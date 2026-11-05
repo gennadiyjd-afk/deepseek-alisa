@@ -4,8 +4,8 @@ import requests
 
 app = FastAPI()
 
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+API_URL = "https://routerapi.ru/api/v1/chat/completions"
+API_KEY = os.getenv("ROUTER_API_KEY")
 
 
 @app.post("/")
@@ -13,11 +13,16 @@ async def main(body: dict):
     user_text = body["request"]["original_utterance"]
 
     response = requests.post(
-        DEEPSEEK_API_URL,
-        headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+        API_URL,
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json"
+        },
         json={
-            "model": "deepseek-chat",
-            "messages": [{"role": "user", "content": user_text}],
+            "model": "deepseek/deepseek-v4-pro",
+            "messages": [
+                {"role": "user", "content": user_text}
+            ]
         },
         timeout=60
     )
@@ -25,17 +30,14 @@ async def main(body: dict):
     try:
         data = response.json()
     except ValueError:
-        raise HTTPException(
-            status_code=502,
-            detail=f"DeepSeek вернул не JSON. HTTP {response.status_code}"
-        )
+        raise HTTPException(status_code=502, detail="API вернул некорректный ответ")
 
     if response.status_code != 200 or "choices" not in data:
         raise HTTPException(
             status_code=502,
             detail={
-                "deepseek_status": response.status_code,
-                "deepseek_error": data
+                "api_status": response.status_code,
+                "api_error": data
             }
         )
 
