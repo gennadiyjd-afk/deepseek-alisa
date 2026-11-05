@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 import requests
 
 app = FastAPI()
@@ -18,10 +18,28 @@ async def main(body: dict):
         json={
             "model": "deepseek-chat",
             "messages": [{"role": "user", "content": user_text}],
-        }
+        },
+        timeout=60
     )
 
-    answer = response.json()["choices"][0]["message"]["content"]
+    try:
+        data = response.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail=f"DeepSeek вернул не JSON. HTTP {response.status_code}"
+        )
+
+    if response.status_code != 200 or "choices" not in data:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "deepseek_status": response.status_code,
+                "deepseek_error": data
+            }
+        )
+
+    answer = data["choices"][0]["message"]["content"]
 
     return {
         "version": body["version"],
