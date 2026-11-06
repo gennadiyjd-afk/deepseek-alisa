@@ -349,7 +349,8 @@ async def main(body: dict):
         }
 
     elif job and job.get("status") == "pending":
-        if text_lower in ("да", "продолжай", "готово"):
+
+        if text_lower in ("да", "продолжай", "продолжи", "продолжить", "готово"):
             answer = (
                 "Я ещё ищу информацию. "
                 "Попробуй сказать «Продолжай» немного позже."
