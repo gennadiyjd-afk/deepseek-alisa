@@ -267,23 +267,54 @@ async def main(body: dict):
     state = body.get("state", {}).get("session", {})
     history = state.get("history", [])
 
-    # Проверяем, не ожидает ли пользователь результат поиска
+    # Проверяем состояние поиска и ожидание ответа о ссылках
 
-    if text_lower in ("продолжай", "да", "готово"):
-        with jobs_lock:
-            job = search_jobs.get(session_id)
+    with jobs_lock:
+        job = search_jobs.get(session_id)
 
-        if job and job["status"] == "ready":
-            answer = job["answer"]
+    if job and job.get("status") == "ready":
+
+        # Пользователь согласился получить источники
+
+        if job.get("waiting_for_sources") and text_lower in (
+            "да", "нужны", "давай", "покажи", "конечно"
+        ):
+            source_list = job.get("sources", [])
+
+            answer = "Вот источники с датами публикаций:\n"
+
+            for i, source in enumerate(source_list, 1):
+                answer += (
+                    f"\n{i}. {source['title']}"
+                    f"\nДата: {source['date']}"
+                    f"\nСсылка: {source['url']}\n"
+                )
 
             with jobs_lock:
                 search_jobs.pop(session_id, None)
 
-            new_history = history[-3:] + [
-                {"role": "user", "content": user_text[:400]},
-                {"role": "assistant", "content": answer[:400]}
-            ]
+        # Пользователь отказался от ссылок
 
+        elif job.get("waiting_for_sources") and text_lower in (
+            "нет", "не нужно", "не надо", "не нужны"
+        ):
+            with jobs_lock:
+                search_jobs.pop(session_id, None)
+
+            answer = "Хорошо, продолжим без ссылок."
+
+        # Получаем готовый ответ после команды Продолжай
+
+        elif text_lower == "продолжай":
+            answer = job["answer"]
+
+            with jobs_lock:
+                job["waiting_for_sources"] = True
+
+        else:
+            answer = None
+
+        if answer is not None:
             return {
                 "version": body["version"],
                 "session": body["session"],
@@ -292,29 +323,38 @@ async def main(body: dict):
                     "text": limit_text(answer)
                 },
                 "session_state": {
-                    "history": new_history[-4:]
+                    "history": history[-4:]
                 }
             }
 
-        if job and job["status"] == "error":
-            with jobs_lock:
-                search_jobs.pop(session_id, None)
+    elif job and job.get("status") == "error":
+        with jobs_lock:
+            search_jobs.pop(session_id, None)
 
-            answer = (
-                "Не удалось получить результаты поиска. "
-                "Попробуй повторить запрос."
-            )
+        answer = (
+            "Не удалось получить результаты поиска. "
+            "Попробуй повторить запрос."
+        )
 
-        elif job and job["status"] == "pending":
+        return {
+            "version": body["version"],
+            "session": body["session"],
+            "response": {
+                "end_session": False,
+                "text": limit_text(answer)
+            },
+            "session_state": {
+                "history": history[-4:]
+            }
+        }
+
+    elif job and job.get("status") == "pending":
+        if text_lower in ("да", "продолжай", "готово"):
             answer = (
                 "Я ещё ищу информацию. "
                 "Попробуй сказать «Продолжай» немного позже."
             )
 
-        else:
-            answer = ""
-
-        if answer:
             return {
                 "version": body["version"],
                 "session": body["session"],
@@ -328,7 +368,6 @@ async def main(body: dict):
             }
 
     # Запускаем интернет-поиск в фоновом потоке
-
     if needs_search(user_text):
         with jobs_lock:
             existing_job = search_jobs.get(session_id)
