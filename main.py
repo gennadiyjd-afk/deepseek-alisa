@@ -79,6 +79,9 @@ def search_and_answer(session_id, user_text, history):
                 "query": user_text[:350],
                 "search_depth": "fast",
                 "max_results": 3
+                "topic": "news",
+                "days": 7,
+                "include_published_date": True
             },
             timeout=20
         )
