@@ -1,8 +1,13 @@
 import os
-from fastapi import FastAPI, HTTPException
+import time
+import logging
 import requests
+from fastapi import FastAPI, HTTPException
 
 app = FastAPI()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("deepseek_alisa")
 
 API_URL = "https://routerapi.ru/api/v1/chat/completions"
 API_KEY = os.getenv("ROUTER_API_KEY")
@@ -12,11 +17,9 @@ API_KEY = os.getenv("ROUTER_API_KEY")
 async def main(body: dict):
     user_text = body["request"]["original_utterance"]
 
-    # Получаем историю предыдущих реплик
     state = body.get("state", {}).get("session", {})
     history = state.get("history", [])
 
-    # Оставляем только последние сообщения
     messages = [
         {
             "role": "system",
@@ -32,8 +35,10 @@ async def main(body: dict):
                 "Учитывай предыдущие реплики и понимай короткие "
                 "уточнения по контексту разговора. "
                 "Отвечай понятно, дружелюбно и по существу. "
-                "Для голосового общения предпочитай короткие ответы "
-                "из 2–4 предложений."
+                "Для голосового общения используй 1–3 законченных "
+                "предложения. Не обрывай ответ на полуслове. "
+                "Если вопрос сложный, сначала дай краткий "
+                "и законченный ответ."
             )
         }
     ]
@@ -46,6 +51,8 @@ async def main(body: dict):
             })
 
     messages.append({"role": "user", "content": user_text})
+
+    start_time = time.perf_counter()
 
     try:
         response = requests.post(
@@ -62,34 +69,47 @@ async def main(body: dict):
             timeout=3.5
         )
 
+        elapsed = round(time.perf_counter() - start_time, 2)
         data = response.json()
 
+        if response.status_code != 200 or "choices" not in data:
+            logger.error(
+                "API error: status=%s, time=%s",
+                response.status_code,
+                elapsed
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Ошибка ответа API"
+            )
+
+        choice = data["choices"][0]
+        answer = choice.get("message", {}).get("content", "")
+        finish_reason = choice.get("finish_reason")
+
+        logger.info(
+            "API response: time=%s sec, finish_reason=%s, chars=%s",
+            elapsed,
+            finish_reason,
+            len(answer)
+        )
+
+        if not answer:
+            answer = "Не удалось сформировать ответ. Попробуй ещё раз."
+
     except requests.exceptions.Timeout:
-        return {
-            "version": body["version"],
-            "session": body["session"],
-            "response": {
-                "end_session": False,
-                "text": "Ответ задерживается. Попробуй повторить вопрос."
-            },
-            "session_state": {"history": history[-4:]}
-        }
+        elapsed = round(time.perf_counter() - start_time, 2)
+        logger.warning("API timeout after %s sec", elapsed)
+        answer = "Ответ задерживается. Попробуй повторить вопрос."
 
-    except (requests.exceptions.RequestException, ValueError):
-        raise HTTPException(
-            status_code=502,
-            detail="Не удалось получить ответ от API"
-        )
+    except requests.exceptions.RequestException:
+        logger.exception("Connection error")
+        answer = "Сейчас не удаётся связаться с помощником. Попробуй позже."
 
-    if response.status_code != 200 or "choices" not in data:
-        raise HTTPException(
-            status_code=502,
-            detail="Ошибка ответа API"
-        )
+    except ValueError:
+        logger.exception("Invalid API response")
+        answer = "Получен некорректный ответ. Попробуй ещё раз."
 
-    answer = data["choices"][0]["message"]["content"]
-
-    # Сохраняем последние две пары реплик
     new_history = history[-3:] + [
         {"role": "user", "content": user_text[:170]},
         {"role": "assistant", "content": answer[:170]}
