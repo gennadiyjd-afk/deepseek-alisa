@@ -24,6 +24,18 @@ search_jobs = {}
 jobs_lock = threading.Lock()
 
 
+def limit_text(text, limit=1024):
+    text = str(text or "").strip()
+
+    if len(text) <= limit:
+        return text
+
+    shortened = text[:limit - 3]
+
+    if " " in shortened:
+        shortened = shortened.rsplit(" ", 1)[0]
+
+    return shortened.rstrip(" ,;:-") + "..."
 def needs_search(text):
     text = text.lower()
 
@@ -251,7 +263,7 @@ async def main(body: dict):
                 "session": body["session"],
                 "response": {
                     "end_session": False,
-                    "text": answer
+                    "text": limit_text(answer)
                 },
                 "session_state": {
                     "history": new_history[-4:]
@@ -282,7 +294,7 @@ async def main(body: dict):
                 "session": body["session"],
                 "response": {
                     "end_session": False,
-                    "text": answer
+                    "text": limit_text(answer)
                 },
                 "session_state": {
                     "history": history[-4:]
@@ -323,7 +335,7 @@ async def main(body: dict):
             "session": body["session"],
             "response": {
                 "end_session": False,
-                "text": answer
+                "text": limit_text(answer)
             },
             "session_state": {
                 "history": history[-4:]
@@ -435,7 +447,7 @@ async def main(body: dict):
         "session": body["session"],
         "response": {
             "end_session": False,
-            "text": answer
+            "text": limit_text(answer)
         },
         "session_state": {
             "history": new_history[-4:]
