@@ -99,6 +99,8 @@ def search_and_answer(session_id, user_text, history):
         for item in results[:3]:
             sources.append(
                 "Название: " + str(item.get("title", "")) +
+                "\nДата публикации: " +
+                str(item.get("published_date") or "не указана") +
                 "\nСсылка: " + str(item.get("url", "")) +
                 "\nСодержание: " + str(item.get("content", ""))[:1000]
             )
