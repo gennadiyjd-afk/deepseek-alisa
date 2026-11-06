@@ -8,7 +8,7 @@ app = FastAPI()
 
 @app.api_route("/health", methods = ["GET", "HEAD"])
 async def health():
-return {
+    return {
     "status": "ok"
 }
 
