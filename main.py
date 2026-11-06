@@ -7,6 +7,10 @@ from fastapi import FastAPI, HTTPException
 
 app = FastAPI()
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("deepseek_alisa")
 
