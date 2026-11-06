@@ -306,7 +306,10 @@ async def main(body: dict):
         # Получаем готовый ответ после команды Продолжай
 
         elif text_lower == "продолжай":
-            answer = job["answer"]
+            answer = (
+                job["answer"].rstrip()
+                + "\n\nНужны ссылки на источники с датами публикаций?"
+            )
 
             with jobs_lock:
                 job["waiting_for_sources"] = True
