@@ -78,7 +78,7 @@ def search_and_answer(session_id, user_text, history):
             json={
                 "query": user_text[:350],
                 "search_depth": "fast",
-                "max_results": 3
+                "max_results": 3,
                 "topic": "news",
                 "days": 7,
                 "include_published_date": True
