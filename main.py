@@ -54,7 +54,7 @@ messages = [
     }
 ]
 
-for item in history[-4:]:
+    for item in history[-4:]:
         if isinstance(item, dict) and item.get("role") in ("user", "assistant"):
             messages.append({
                 "role": item["role"],
@@ -62,7 +62,6 @@ for item in history[-4:]:
             })
 
     messages.append({"role": "user", "content": user_text})
-
     start_time = time.perf_counter()
 
     try:
