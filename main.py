@@ -95,15 +95,27 @@ def search_and_answer(session_id, user_text, history):
             raise Exception("No search results")
 
         sources = []
+        source_details = []
 
         for item in results[:3]:
+            title = str(item.get("title", "Без названия"))
+            published_date = str(
+            item.get("published_date") or "дата не указана"
+            )
+            url = str(item.get("url", ""))
+
             sources.append(
-                "Название: " + str(item.get("title", "")) +
-                "\nДата публикации: " +
-                str(item.get("published_date") or "не указана") +
-                "\nСсылка: " + str(item.get("url", "")) +
+                "Название: " + title +
+                "\nДата публикации: " + published_date +
+                "\nСсылка: " + url +
                 "\nСодержание: " + str(item.get("content", ""))[:1000]
             )
+
+            source_details.append({
+                "title": title,
+                "date": published_date,
+                "url": url
+            })
 
         web_context = "\n\n".join(sources)
 
@@ -193,7 +205,9 @@ def search_and_answer(session_id, user_text, history):
         with jobs_lock:
             search_jobs[session_id] = {
                 "status": "ready",
-                "answer": answer
+                "answer": answer,
+                "sources": source_details,
+                "waiting_for_sources": True
             }
 
         logger.info("Background search completed")
