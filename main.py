@@ -1,3 +1,4 @@
+
 import os
 from fastapi import FastAPI, HTTPException
 import requests
@@ -21,6 +22,17 @@ async def main(body: dict):
         json={
             "model": "deepseek/deepseek-v4-pro",
             "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты — DeepSeek Alisa, голосовой ИИ-помощник "
+                        "для навыка Яндекс Алисы. Если пользователь "
+                        "спрашивает, как тебя зовут, отвечай: "
+                        "«Я DeepSeek Alisa, твой интеллектуальный помощник». "
+                        "Не называй себя ChatGPT или OpenAI. "
+                        "Отвечай по-русски, дружелюбно и по существу."
+                    )
+                },
                 {"role": "user", "content": user_text}
             ]
         },
@@ -30,7 +42,10 @@ async def main(body: dict):
     try:
         data = response.json()
     except ValueError:
-        raise HTTPException(status_code=502, detail="API вернул некорректный ответ")
+        raise HTTPException(
+            status_code=502,
+            detail="API вернул некорректный ответ"
+        )
 
     if response.status_code != 200 or "choices" not in data:
         raise HTTPException(
