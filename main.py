@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from fastapi import FastAPI
+from datetime import datetime
 
 app = FastAPI()
 
@@ -245,6 +246,8 @@ def search_and_answer(session_id, job_id, user_text, history):
         if not TAVILY_KEY:
             raise RuntimeError("TAVILY_API_KEY is missing")
 
+        today = datetime.now().astimezone().strftime("%d.%m.%Y")
+
         response = requests.post(
             TAVILY_URL,
             headers={
@@ -298,6 +301,9 @@ def search_and_answer(session_id, job_id, user_text, history):
                 "content": (
                     "Ты — DeepSeek Alisa, голосовая ИИ-помощница "
                     "женского рода для Яндекс Алисы. "
+                    f"Сегодняшняя дата: {today}. "
+                    "Это единственная текущая дата, на которую "
+                    "нужно ориентироваться. "
                     "Отвечай только по-русски. "
                     "О себе говори только в женском роде. "
                     "Постоянного собеседника зовут Геннадий. "
@@ -305,16 +311,23 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "Не называй себя ChatGPT или OpenAI. "
                     "Используй найденные материалы для ответа. "
                     "Не выдумывай факты. "
-                    "Учитывай даты публикаций и отдавай предпочтение "
-                    "самым свежим материалам. "
+                    "Обязательно сверяй даты публикаций с сегодняшней датой. "
+                    "Не называй событие сегодняшним, если оно произошло "
+                    "раньше. Не выдавай старые новости за новые. "
+                    "Если публикация старше, чем несколько дней, "
+                    "уточняй её дату. "
+                    "Не утверждай, что событие произошло, если источники "
+                    "этого не подтверждают. "
+                    "Отдавай предпочтение самым свежим материалам. "
                     "Если источники противоречат друг другу, сообщи об этом. "
                     "Ответ должен быть законченным, кратким и понятным. "
-                    "Максимум 750 символов. "
+                    "Максимум 650 символов. "
                     "Не перечисляй источники, даты и ссылки в основном ответе. "
                     "Не сообщай адреса сайтов. "
                     "В конце основного ответа обязательно спроси: "
                     "«Нужны ссылки на источники с датами публикаций?» "
-                    "Ответ должен быть законченным и не обрываться. "
+                    "Не обрывай предложения и не заканчивай ответ "
+                    "незавершённой мыслью. "
                     "Говори естественно, как в обычном разговоре."
                 ),
             },
@@ -331,7 +344,11 @@ def search_and_answer(session_id, job_id, user_text, history):
             "role": "system",
             "content": "Результаты интернет-поиска:\n\n" + "\n\n".join(sources),
         })
-        messages.append({"role": "user", "content": user_text})
+
+        messages.append({
+            "role": "user",
+            "content": user_text,
+        })
 
         answer = ask_ai(messages, timeout=60)
 
@@ -345,6 +362,7 @@ def search_and_answer(session_id, job_id, user_text, history):
                 "waiting_for_sources": True,
             },
         )
+
         logger.info("Background search completed")
 
     except Exception:
