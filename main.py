@@ -266,14 +266,29 @@ def search_and_answer(session_id, job_id, user_text, history):
         today = datetime.now().astimezone().strftime("%d.%m.%Y")
         lower_text = user_text.lower()
 
+        oil_words = (
+            "нефть", "brent", "брент", "wti", "марки бренд",
+            "марки brent", "марки брент",
+        )
+        is_oil = any(word in lower_text for word in oil_words)
+
         finance_words = (
-            "нефть", "brent", "wti", "золото", "курс", "доллар",
-            "евро", "рубль", "акции", "котировк", "бирж", "биткоин",
-            "криптовалют", "стоимость", "цена", "газ",
+            "нефть", "brent", "брент", "wti", "золото", "курс",
+            "доллар", "евро", "рубль", "акции", "котировк", "бирж",
+            "биткоин", "криптовалют", "стоимость", "цена", "газ",
         )
         is_finance = any(word in lower_text for word in finance_words)
 
-        if is_finance:
+        if is_oil:
+            search_topic = "finance"
+            search_query = (
+                f"Brent crude oil price today {today}, latest live market "
+                f"quote for ICE Brent futures in USD per barrel, current "
+                f"trading price, latest update date and time. "
+                f"Russian query: {user_text}. "
+                f"Do not return historical prices as current."
+            )
+        elif is_finance:
             search_topic = "finance"
             search_query = (
                 f"{user_text}. Актуальная цена или последняя котировка "
@@ -362,6 +377,11 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "Если вопрос касается цены или котировки, "
                     "указывай дату последнего обновления данных. "
                     "Не выдавай старую котировку за текущую. "
+                    "Для нефти Brent и WTI указывай цену именно за баррель "
+                    "и валюту котировки. Ищи текущую биржевую котировку "
+                    "или последнюю цену закрытия, а не обзорные статьи. "
+                    "Если дата или время самой котировки не подтверждены, "
+                    "не называй её текущей. "
                     "Если актуальная цена не найдена, прямо сообщи об этом. "
                     "Если биржа закрыта, укажи последнюю доступную цену закрытия. "
                     "Обязательно сверяй даты публикаций с сегодняшней датой. "
