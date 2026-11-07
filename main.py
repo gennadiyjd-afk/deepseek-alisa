@@ -673,47 +673,21 @@ async def main(body: dict):
         # with "Что там?" once the next request reaches the skill.
         return make_response(body, "Сейчас посмотрю.")
 
-    # Обычный запрос: даём модели до трёх секунд, чтобы ответить
-    # в рамках того же обращения к навыку. Если ответ не успел,
-    # фоновая задача продолжит работу, а результат можно запросить
-    # отдельной командой «Продолжи».
-    job_id = uuid.uuid4().hex
-
-    with jobs_lock:
-        search_jobs[job_key] = {
-            "job_id": job_id,
-            "kind": "chat",
-            "status": "pending",
-            "answer": "",
-            "user_text": user_text,
-            "history": history[-4:],
-        }
-
-    future = executor.submit(
-        chat_in_background,
-        job_key,
-        job_id,
-        user_text,
-        history[-4:],
-    )
-
+    # Обычный разговор: один прямой запрос к модели и сразу готовый ответ.
+    # Никакого дополнительного ожидания, фоновой задачи или фразы «Секунду».
     try:
-        result = await asyncio.wait_for(
-            asyncio.wrap_future(future),
-            timeout=3.0,
-        )
-        if result and result.get("status") == "ready":
-            return make_response(body, result.get("answer", ""))
-        if result and result.get("status") == "error":
-            return make_response(
-                body,
-                "Не удалось подготовить ответ. Попробуй повторить вопрос.",
-            )
-    except asyncio.TimeoutError:
-        logger.info("Chat did not finish within the short voice wait window")
-    except Exception:
-        logger.exception("Error while waiting briefly for chat answer")
+        messages = build_chat_messages(user_text, history)
+        answer = ask_ai(messages, timeout=4.0)
 
-    # Не произносим прежнюю длинную подсказку.
-    # Задача продолжает выполняться, ответ сохранится для команды «Продолжи».
-    return make_response(body, "Секунду.")
+        new_history = history[-3:] + [
+            {"role": "user", "content": user_text[:400]},
+            {"role": "assistant", "content": answer[:400]},
+        ]
+        return make_response(body, answer, new_history)
+
+    except Exception:
+        logger.exception("Direct chat request failed")
+        return make_response(
+            body,
+            "Не удалось получить ответ. Попробуй, пожалуйста, ещё раз.",
+        )
