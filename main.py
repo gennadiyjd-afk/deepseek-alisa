@@ -25,6 +25,7 @@ search_jobs = {}
 jobs_lock = threading.Lock()
 
 
+
 def limit_text(text, limit=1024):
     text = str(text or "").strip()
 
@@ -32,11 +33,28 @@ def limit_text(text, limit=1024):
         return text
 
     shortened = text[:limit - 3]
-    if " " in shortened:
-        shortened = shortened.rsplit(" ", 1)[0]
+
+    # Сначала ищем конец последнего законченного предложения.
+    endings = [
+        shortened.rfind("."),
+        shortened.rfind("!"),
+        shortened.rfind("?"),
+    ]
+
+    sentence_end = max(endings)
+
+    # Если предложение заканчивается достаточно близко к лимиту,
+    # сохраняем его целиком.
+    if sentence_end >= limit * 0.6:
+        return shortened[:sentence_end + 1].rstrip()
+
+    # Иначе ищем последнюю границу между предложениями или абзацами.
+    for separator in ("\n", ";", ",", " "):
+        position = shortened.rfind(separator)
+        if position >= limit * 0.6:
+            return shortened[:position].rstrip(" ,;:-") + "..."
 
     return shortened.rstrip(" ,;:-") + "..."
-
 
 def is_continue_command(text):
     return text.lower().strip() in (
