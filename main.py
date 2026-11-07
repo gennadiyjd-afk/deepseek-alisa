@@ -272,7 +272,10 @@ def search_and_answer(session_id, job_id, user_text, history):
                 "Content-Type": "application/json",
             },
             json={
-                "query": user_text[:350],
+                "query": (
+                    f"{user_text} "
+                    f"самые свежие новости и последние события на {today}"
+                ),
                 "search_depth": "fast",
                 "max_results": 7,
                 "topic": "news",
