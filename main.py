@@ -4,6 +4,7 @@ import asyncio
 import uuid
 import logging
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -60,6 +61,33 @@ def limit_text(text, limit=1024):
 def normalize_command(text):
     text = str(text or "").lower().replace("ё", "е").strip()
     return " ".join(text.split()).strip(" .,!?:;\"'«»")
+
+
+def remove_source_links(text):
+    """Убирает URL и явные предложения перейти к источникам из ответа."""
+    text = str(text or "")
+    # Убираем Markdown-ссылки, оставляя только их подпись.
+    text = re.sub(r"\[([^\]]+)\]\((?:https?://|www\.)[^)]+\)", r"\1", text)
+    # Убираем прямые URL.
+    text = re.sub(r"https?://\S+|www\.\S+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:URL|ссылка):\s*", "", text, flags=re.IGNORECASE)
+    # Удаляем отдельные строки со ссылками/предложением показать источники.
+    kept_lines = []
+    for line in text.splitlines():
+        normalized = line.lower().replace("ё", "е")
+        if (
+            any(phrase in normalized for phrase in (
+                "ссылки на источники", "нужны ссылки", "показать источники",
+                "перейдите по ссылке", "читайте подробнее по ссылке",
+            ))
+            or normalized.strip().startswith(("url:", "ссылка:"))
+        ):
+            continue
+        kept_lines.append(line)
+    text = "\n".join(kept_lines)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def is_status_command(text):
@@ -351,8 +379,6 @@ def search_and_answer(session_id, job_id, user_text, history):
             raise RuntimeError("No search results")
 
         sources = []
-        source_details = []
-
         for item in results[:5]:
             title = str(item.get("title", "Без названия"))
             published_date = str(
@@ -368,12 +394,6 @@ def search_and_answer(session_id, job_id, user_text, history):
                 + "\nURL: " + url
                 + "\nФрагмент источника: " + content[:1400]
             )
-
-            source_details.append({
-                "title": title,
-                "date": published_date,
-                "url": url,
-            })
 
         messages = [
             {
@@ -428,11 +448,9 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "Учитывай все найденные материалы, а не только первые. "
                     "Ответ должен быть законченным, кратким и понятным. "
                     "Максимум 650 символов. "
-                    "В основном ответе можно назвать один-два источника "
-                    "словами, но не произноси URL и длинные списки ссылок. "
-                    "Не сообщай адреса сайтов. "
-                    "Не задавай вопрос о ссылках на источники: "
-                    "это сделает обработчик навыка отдельно. "
+                    "Не произноси URL, адреса сайтов и ссылки. "
+                    "Не предлагай пользователю источники и не спрашивай, "
+                    "нужны ли ему ссылки. Давай только сам ответ. "
                     "Не обрывай предложения и не заканчивай ответ "
                     "незавершённой мыслью. "
                     "Говори естественно, как в обычном разговоре."
@@ -464,11 +482,10 @@ def search_and_answer(session_id, job_id, user_text, history):
             time.perf_counter() - search_ai_started,
         )
 
+        answer = remove_source_links(answer)
         result = {
             "status": "ready",
             "answer": answer,
-            "sources": source_details,
-            "waiting_for_sources": True,
         }
         save_job_result(session_id, job_id, result)
         logger.info("Background search completed")
@@ -556,44 +573,12 @@ async def main(body: dict):
     # Обрабатываем готовую задачу
     if job and job.get("status") == "ready":
         if job.get("kind") == "search":
-            if job.get("waiting_for_sources") and text_lower in (
-                "да", "нужны", "давай", "покажи", "конечно"
-            ):
-                source_list = job.get("sources", [])
-                answer = "Вот источники с датами публикаций:\n"
-
-                for i, source in enumerate(source_list, 1):
-                    entry = (
-                        f"\n{i}. {source['title']}"
-                        f"\nДата: {source['date']}"
-                        f"\nСсылка: {source['url']}\n"
-                    )
-                    if len(answer) + len(entry) > 1000:
-                        answer += "\nОстальные ссылки не поместились в один ответ."
-                        break
-                    answer += entry
-
-                with jobs_lock:
-                    search_jobs.pop(job_key, None)
-
-                return make_response(body, answer)
-
-            if job.get("waiting_for_sources") and text_lower in (
-                "нет", "не нужно", "не надо", "не нужны"
-            ):
-                with jobs_lock:
-                    search_jobs.pop(job_key, None)
-                return make_response(body, "Хорошо, продолжим без ссылок.")
-
             if is_continue_command(text_lower):
-                answer = (
-                    job["answer"].rstrip()
-                    + "\n\nНужны ссылки на источники с датами публикаций?"
-                )
+                answer = job.get("answer", "")
                 with jobs_lock:
                     current = search_jobs.get(job_key)
                     if current and current.get("job_id") == job.get("job_id"):
-                        current["waiting_for_sources"] = True
+                        search_jobs.pop(job_key, None)
                 return make_response(body, answer)
 
             # Иное сообщение — начинаем обработку нового запроса.
@@ -672,20 +657,56 @@ async def main(body: dict):
         logger.info("Search task submitted; returning immediately to Alice")
         return make_response(body, "Сейчас посмотрю.")
 
-    # Обычный разговор: один прямой запрос к модели и сразу готовый ответ.
-    # Никакого дополнительного ожидания, фоновой задачи или фразы «Секунду».
-    try:
-        messages = build_chat_messages(user_text, history)
-        answer = ask_ai(messages, timeout=4.0)
+    # Обычный разговор: даём модели короткое время на быстрый ответ.
+    # Если ответ не готов за 2 секунды, продолжаем запрос в фоне,
+    # чтобы не удерживать вебхук Алисы до тайм-аута.
+    job_id = uuid.uuid4().hex
+    with jobs_lock:
+        search_jobs[job_key] = {
+            "job_id": job_id,
+            "kind": "chat",
+            "status": "pending",
+            "answer": "",
+            "user_text": user_text,
+            "history": history[-4:],
+        }
 
-        new_history = history[-3:] + [
-            {"role": "user", "content": user_text[:400]},
-            {"role": "assistant", "content": answer[:400]},
-        ]
-        return make_response(body, answer, new_history)
+    future = executor.submit(
+        chat_in_background,
+        job_key,
+        job_id,
+        user_text,
+        history[-4:],
+    )
+
+    try:
+        # shield не позволяет тайм-ауту ожидания отменить фоновый запрос.
+        wrapped_future = asyncio.shield(asyncio.wrap_future(future))
+        result = await asyncio.wait_for(wrapped_future, timeout=2.0)
+
+        if result.get("status") == "ready":
+            answer = result.get("answer", "")
+            new_history = history[-3:] + [
+                {"role": "user", "content": user_text[:400]},
+                {"role": "assistant", "content": answer[:400]},
+            ]
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                if current and current.get("job_id") == job_id:
+                    search_jobs.pop(job_key, None)
+            return make_response(body, answer, new_history)
+
+        raise RuntimeError("Background chat returned no answer")
+
+    except asyncio.TimeoutError:
+        logger.info("Chat is still running after 2 seconds; returning control to Alice")
+        return make_response(
+            body,
+            "Ответ ещё готовится. Скажи «Что там?» немного позже.",
+        )
 
     except Exception:
-        logger.exception("Direct chat request failed")
+        logger.exception("Chat request failed")
         return make_response(
             body,
             "Не удалось получить ответ. Попробуй, пожалуйста, ещё раз.",
