@@ -230,7 +230,12 @@ def chat_in_background(session_id, job_id, user_text, history):
     try:
         logger.info("Background chat started")
         messages = build_chat_messages(user_text, history)
+        ai_started = time.perf_counter()
         answer = ask_ai(messages, timeout=60)
+        logger.info(
+            "Background chat AI completed in %.2f seconds",
+            time.perf_counter() - ai_started,
+        )
 
         result = {
             "status": "ready",
@@ -307,15 +312,17 @@ def search_and_answer(session_id, job_id, user_text, history):
 
         search_payload = {
             "query": search_query,
-            # Tavily supports the finance topic only with advanced search.
+            # Для финансовых данных сохраняем advanced-поиск;
+            # для остальных запросов используем быстрый режим.
             "search_depth": "advanced" if is_finance else "fast",
-            "max_results": 7,
+            "max_results": 5,
             "topic": search_topic,
             "include_published_date": True,
         }
         if not is_finance:
             search_payload["days"] = 7
 
+        tavily_started = time.perf_counter()
         response = requests.post(
             TAVILY_URL,
             headers={
@@ -333,6 +340,10 @@ def search_and_answer(session_id, job_id, user_text, history):
             )
 
         response.raise_for_status()
+        logger.info(
+            "Tavily search completed in %.2f seconds",
+            time.perf_counter() - tavily_started,
+        )
         data = response.json()
         results = data.get("results", [])
 
@@ -342,7 +353,7 @@ def search_and_answer(session_id, job_id, user_text, history):
         sources = []
         source_details = []
 
-        for item in results[:7]:
+        for item in results[:5]:
             title = str(item.get("title", "Без названия"))
             published_date = str(
                 item.get("published_date") or "дата не указана"
@@ -446,7 +457,12 @@ def search_and_answer(session_id, job_id, user_text, history):
             "content": user_text,
         })
 
+        search_ai_started = time.perf_counter()
         answer = ask_ai(messages, timeout=60)
+        logger.info(
+            "Search answer AI completed in %.2f seconds",
+            time.perf_counter() - search_ai_started,
+        )
 
         result = {
             "status": "ready",
@@ -650,27 +666,10 @@ async def main(body: dict):
             history[-4:],
         )
 
-        try:
-            # Give fast searches a chance to finish during this same turn.
-            # Keep a safety margin below Alice's webhook response deadline.
-            result = await asyncio.wait_for(
-                asyncio.wrap_future(future),
-                timeout=3.0,
-            )
-            if result and result.get("status") == "ready":
-                return make_response(body, result.get("answer", "Поиск завершён."))
-            if result and result.get("status") == "error":
-                return make_response(
-                    body,
-                    "Не удалось найти информацию. Попробуй повторить запрос немного позже.",
-                )
-        except asyncio.TimeoutError:
-            logger.info("Search did not finish within the short voice wait window")
-        except Exception:
-            logger.exception("Error while waiting briefly for search result")
-
-        # The background task keeps running. The result can be retrieved
-        # with "Что там?" once the next request reaches the skill.
+        # Не ждём завершения поиска в текущем вебхуке: Алиса сразу
+        # отвечает пользователю, а Tavily и DeepSeek работают в фоне.
+        # Готовый результат пользователь заберёт командой «Что там?».
+        logger.info("Search task submitted; returning immediately to Alice")
         return make_response(body, "Сейчас посмотрю.")
 
     # Обычный разговор: один прямой запрос к модели и сразу готовый ответ.
