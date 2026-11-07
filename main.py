@@ -97,7 +97,7 @@ def ask_ai(messages, timeout=25):
             "model": "deepseek/deepseek-v4-pro",
             "messages": messages,
             "thinking": {"type": "disabled"},
-            "max_tokens": 350,
+            "max_tokens": 1000,
         },
         timeout=timeout,
     )
@@ -214,7 +214,7 @@ def chat_in_background(session_id, job_id, user_text, history):
     try:
         logger.info("Background chat started")
         messages = build_chat_messages(user_text, history)
-        answer = ask_ai(messages, timeout=25)
+        answer = ask_ai(messages, timeout=60)
 
         save_job_result(
             session_id,
@@ -333,7 +333,7 @@ def search_and_answer(session_id, job_id, user_text, history):
         })
         messages.append({"role": "user", "content": user_text})
 
-        answer = ask_ai(messages, timeout=25)
+        answer = ask_ai(messages, timeout=60)
 
         save_job_result(
             session_id,
