@@ -264,6 +264,42 @@ def search_and_answer(session_id, job_id, user_text, history):
             raise RuntimeError("TAVILY_API_KEY is missing")
 
         today = datetime.now().astimezone().strftime("%d.%m.%Y")
+        lower_text = user_text.lower()
+
+        # Определяем, нужен ли финансовый поиск вместо новостного.
+        finance_terms = (
+            "нефть", "brent", "брент", "wti", "золото",
+            "курс", "доллар", "евро", "рубль", "акции",
+            "котиров", "бирж", "биткоин", "криптовалют",
+            "газ", "цена", "стоимость",
+        )
+        is_finance = any(term in lower_text for term in finance_terms)
+
+        if is_finance:
+            search_topic = "finance"
+            search_query = (
+                f"{user_text}. Найди последнюю доступную рыночную цену "
+                f"или котировку на {today}. Укажи дату и время обновления, "
+                "валюту и единицу измерения."
+            )
+        else:
+            search_topic = "news"
+            search_query = (
+                f"{user_text} самые свежие новости и последние события "
+                f"на {today}"
+            )
+
+        search_payload = {
+            "query": search_query[:380],
+            "search_depth": "fast",
+            "max_results": 7,
+            "topic": search_topic,
+            "include_published_date": True,
+        }
+
+        # Параметр days используем только для новостного поиска.
+        if search_topic == "news":
+            search_payload["days"] = 7
 
         response = requests.post(
             TAVILY_URL,
@@ -271,21 +307,18 @@ def search_and_answer(session_id, job_id, user_text, history):
                 "Authorization": f"Bearer {TAVILY_KEY}",
                 "Content-Type": "application/json",
             },
-            json={
-                "query": (
-                    f"{user_text} "
-                    f"самые свежие новости и последние события на {today}"
-                ),
-                "search_depth": "fast",
-                "max_results": 7,
-                "topic": "news",
-                "days": 7,
-                "include_published_date": True,
-            },
+            json=search_payload,
             timeout=20,
         )
 
-        response.raise_for_status()
+        if not response.ok:
+            logger.error(
+                "Tavily error: status=%s, body=%s",
+                response.status_code,
+                response.text[:1000],
+            )
+            response.raise_for_status()
+
         data = response.json()
         results = data.get("results", [])
 
@@ -304,9 +337,9 @@ def search_and_answer(session_id, job_id, user_text, history):
 
             sources.append(
                 "Название: " + title
-                + "\nДата публикации: " + published_date
-                + "\nСсылка: " + url
-                + "\nСодержание: " + str(item.get("content", ""))[:1000]
+                + "\\nДата публикации: " + published_date
+                + "\\nСсылка: " + url
+                + "\\nСодержание: " + str(item.get("content", ""))[:1000]
             )
 
             source_details.append({
@@ -314,6 +347,23 @@ def search_and_answer(session_id, job_id, user_text, history):
                 "date": published_date,
                 "url": url,
             })
+
+        if is_finance:
+            search_instruction = (
+                "Это финансовый запрос. Ищи именно последнюю доступную "
+                "рыночную котировку, а не старую новостную статью. "
+                "Обязательно называй дату котировки, валюту и единицу "
+                "измерения, если они указаны в источниках. Отличай цену "
+                "во время торгов от цены закрытия. Если рынки закрыты, "
+                "сообщи последнюю доступную цену закрытия и её дату. "
+                "Если источники не подтверждают актуальную цену, прямо "
+                "скажи об этом. Не подставляй устаревшее значение."
+            )
+        else:
+            search_instruction = (
+                "Это запрос о новостях. Отдавай предпочтение самым свежим "
+                "публикациям и не выдавай старые материалы за новые."
+            )
 
         messages = [
             {
@@ -331,19 +381,19 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "Не называй себя ChatGPT или OpenAI. "
                     "Используй найденные материалы для ответа. "
                     "Не выдумывай факты. "
-                    "Обязательно сверяй даты публикаций с сегодняшней датой. "
+                    f"{search_instruction} "
+                    "Сверяй даты публикаций с сегодняшней датой. "
                     "Не называй событие сегодняшним, если оно произошло "
-                    "раньше. Не выдавай старые новости за новые. "
-                    "Если публикация старше нескольких дней, "
-                    "уточняй её дату. "
+                    "раньше. Не выдавай старые данные за новые. "
+                    "Если публикация старше нескольких дней, уточняй её дату. "
                     "Не утверждай, что событие произошло, если источники "
                     "этого не подтверждают. "
-                    "Отдавай предпочтение самым свежим материалам. "
                     "Если источники противоречат друг другу, сообщи об этом. "
                     "Учитывай все найденные материалы, а не только первые. "
                     "Ответ должен быть законченным, кратким и понятным. "
                     "Максимум 650 символов. "
-                    "Не перечисляй источники, даты и ссылки в основном ответе. "
+                    "Не перечисляй источники, даты и ссылки в основном ответе, "
+                    "кроме даты котировки в финансовом ответе. "
                     "Не сообщай адреса сайтов. "
                     "Не задавай вопрос о ссылках на источники: "
                     "это сделает обработчик навыка отдельно. "
@@ -363,7 +413,7 @@ def search_and_answer(session_id, job_id, user_text, history):
 
         messages.append({
             "role": "system",
-            "content": "Результаты интернет-поиска:\n\n" + "\n\n".join(sources),
+            "content": "Результаты интернет-поиска:\\n\\n" + "\\n\\n".join(sources),
         })
 
         messages.append({
