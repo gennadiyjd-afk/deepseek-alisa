@@ -112,8 +112,12 @@ def ask_ai(messages, timeout=25):
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json",
         },
-        json=search_payload,
-  
+        json={
+            "model": "deepseek/deepseek-v4-pro",
+            "messages": messages,
+            "thinking": {"type": "disabled"},
+            "max_tokens": 1000,
+        },
         timeout=timeout,
     )
 
@@ -261,52 +265,23 @@ def search_and_answer(session_id, job_id, user_text, history):
 
         today = datetime.now().astimezone().strftime("%d.%m.%Y")
 
-        lower_text = user_text.lower()
-
-        finance_words = (
-            "нефть", "brent", "wti", "золото",
-            "курс", "доллар", "евро", "рубль",
-            "акции", "котировк", "бирж",
-            "биткоин", "криптовалют", "стоимость",
-            "цена", "газ"
-        )
-
-        is_finance = any(
-            word in lower_text for word in finance_words
-        )
-
-        if is_finance:
-            search_topic = "finance"
-            search_days = 1
-            search_query = (
-                f"{user_text}. Актуальная цена, последняя котировка "
-                f"на {today}, дата и время обновления данных."
-            )
-        else:
-            search_topic = "news"
-            search_days = 7
-            search_query = (
-                f"{user_text} самые свежие новости "
-                f"и последние события на {today}"
-            )
-
         response = requests.post(
             TAVILY_URL,
             headers={
                 "Authorization": f"Bearer {TAVILY_KEY}",
                 "Content-Type": "application/json",
             },
-             
-            search_payload = {
-                "query": search_query,
+            json={
+                "query": (
+                    f"{user_text} "
+                    f"самые свежие новости и последние события на {today}"
+                ),
                 "search_depth": "fast",
                 "max_results": 7,
-                "topic": search_topic,
+                "topic": "news",
+                "days": 7,
                 "include_published_date": True,
-            }
-
-            if search_topic == "news":
-                search_payload["days"] = search_days 
+            },
             timeout=20,
         )
 
@@ -356,11 +331,6 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "Не называй себя ChatGPT или OpenAI. "
                     "Используй найденные материалы для ответа. "
                     "Не выдумывай факты. "
-                    "Если вопрос касается цены или котировки, "
-                    "указывай дату последнего обновления данных. "
-                    "Не выдавай старую котировку за текущую. "
-                    "Если актуальная цена не найдена, прямо сообщи об этом. "
-                    "Если биржа закрыта, укажи последнюю доступную цену закрытия. "
                     "Обязательно сверяй даты публикаций с сегодняшней датой. "
                     "Не называй событие сегодняшним, если оно произошло "
                     "раньше. Не выдавай старые новости за новые. "
