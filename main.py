@@ -322,7 +322,28 @@ def search_and_answer(session_id, job_id, user_text, history):
         data = response.json()
         results = data.get("results", [])
 
+        # Диагностика ответа Tavily: помогает понять,
+        # какие именно материалы были найдены.
+        logger.info(
+            "Tavily response: topic=%s, results_count=%s, response_keys=%s",
+            search_topic,
+            len(results),
+            list(data.keys()),
+        )
+
+        for index, item in enumerate(results[:7], start=1):
+            logger.info(
+                "Tavily result %s: title=%s | date=%s | score=%s | url=%s | content=%s",
+                index,
+                str(item.get("title", "Без названия"))[:180],
+                str(item.get("published_date") or "дата не указана")[:60],
+                item.get("score", "нет оценки"),
+                str(item.get("url", ""))[:250],
+                str(item.get("content", "")).replace("\\n", " ")[:450],
+            )
+
         if not results:
+            logger.warning("Tavily returned an empty results list")
             raise RuntimeError("No search results")
 
         sources = []
