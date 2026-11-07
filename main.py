@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 import uuid
 import logging
 import threading
@@ -56,63 +57,34 @@ def limit_text(text, limit=1024):
 
     return shortened.rstrip(" ,;:-") + "..."
 
+def normalize_command(text):
+    text = str(text or "").lower().replace("ё", "е").strip()
+    return " ".join(text.split()).strip(" .,!?:;\"'«»")
+
+
+def is_status_command(text):
+    return normalize_command(text) in (
+        "что там",
+        "ну что там",
+        "что там у нас",
+        "ну и что там",
+    )
+
+
 def is_continue_command(text):
-    return text.lower().strip() in (
+    return normalize_command(text) in (
         "продолжай",
         "продолжи",
         "продолжить",
         "готово",
-    )
-
-
-def is_result_check_command(text):
-    text = text.lower().strip().replace("ё", "е")
-    phrases = (
-        "ну что там", "что там", "что нашла", "что ты нашла",
-        "есть результат", "готов ответ", "получилось", "как там поиск",
-        "ну как", "результат", "ты нашла", "нашла",
-    )
-    return text in phrases or any(text.startswith(p + " ") for p in phrases)
+    ) or is_status_command(text)
 
 
 def needs_search(text):
-    text = text.lower()
-
-    phrases = [
-        "найди в интернете",
-        "поищи в интернете",
-        "найди информацию",
-        "поищи информацию",
-        "поищи в сети",
-        "последние новости",
-        "свежие новости",
-        "новости сегодня",
-        "что сейчас происходит",
-        "что происходит сейчас",
-        "на сегодняшний день",
-        "актуальная информация",
-        "актуальные данные",
-        "последние события",
-        "последние изменения",
-        "сколько сейчас стоит",
-        "какая сейчас цена",
-    ]
-
-    if any(phrase in text for phrase in phrases):
-        return True
-
-    # Автоматически ищем свежие рыночные данные, даже если пользователь
-    # не произнёс фразу «найди в интернете».
-    market_terms = (
-        "brent", "брент", "wti", "нефть", "курс", "котировк",
-        "акции", "золото", "биткоин", "криптовалют", "цена", "стоимость",
-    )
-    current_terms = (
-        "сейчас", "сегодня", "текущ", "актуальн", "последн", "на данный момент",
-    )
+    text = str(text or "").lower().replace("ё", "е")
     return (
-        any(term in text for term in market_terms)
-        and any(term in text for term in current_terms)
+        "найди в интернете" in text
+        or "посмотри в интернете" in text
     )
 
 
@@ -452,7 +424,9 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "В основном ответе можно назвать один-два источника "
                     "словами, но не произноси URL и длинные списки ссылок. "
                     "Не сообщай адреса сайтов. "
-                        "Не обрывай предложения и не заканчивай ответ "
+                    "Не задавай вопрос о ссылках на источники: "
+                    "это сделает обработчик навыка отдельно. "
+                    "Не обрывай предложения и не заканчивай ответ "
                     "незавершённой мыслью. "
                     "Говори естественно, как в обычном разговоре."
                 ),
@@ -478,28 +452,21 @@ def search_and_answer(session_id, job_id, user_text, history):
 
         answer = ask_ai(messages, timeout=60)
 
-        save_job_result(
-            session_id,
-            job_id,
-            {
-                "status": "ready",
-                "answer": answer,
-                "sources": source_details,
-            },
-        )
-
+        result = {
+            "status": "ready",
+            "answer": answer,
+            "sources": source_details,
+            "waiting_for_sources": True,
+        }
+        save_job_result(session_id, job_id, result)
         logger.info("Background search completed")
+        return result
 
     except Exception:
         logger.exception("Background search failed")
-        save_job_result(
-            session_id,
-            job_id,
-            {
-                "status": "error",
-                "answer": "",
-            },
-        )
+        result = {"status": "error", "answer": ""}
+        save_job_result(session_id, job_id, result)
+        return result
 
 
 def make_response(body, answer, history=None):
@@ -531,95 +498,209 @@ async def health():
 async def main(body: dict):
     request_data = body.get("request", {})
     user_text = str(request_data.get("original_utterance") or "").strip()
-    text_lower = user_text.lower().strip().replace("ё", "е")
+    text_lower = user_text.lower().strip()
 
+    # Запуск навыка без произнесённого вопроса: только приветствуем.
+    # Важно сделать это до проверки фоновых задач, чтобы пустой запуск
+    # не отменял уже выполняющийся запрос.
     if not user_text:
-        return make_response(body, "Привет! Я DeepSeek Alisa. Чем могу помочь?")
-
-    session_id = str(body.get("session", {}).get("session_id", "default"))
-    state = body.get("state", {}).get("session", {})
-    history = state.get("history", [])
-    check_result = is_continue_command(text_lower) or is_result_check_command(text_lower)
-
-    with jobs_lock:
-        job = search_jobs.get(session_id)
-
-    if job and job.get("status") == "pending":
-        if check_result:
-            message = (
-                "Я ещё проверяю информацию. Спроси меня «Ну что там?» немного позже."
-                if job.get("kind") == "search" else
-                "Я ещё готовлю ответ. Спроси меня «Ну что там?» немного позже."
-            )
-            return make_response(body, message)
-        with jobs_lock:
-            current = search_jobs.get(session_id)
-            if current and current.get("job_id") == job.get("job_id"):
-                search_jobs.pop(session_id, None)
-        job = None
-
-    if job and job.get("status") == "ready":
-        if check_result:
-            answer = str(job.get("answer", "")).strip()
-            original_text = job.get("user_text", "")
-            original_history = job.get("history", history)
-            new_history = original_history[-3:] + [
-                {"role": "user", "content": str(original_text)[:400]},
-                {"role": "assistant", "content": answer[:400]},
-            ]
-            with jobs_lock:
-                current = search_jobs.get(session_id)
-                if current and current.get("job_id") == job.get("job_id"):
-                    search_jobs.pop(session_id, None)
-            return make_response(body, answer or "Не удалось получить готовый ответ.", new_history)
-        with jobs_lock:
-            current = search_jobs.get(session_id)
-            if current and current.get("job_id") == job.get("job_id"):
-                search_jobs.pop(session_id, None)
-        job = None
-
-    if job and job.get("status") == "error":
-        with jobs_lock:
-            current = search_jobs.get(session_id)
-            if current and current.get("job_id") == job.get("job_id"):
-                search_jobs.pop(session_id, None)
-        return make_response(body, "Не удалось получить ответ. Попробуй повторить запрос.")
-
-    if needs_search(user_text):
-        job_id = uuid.uuid4().hex
-        with jobs_lock:
-            search_jobs[session_id] = {
-                "job_id": job_id, "kind": "search", "status": "pending",
-                "answer": "", "user_text": user_text, "history": history[-4:],
-            }
-        executor.submit(search_and_answer, session_id, job_id, user_text, history[-4:])
         return make_response(
             body,
-            "Сейчас проверю информацию. Когда захочешь узнать результат, спроси: «Ну что там?»",
+            "Привет! Я DeepSeek Alisa. Чем могу помочь?",
         )
 
-    # Обычные вопросы пробуем обработать сразу, чтобы Алиса не произносила
-    # фразу ожидания для каждого запроса. При долгом ответе используем фон.
-    try:
-        messages = build_chat_messages(user_text, history)
-        answer = ask_ai(messages, timeout=3.2)
-        new_history = history[-3:] + [
-            {"role": "user", "content": user_text[:400]},
-            {"role": "assistant", "content": answer[:400]},
-        ]
-        return make_response(body, answer, new_history)
-    except Exception:
-        logger.exception("Synchronous chat failed; switching to background")
+    session = body.get("session", {})
+    session_id = str(session.get("session_id", "default"))
+    # user_id persists across separate Alice sessions; session_id may change
+    # between the initial request and the follow-up phrase "Что там?".
+    user_id = session.get("user", {}).get("user_id")
+    job_key = str(user_id or session_id)
 
-    job_id = uuid.uuid4().hex
+    state = body.get("state", {}).get("session", {})
+    history = state.get("history", [])
+
     with jobs_lock:
-        search_jobs[session_id] = {
-            "job_id": job_id, "kind": "chat", "status": "pending",
-            "answer": "", "user_text": user_text, "history": history[-4:],
+        job = search_jobs.get(job_key)
+
+    # Если предыдущая задача ещё выполняется, не запускаем вторую
+    # поверх неё. Команда продолжения проверяет готовность результата.
+    if job and job.get("status") == "pending":
+        if is_continue_command(text_lower):
+            if job.get("kind") == "search":
+                # Не подсказываем пользователю команду повторно:
+                # он сам спросит «Что там?», когда захочет получить результат.
+                message = "Поиск ещё выполняется. Попробуй немного позже."
+            else:
+                message = (
+                    "Я ещё готовлю ответ. Спроси «Продолжи» немного позже."
+                )
+            return make_response(body, message)
+
+        # Новый вопрос отменяет ожидание старого результата.
+        with jobs_lock:
+            current = search_jobs.get(job_key)
+            if current and current.get("job_id") == job.get("job_id"):
+                search_jobs.pop(job_key, None)
+        job = None
+
+    # Обрабатываем готовую задачу
+    if job and job.get("status") == "ready":
+        if job.get("kind") == "search":
+            if job.get("waiting_for_sources") and text_lower in (
+                "да", "нужны", "давай", "покажи", "конечно"
+            ):
+                source_list = job.get("sources", [])
+                answer = "Вот источники с датами публикаций:\n"
+
+                for i, source in enumerate(source_list, 1):
+                    entry = (
+                        f"\n{i}. {source['title']}"
+                        f"\nДата: {source['date']}"
+                        f"\nСсылка: {source['url']}\n"
+                    )
+                    if len(answer) + len(entry) > 1000:
+                        answer += "\nОстальные ссылки не поместились в один ответ."
+                        break
+                    answer += entry
+
+                with jobs_lock:
+                    search_jobs.pop(job_key, None)
+
+                return make_response(body, answer)
+
+            if job.get("waiting_for_sources") and text_lower in (
+                "нет", "не нужно", "не надо", "не нужны"
+            ):
+                with jobs_lock:
+                    search_jobs.pop(job_key, None)
+                return make_response(body, "Хорошо, продолжим без ссылок.")
+
+            if is_continue_command(text_lower):
+                answer = (
+                    job["answer"].rstrip()
+                    + "\n\nНужны ссылки на источники с датами публикаций?"
+                )
+                with jobs_lock:
+                    current = search_jobs.get(job_key)
+                    if current and current.get("job_id") == job.get("job_id"):
+                        current["waiting_for_sources"] = True
+                return make_response(body, answer)
+
+            # Иное сообщение — начинаем обработку нового запроса.
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                if current and current.get("job_id") == job.get("job_id"):
+                    search_jobs.pop(job_key, None)
+
+        elif job.get("kind") == "chat":
+            if is_continue_command(text_lower):
+                answer = job.get("answer", "")
+                original_text = job.get("user_text", "")
+                original_history = job.get("history", [])
+                new_history = original_history[-3:] + [
+                    {"role": "user", "content": original_text[:400]},
+                    {"role": "assistant", "content": answer[:400]},
+                ]
+
+                with jobs_lock:
+                    current = search_jobs.get(job_key)
+                    if current and current.get("job_id") == job.get("job_id"):
+                        search_jobs.pop(job_key, None)
+
+                return make_response(body, answer, new_history)
+
+            # Пользователь задал новый вопрос — удаляем старый результат.
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                if current and current.get("job_id") == job.get("job_id"):
+                    search_jobs.pop(job_key, None)
+
+    elif job and job.get("status") == "error":
+        with jobs_lock:
+            current = search_jobs.get(job_key)
+            if current and current.get("job_id") == job.get("job_id"):
+                search_jobs.pop(job_key, None)
+
+        return make_response(
+            body,
+            "Не удалось получить ответ. Попробуй повторить запрос.",
+        )
+
+    # A status phrase is a retrieval command, not a new question for the AI.
+    if is_status_command(user_text):
+        return make_response(
+            body,
+            "Я пока не вижу сохранённого результата поиска. Повтори вопрос "
+            "с фразой «найди в интернете» или «посмотри в интернете».",
+        )
+
+    # Запускаем интернет-поиск в фоновом потоке
+    if needs_search(user_text):
+        job_id = uuid.uuid4().hex
+
+        with jobs_lock:
+            search_jobs[job_key] = {
+                "job_id": job_id,
+                "kind": "search",
+                "status": "pending",
+                "answer": "",
+                "user_text": user_text,
+                "history": history[-4:],
+            }
+
+        future = executor.submit(
+            search_and_answer,
+            job_key,
+            job_id,
+            user_text,
+            history[-4:],
+        )
+
+        try:
+            # Give fast searches a chance to finish during this same turn.
+            # Keep a safety margin below Alice's webhook response deadline.
+            result = await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=3.0,
+            )
+            if result and result.get("status") == "ready":
+                return make_response(body, result.get("answer", "Поиск завершён."))
+            if result and result.get("status") == "error":
+                return make_response(
+                    body,
+                    "Не удалось найти информацию. Попробуй повторить запрос немного позже.",
+                )
+        except asyncio.TimeoutError:
+            logger.info("Search did not finish within the short voice wait window")
+        except Exception:
+            logger.exception("Error while waiting briefly for search result")
+
+        # The background task keeps running. The result can be retrieved
+        # with "Что там?" once the next request reaches the skill.
+        return make_response(body, "Сейчас посмотрю.")
+
+    # Обычный запрос тоже обрабатывается в фоне
+    job_id = uuid.uuid4().hex
+
+    with jobs_lock:
+        search_jobs[job_key] = {
+            "job_id": job_id,
+            "kind": "chat",
+            "status": "pending",
+            "answer": "",
+            "user_text": user_text,
+            "history": history[-4:],
         }
-    executor.submit(chat_in_background, session_id, job_id, user_text, history[-4:])
-    return make_response(
-        body,
-        "Мне нужно немного больше времени. Спроси меня «Ну что там?» чуть позже.",
+
+    executor.submit(
+        chat_in_background,
+        job_key,
+        job_id,
+        user_text,
+        history[-4:],
     )
 
+    return make_response(
+        body,
+        "Хорошо, готовлю ответ. Скажи «Продолжи» через несколько секунд.",
+    )
