@@ -306,6 +306,12 @@ def search_and_answer(session_id, job_id, user_text, history):
             timeout=20,
         )
 
+        if not response.ok:
+            logger.error(
+                "Tavily error response: %s",
+                response.text[:1000]
+            )
+
         response.raise_for_status()
         data = response.json()
         results = data.get("results", [])
