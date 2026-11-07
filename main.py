@@ -342,8 +342,18 @@ async def health():
 
 @app.post("/")
 async def main(body: dict):
-    user_text = body["request"]["original_utterance"].strip()
+    request_data = body.get("request", {})
+    user_text = str(request_data.get("original_utterance") or "").strip()
     text_lower = user_text.lower().strip()
+
+    # Запуск навыка без произнесённого вопроса: только приветствуем.
+    # Важно сделать это до проверки фоновых задач, чтобы пустой запуск
+    # не отменял уже выполняющийся запрос.
+    if not user_text:
+        return make_response(
+            body,
+            "Привет! Я DeepSeek Alisa. Чем могу помочь?",
+        )
 
     session_id = str(
         body.get("session", {}).get("session_id", "default")
