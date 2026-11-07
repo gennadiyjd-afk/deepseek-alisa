@@ -288,7 +288,8 @@ def search_and_answer(session_id, job_id, user_text, history):
 
         search_payload = {
             "query": search_query,
-            "search_depth": "fast",
+            # Tavily supports the finance topic only with advanced search.
+            "search_depth": "advanced" if is_finance else "fast",
             "max_results": 7,
             "topic": search_topic,
             "include_published_date": True,
