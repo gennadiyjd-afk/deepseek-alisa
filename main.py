@@ -88,7 +88,22 @@ def needs_search(text):
         "какая сейчас цена",
     ]
 
-    return any(phrase in text for phrase in phrases)
+    if any(phrase in text for phrase in phrases):
+        return True
+
+    # Автоматически ищем свежие рыночные данные, даже если пользователь
+    # не произнёс фразу «найди в интернете».
+    market_terms = (
+        "brent", "брент", "wti", "нефть", "курс", "котировк",
+        "акции", "золото", "биткоин", "криптовалют", "цена", "стоимость",
+    )
+    current_terms = (
+        "сейчас", "сегодня", "текущ", "актуальн", "последн", "на данный момент",
+    )
+    return (
+        any(term in text for term in market_terms)
+        and any(term in text for term in current_terms)
+    )
 
 
 def save_job_result(session_id, job_id, result):
@@ -281,12 +296,23 @@ def search_and_answer(session_id, job_id, user_text, history):
 
         if is_oil:
             search_topic = "finance"
+            is_wti = "wti" in lower_text
+            benchmark = "WTI" if is_wti else "Brent"
+            exchange_contract = (
+                "NYMEX WTI crude oil futures, front-month contract"
+                if is_wti else
+                "ICE Brent crude oil futures, front-month contract"
+            )
             search_query = (
-                f"Brent crude oil price today {today}, latest live market "
-                f"quote for ICE Brent futures in USD per barrel, current "
-                f"trading price, latest update date and time. "
-                f"Russian query: {user_text}. "
-                f"Do not return historical prices as current."
+                f"{benchmark} crude oil latest market quote today {today}. "
+                f"Find the actual quoted price for {exchange_contract}, "
+                f"contract delivery month, USD per barrel, exact quote "
+                f"date and time or last update timestamp. Prefer official "
+                f"exchange quote pages and reputable financial news such "
+                f"as ICE, CME, Reuters and major market data providers. "
+                f"Distinguish the futures contract from the general spot "
+                f"benchmark. Russian query: {user_text}. "
+                f"Do not present an old article or historical quote as current."
             )
         elif is_finance:
             search_topic = "finance"
@@ -345,11 +371,13 @@ def search_and_answer(session_id, job_id, user_text, history):
             )
             url = str(item.get("url", ""))
 
+            content = str(item.get("content", ""))
             sources.append(
-                "Название: " + title
-                + "\nДата публикации: " + published_date
-                + "\nСсылка: " + url
-                + "\nСодержание: " + str(item.get("content", ""))[:1000]
+                "Источник: " + title
+                + "\nДомен: " + (url.split("/")[2] if "://" in url else "не указан")
+                + "\nДата публикации материала: " + published_date
+                + "\nURL: " + url
+                + "\nФрагмент источника: " + content[:1400]
             )
 
             source_details.append({
@@ -374,14 +402,25 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "Не называй себя ChatGPT или OpenAI. "
                     "Используй найденные материалы для ответа. "
                     "Не выдумывай факты. "
-                    "Если вопрос касается цены или котировки, "
-                    "указывай дату последнего обновления данных. "
+                    "Если вопрос касается цены или котировки, обязательно "
+                    "различай дату публикации статьи и дату/время самой "
+                    "котировки: это не одно и то же. Дату и время котировки "
+                    "называй только тогда, когда они прямо подтверждены "
+                    "текстом найденного источника. "
                     "Не выдавай старую котировку за текущую. "
-                    "Для нефти Brent и WTI указывай цену именно за баррель "
-                    "и валюту котировки. Ищи текущую биржевую котировку "
-                    "или последнюю цену закрытия, а не обзорные статьи. "
-                    "Если дата или время самой котировки не подтверждены, "
-                    "не называй её текущей. "
+                    "Для нефти Brent и WTI указывай цену за баррель и валюту. "
+                    "Если источник указывает месяц поставки фьючерса, "
+                    "назови этот контрактный месяц. Не называй цену "
+                    "конкретного фьючерсного контракта просто спотовой "
+                    "ценой Brent или WTI. Если контрактный месяц не указан, "
+                    "не придумывай его. "
+                    "Для нефтяных котировок укажи название источника "
+                    "(например, ICE, CME, Reuters или название площадки), "
+                    "если оно видно в найденных материалах. "
+                    "Ищи биржевую котировку или последнюю цену закрытия, "
+                    "а не обзорные статьи. Если дата или время самой "
+                    "котировки не подтверждены, прямо скажи об этом; "
+                    "не подменяй их датой публикации статьи. "
                     "Если актуальная цена не найдена, прямо сообщи об этом. "
                     "Если биржа закрыта, укажи последнюю доступную цену закрытия. "
                     "Обязательно сверяй даты публикаций с сегодняшней датой. "
@@ -392,11 +431,16 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "Не утверждай, что событие произошло, если источники "
                     "этого не подтверждают. "
                     "Отдавай предпочтение самым свежим материалам. "
-                    "Если источники противоречат друг другу, сообщи об этом. "
+                    "Если источники показывают разные цены, не выбирай "
+                    "произвольно одну. Кратко объясни возможную причину: "
+                    "разное время обновления, разные контрактные месяцы, "
+                    "биржа или тип цены. Если причина не ясна, так и скажи "
+                    "и приведи обе цифры с названиями источников. "
                     "Учитывай все найденные материалы, а не только первые. "
                     "Ответ должен быть законченным, кратким и понятным. "
                     "Максимум 650 символов. "
-                    "Не перечисляй источники, даты и ссылки в основном ответе. "
+                    "В основном ответе можно назвать один-два источника "
+                    "словами, но не произноси URL и длинные списки ссылок. "
                     "Не сообщай адреса сайтов. "
                     "Не задавай вопрос о ссылках на источники: "
                     "это сделает обработчик навыка отдельно. "
