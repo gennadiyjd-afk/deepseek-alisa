@@ -266,39 +266,34 @@ def search_and_answer(session_id, job_id, user_text, history):
         today = datetime.now().astimezone().strftime("%d.%m.%Y")
         lower_text = user_text.lower()
 
-        # Определяем, нужен ли финансовый поиск вместо новостного.
-        finance_terms = (
-            "нефть", "brent", "брент", "wti", "золото",
-            "курс", "доллар", "евро", "рубль", "акции",
-            "котиров", "бирж", "биткоин", "криптовалют",
-            "газ", "цена", "стоимость",
+        finance_words = (
+            "нефть", "brent", "wti", "золото", "курс", "доллар",
+            "евро", "рубль", "акции", "котировк", "бирж", "биткоин",
+            "криптовалют", "стоимость", "цена", "газ",
         )
-        is_finance = any(term in lower_text for term in finance_terms)
+        is_finance = any(word in lower_text for word in finance_words)
 
         if is_finance:
             search_topic = "finance"
             search_query = (
-                f"{user_text}. Найди последнюю доступную рыночную цену "
-                f"или котировку на {today}. Укажи дату и время обновления, "
-                "валюту и единицу измерения."
+                f"{user_text}. Актуальная цена или последняя котировка "
+                f"на {today}; укажи дату и время обновления данных."
             )
         else:
             search_topic = "news"
             search_query = (
-                f"{user_text} самые свежие новости и последние события "
-                f"на {today}"
+                f"{user_text} самые свежие новости "
+                f"и последние события на {today}"
             )
 
         search_payload = {
-            "query": search_query[:380],
+            "query": search_query,
             "search_depth": "fast",
             "max_results": 7,
             "topic": search_topic,
             "include_published_date": True,
         }
-
-        # Параметр days используем только для новостного поиска.
-        if search_topic == "news":
+        if not is_finance:
             search_payload["days"] = 7
 
         response = requests.post(
@@ -311,39 +306,11 @@ def search_and_answer(session_id, job_id, user_text, history):
             timeout=20,
         )
 
-        if not response.ok:
-            logger.error(
-                "Tavily error: status=%s, body=%s",
-                response.status_code,
-                response.text[:1000],
-            )
-            response.raise_for_status()
-
+        response.raise_for_status()
         data = response.json()
         results = data.get("results", [])
 
-        # Диагностика ответа Tavily: помогает понять,
-        # какие именно материалы были найдены.
-        logger.info(
-            "Tavily response: topic=%s, results_count=%s, response_keys=%s",
-            search_topic,
-            len(results),
-            list(data.keys()),
-        )
-
-        for index, item in enumerate(results[:7], start=1):
-            logger.info(
-                "Tavily result %s: title=%s | date=%s | score=%s | url=%s | content=%s",
-                index,
-                str(item.get("title", "Без названия"))[:180],
-                str(item.get("published_date") or "дата не указана")[:60],
-                item.get("score", "нет оценки"),
-                str(item.get("url", ""))[:250],
-                str(item.get("content", "")).replace("\\n", " ")[:450],
-            )
-
         if not results:
-            logger.warning("Tavily returned an empty results list")
             raise RuntimeError("No search results")
 
         sources = []
@@ -358,9 +325,9 @@ def search_and_answer(session_id, job_id, user_text, history):
 
             sources.append(
                 "Название: " + title
-                + "\\nДата публикации: " + published_date
-                + "\\nСсылка: " + url
-                + "\\nСодержание: " + str(item.get("content", ""))[:1000]
+                + "\nДата публикации: " + published_date
+                + "\nСсылка: " + url
+                + "\nСодержание: " + str(item.get("content", ""))[:1000]
             )
 
             source_details.append({
@@ -368,23 +335,6 @@ def search_and_answer(session_id, job_id, user_text, history):
                 "date": published_date,
                 "url": url,
             })
-
-        if is_finance:
-            search_instruction = (
-                "Это финансовый запрос. Ищи именно последнюю доступную "
-                "рыночную котировку, а не старую новостную статью. "
-                "Обязательно называй дату котировки, валюту и единицу "
-                "измерения, если они указаны в источниках. Отличай цену "
-                "во время торгов от цены закрытия. Если рынки закрыты, "
-                "сообщи последнюю доступную цену закрытия и её дату. "
-                "Если источники не подтверждают актуальную цену, прямо "
-                "скажи об этом. Не подставляй устаревшее значение."
-            )
-        else:
-            search_instruction = (
-                "Это запрос о новостях. Отдавай предпочтение самым свежим "
-                "публикациям и не выдавай старые материалы за новые."
-            )
 
         messages = [
             {
@@ -402,19 +352,24 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "Не называй себя ChatGPT или OpenAI. "
                     "Используй найденные материалы для ответа. "
                     "Не выдумывай факты. "
-                    f"{search_instruction} "
-                    "Сверяй даты публикаций с сегодняшней датой. "
+                    "Если вопрос касается цены или котировки, "
+                    "указывай дату последнего обновления данных. "
+                    "Не выдавай старую котировку за текущую. "
+                    "Если актуальная цена не найдена, прямо сообщи об этом. "
+                    "Если биржа закрыта, укажи последнюю доступную цену закрытия. "
+                    "Обязательно сверяй даты публикаций с сегодняшней датой. "
                     "Не называй событие сегодняшним, если оно произошло "
-                    "раньше. Не выдавай старые данные за новые. "
-                    "Если публикация старше нескольких дней, уточняй её дату. "
+                    "раньше. Не выдавай старые новости за новые. "
+                    "Если публикация старше нескольких дней, "
+                    "уточняй её дату. "
                     "Не утверждай, что событие произошло, если источники "
                     "этого не подтверждают. "
+                    "Отдавай предпочтение самым свежим материалам. "
                     "Если источники противоречат друг другу, сообщи об этом. "
                     "Учитывай все найденные материалы, а не только первые. "
                     "Ответ должен быть законченным, кратким и понятным. "
                     "Максимум 650 символов. "
-                    "Не перечисляй источники, даты и ссылки в основном ответе, "
-                    "кроме даты котировки в финансовом ответе. "
+                    "Не перечисляй источники, даты и ссылки в основном ответе. "
                     "Не сообщай адреса сайтов. "
                     "Не задавай вопрос о ссылках на источники: "
                     "это сделает обработчик навыка отдельно. "
@@ -434,7 +389,7 @@ def search_and_answer(session_id, job_id, user_text, history):
 
         messages.append({
             "role": "system",
-            "content": "Результаты интернет-поиска:\\n\\n" + "\\n\\n".join(sources),
+            "content": "Результаты интернет-поиска:\n\n" + "\n\n".join(sources),
         })
 
         messages.append({
