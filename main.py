@@ -232,26 +232,22 @@ def chat_in_background(session_id, job_id, user_text, history):
         messages = build_chat_messages(user_text, history)
         answer = ask_ai(messages, timeout=60)
 
-        save_job_result(
-            session_id,
-            job_id,
-            {
-                "status": "ready",
-                "answer": answer,
-            },
-        )
+        result = {
+            "status": "ready",
+            "answer": answer,
+        }
+        save_job_result(session_id, job_id, result)
         logger.info("Background chat completed")
+        return result
 
     except Exception:
         logger.exception("Background chat failed")
-        save_job_result(
-            session_id,
-            job_id,
-            {
-                "status": "error",
-                "answer": "",
-            },
-        )
+        result = {
+            "status": "error",
+            "answer": "",
+        }
+        save_job_result(session_id, job_id, result)
+        return result
 
 def search_and_answer(session_id, job_id, user_text, history):
     try:
@@ -531,9 +527,7 @@ async def main(body: dict):
                 # он сам спросит «Что там?», когда захочет получить результат.
                 message = "Поиск ещё выполняется. Попробуй немного позже."
             else:
-                message = (
-                    "Я ещё готовлю ответ. Спроси «Продолжи» немного позже."
-                )
+                message = "Ответ ещё готовится. Попробуй немного позже."
             return make_response(body, message)
 
         # Новый вопрос отменяет ожидание старого результата.
@@ -679,7 +673,10 @@ async def main(body: dict):
         # with "Что там?" once the next request reaches the skill.
         return make_response(body, "Сейчас посмотрю.")
 
-    # Обычный запрос тоже обрабатывается в фоне
+    # Обычный запрос: даём модели до трёх секунд, чтобы ответить
+    # в рамках того же обращения к навыку. Если ответ не успел,
+    # фоновая задача продолжит работу, а результат можно запросить
+    # отдельной командой «Продолжи».
     job_id = uuid.uuid4().hex
 
     with jobs_lock:
@@ -692,7 +689,7 @@ async def main(body: dict):
             "history": history[-4:],
         }
 
-    executor.submit(
+    future = executor.submit(
         chat_in_background,
         job_key,
         job_id,
@@ -700,7 +697,23 @@ async def main(body: dict):
         history[-4:],
     )
 
-    return make_response(
-        body,
-        "Хорошо, готовлю ответ. Скажи «Продолжи» через несколько секунд.",
-    )
+    try:
+        result = await asyncio.wait_for(
+            asyncio.wrap_future(future),
+            timeout=3.0,
+        )
+        if result and result.get("status") == "ready":
+            return make_response(body, result.get("answer", ""))
+        if result and result.get("status") == "error":
+            return make_response(
+                body,
+                "Не удалось подготовить ответ. Попробуй повторить вопрос.",
+            )
+    except asyncio.TimeoutError:
+        logger.info("Chat did not finish within the short voice wait window")
+    except Exception:
+        logger.exception("Error while waiting briefly for chat answer")
+
+    # Не произносим прежнюю длинную подсказку.
+    # Задача продолжает выполняться, ответ сохранится для команды «Продолжи».
+    return make_response(body, "Секунду.")
