@@ -116,6 +116,32 @@ def needs_search(text):
     )
 
 
+def is_complex_question(text):
+    """Определяет запросы, которым обычно требуется длительная обработка."""
+    normalized = normalize_command(text)
+    complex_phrases = (
+        "подробно проанализируй",
+        "проведи анализ",
+        "глубокий анализ",
+        "сравни подробно",
+        "составь подробный план",
+        "разработай стратегию",
+        "подготовь исследование",
+        "напиши большую программу",
+        "разбери по пунктам",
+        "максимально подробно",
+    )
+    if any(phrase in normalized for phrase in complex_phrases):
+        return True
+
+    # Длинные многочастные запросы чаще требуют заметно больше времени.
+    words = normalized.split()
+    if len(words) >= 35 or len(normalized) >= 240:
+        return True
+
+    return False
+
+
 def save_job_result(session_id, job_id, result):
     """Записывает результат, только если это всё ещё актуальная задача."""
     with jobs_lock:
@@ -657,9 +683,15 @@ async def main(body: dict):
         logger.info("Search task submitted; returning immediately to Alice")
         return make_response(body, "Сейчас посмотрю.")
 
-    # Обычный разговор: даём модели короткое время на быстрый ответ.
-    # Если ответ не готов за 2 секунды, продолжаем запрос в фоне,
-    # чтобы не удерживать вебхук Алисы до тайм-аута.
+    # Обычный разговор: простым вопросам даём почти всё безопасное
+    # время вебхука, а явно сложные сразу продолжаем в фоне.
+    complex_question = is_complex_question(user_text)
+    wait_timeout = 0.35 if complex_question else 3.35
+    logger.info(
+        "Chat question classified as %s; wait timeout %.2f seconds",
+        "complex" if complex_question else "simple",
+        wait_timeout,
+    )
     job_id = uuid.uuid4().hex
     with jobs_lock:
         search_jobs[job_key] = {
@@ -682,7 +714,7 @@ async def main(body: dict):
     try:
         # shield не позволяет тайм-ауту ожидания отменить фоновый запрос.
         wrapped_future = asyncio.shield(asyncio.wrap_future(future))
-        result = await asyncio.wait_for(wrapped_future, timeout=2.0)
+        result = await asyncio.wait_for(wrapped_future, timeout=wait_timeout)
 
         if result.get("status") == "ready":
             answer = result.get("answer", "")
@@ -699,11 +731,15 @@ async def main(body: dict):
         raise RuntimeError("Background chat returned no answer")
 
     except asyncio.TimeoutError:
-        logger.info("Chat is still running after 2 seconds; returning control to Alice")
-        return make_response(
-            body,
-            "Ответ ещё готовится. Скажи «Что там?» немного позже.",
+        logger.info(
+            "Chat is still running after %.2f seconds; returning control to Alice",
+            wait_timeout,
         )
+        if complex_question:
+            message = "Это непростой вопрос, я готовлю ответ. Скажи «Что там?» немного позже."
+        else:
+            message = "Ответ задерживается. Скажи «Что там?» немного позже."
+        return make_response(body, message)
 
     except Exception:
         logger.exception("Chat request failed")
