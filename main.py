@@ -83,7 +83,6 @@ def save_job_result(session_id, job_id, result):
 
         current.update(result)
 
-
 def ask_ai(messages, timeout=25):
     if not API_KEY:
         raise RuntimeError("ROUTER_API_KEY is missing")
@@ -106,17 +105,62 @@ def ask_ai(messages, timeout=25):
     response.raise_for_status()
     data = response.json()
 
-    answer = (
-        data["choices"][0]
-        .get("message", {})
-        .get("content", "")
-    )
+    choices = data.get("choices") if isinstance(data, dict) else None
+
+    if not isinstance(choices, list) or not choices:
+        logger.error(
+            "AI response has no choices: status=%s, keys=%s",
+            response.status_code,
+            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+        )
+        raise RuntimeError("Empty AI response")
+
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message") or {}
+
+    if not isinstance(message, dict):
+        message = {}
+
+    content = message.get("content", "")
+    answer = ""
+
+    if isinstance(content, str):
+        answer = content.strip()
+
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text_part = item.get("text")
+                if isinstance(text_part, str):
+                    parts.append(text_part)
+
+        answer = "\n".join(parts).strip()
 
     if not answer:
+        logger.error(
+            "Empty AI content: status=%s, finish_reason=%s, "
+            "message_keys=%s, content_type=%s, "
+            "content_length=%s, reasoning_present=%s, "
+            "reasoning_length=%s, refusal_present=%s, "
+            "tool_calls_present=%s, usage=%s",
+            response.status_code,
+            choice.get("finish_reason"),
+            list(message.keys()),
+            type(content).__name__,
+            len(content) if isinstance(content, (str, list)) else 0,
+            bool(message.get("reasoning")),
+            len(str(message.get("reasoning", ""))),
+            bool(message.get("refusal")),
+            bool(message.get("tool_calls")),
+            data.get("usage"),
+        )
+
         raise RuntimeError("Empty AI response")
 
     return answer
-
 
 def build_chat_messages(user_text, history):
     messages = [
