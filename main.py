@@ -65,6 +65,16 @@ def is_continue_command(text):
     )
 
 
+def is_result_check_command(text):
+    text = text.lower().strip().replace("ё", "е")
+    phrases = (
+        "ну что там", "что там", "что нашла", "что ты нашла",
+        "есть результат", "готов ответ", "получилось", "как там поиск",
+        "ну как", "результат", "ты нашла", "нашла",
+    )
+    return text in phrases or any(text.startswith(p + " ") for p in phrases)
+
+
 def needs_search(text):
     text = text.lower()
 
@@ -442,9 +452,7 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "В основном ответе можно назвать один-два источника "
                     "словами, но не произноси URL и длинные списки ссылок. "
                     "Не сообщай адреса сайтов. "
-                    "Не задавай вопрос о ссылках на источники: "
-                    "это сделает обработчик навыка отдельно. "
-                    "Не обрывай предложения и не заканчивай ответ "
+                        "Не обрывай предложения и не заканчивай ответ "
                     "незавершённой мыслью. "
                     "Говори естественно, как в обычном разговоре."
                 ),
@@ -477,7 +485,6 @@ def search_and_answer(session_id, job_id, user_text, history):
                 "status": "ready",
                 "answer": answer,
                 "sources": source_details,
-                "waiting_for_sources": True,
             },
         )
 
@@ -524,183 +531,95 @@ async def health():
 async def main(body: dict):
     request_data = body.get("request", {})
     user_text = str(request_data.get("original_utterance") or "").strip()
-    text_lower = user_text.lower().strip()
+    text_lower = user_text.lower().strip().replace("ё", "е")
 
-    # Запуск навыка без произнесённого вопроса: только приветствуем.
-    # Важно сделать это до проверки фоновых задач, чтобы пустой запуск
-    # не отменял уже выполняющийся запрос.
     if not user_text:
-        return make_response(
-            body,
-            "Привет! Я DeepSeek Alisa. Чем могу помочь?",
-        )
+        return make_response(body, "Привет! Я DeepSeek Alisa. Чем могу помочь?")
 
-    session_id = str(
-        body.get("session", {}).get("session_id", "default")
-    )
-
+    session_id = str(body.get("session", {}).get("session_id", "default"))
     state = body.get("state", {}).get("session", {})
     history = state.get("history", [])
+    check_result = is_continue_command(text_lower) or is_result_check_command(text_lower)
 
     with jobs_lock:
         job = search_jobs.get(session_id)
 
-    # Если предыдущая задача ещё выполняется, не запускаем вторую
-    # поверх неё. Команда продолжения проверяет готовность результата.
     if job and job.get("status") == "pending":
-        if is_continue_command(text_lower):
-            if job.get("kind") == "search":
-                message = (
-                    "Я ещё ищу информацию. "
-                    "Попробуй сказать «Продолжи» немного позже."
-                )
-            else:
-                message = (
-                    "Я ещё готовлю ответ. "
-                    "Попробуй сказать «Продолжи» немного позже."
-                )
+        if check_result:
+            message = (
+                "Я ещё проверяю информацию. Спроси меня «Ну что там?» немного позже."
+                if job.get("kind") == "search" else
+                "Я ещё готовлю ответ. Спроси меня «Ну что там?» немного позже."
+            )
             return make_response(body, message)
-
-        # Новый вопрос отменяет ожидание старого результата.
         with jobs_lock:
             current = search_jobs.get(session_id)
             if current and current.get("job_id") == job.get("job_id"):
                 search_jobs.pop(session_id, None)
         job = None
 
-    # Обрабатываем готовую задачу
     if job and job.get("status") == "ready":
-        if job.get("kind") == "search":
-            if job.get("waiting_for_sources") and text_lower in (
-                "да", "нужны", "давай", "покажи", "конечно"
-            ):
-                source_list = job.get("sources", [])
-                answer = "Вот источники с датами публикаций:\n"
-
-                for i, source in enumerate(source_list, 1):
-                    entry = (
-                        f"\n{i}. {source['title']}"
-                        f"\nДата: {source['date']}"
-                        f"\nСсылка: {source['url']}\n"
-                    )
-                    if len(answer) + len(entry) > 1000:
-                        answer += "\nОстальные ссылки не поместились в один ответ."
-                        break
-                    answer += entry
-
-                with jobs_lock:
-                    search_jobs.pop(session_id, None)
-
-                return make_response(body, answer)
-
-            if job.get("waiting_for_sources") and text_lower in (
-                "нет", "не нужно", "не надо", "не нужны"
-            ):
-                with jobs_lock:
-                    search_jobs.pop(session_id, None)
-                return make_response(body, "Хорошо, продолжим без ссылок.")
-
-            if is_continue_command(text_lower):
-                answer = (
-                    job["answer"].rstrip()
-                    + "\n\nНужны ссылки на источники с датами публикаций?"
-                )
-                with jobs_lock:
-                    current = search_jobs.get(session_id)
-                    if current and current.get("job_id") == job.get("job_id"):
-                        current["waiting_for_sources"] = True
-                return make_response(body, answer)
-
-            # Иное сообщение — начинаем обработку нового запроса.
+        if check_result:
+            answer = str(job.get("answer", "")).strip()
+            original_text = job.get("user_text", "")
+            original_history = job.get("history", history)
+            new_history = original_history[-3:] + [
+                {"role": "user", "content": str(original_text)[:400]},
+                {"role": "assistant", "content": answer[:400]},
+            ]
             with jobs_lock:
                 current = search_jobs.get(session_id)
                 if current and current.get("job_id") == job.get("job_id"):
                     search_jobs.pop(session_id, None)
-
-        elif job.get("kind") == "chat":
-            if is_continue_command(text_lower):
-                answer = job.get("answer", "")
-                original_text = job.get("user_text", "")
-                original_history = job.get("history", [])
-                new_history = original_history[-3:] + [
-                    {"role": "user", "content": original_text[:400]},
-                    {"role": "assistant", "content": answer[:400]},
-                ]
-
-                with jobs_lock:
-                    current = search_jobs.get(session_id)
-                    if current and current.get("job_id") == job.get("job_id"):
-                        search_jobs.pop(session_id, None)
-
-                return make_response(body, answer, new_history)
-
-            # Пользователь задал новый вопрос — удаляем старый результат.
-            with jobs_lock:
-                current = search_jobs.get(session_id)
-                if current and current.get("job_id") == job.get("job_id"):
-                    search_jobs.pop(session_id, None)
-
-    elif job and job.get("status") == "error":
+            return make_response(body, answer or "Не удалось получить готовый ответ.", new_history)
         with jobs_lock:
             current = search_jobs.get(session_id)
             if current and current.get("job_id") == job.get("job_id"):
                 search_jobs.pop(session_id, None)
+        job = None
 
-        return make_response(
-            body,
-            "Не удалось получить ответ. Попробуй повторить запрос.",
-        )
+    if job and job.get("status") == "error":
+        with jobs_lock:
+            current = search_jobs.get(session_id)
+            if current and current.get("job_id") == job.get("job_id"):
+                search_jobs.pop(session_id, None)
+        return make_response(body, "Не удалось получить ответ. Попробуй повторить запрос.")
 
-    # Запускаем интернет-поиск в фоновом потоке
     if needs_search(user_text):
         job_id = uuid.uuid4().hex
-
         with jobs_lock:
             search_jobs[session_id] = {
-                "job_id": job_id,
-                "kind": "search",
-                "status": "pending",
-                "answer": "",
-                "user_text": user_text,
-                "history": history[-4:],
+                "job_id": job_id, "kind": "search", "status": "pending",
+                "answer": "", "user_text": user_text, "history": history[-4:],
             }
-
-        executor.submit(
-            search_and_answer,
-            session_id,
-            job_id,
-            user_text,
-            history[-4:],
-        )
-
+        executor.submit(search_and_answer, session_id, job_id, user_text, history[-4:])
         return make_response(
             body,
-            "Хорошо, сейчас поищу информацию в интернете. "
-            "Скажи «Продолжи» через несколько секунд.",
+            "Сейчас проверю информацию. Когда захочешь узнать результат, спроси: «Ну что там?»",
         )
 
-    # Обычный запрос тоже обрабатывается в фоне
-    job_id = uuid.uuid4().hex
+    # Обычные вопросы пробуем обработать сразу, чтобы Алиса не произносила
+    # фразу ожидания для каждого запроса. При долгом ответе используем фон.
+    try:
+        messages = build_chat_messages(user_text, history)
+        answer = ask_ai(messages, timeout=3.2)
+        new_history = history[-3:] + [
+            {"role": "user", "content": user_text[:400]},
+            {"role": "assistant", "content": answer[:400]},
+        ]
+        return make_response(body, answer, new_history)
+    except Exception:
+        logger.exception("Synchronous chat failed; switching to background")
 
+    job_id = uuid.uuid4().hex
     with jobs_lock:
         search_jobs[session_id] = {
-            "job_id": job_id,
-            "kind": "chat",
-            "status": "pending",
-            "answer": "",
-            "user_text": user_text,
-            "history": history[-4:],
+            "job_id": job_id, "kind": "chat", "status": "pending",
+            "answer": "", "user_text": user_text, "history": history[-4:],
         }
-
-    executor.submit(
-        chat_in_background,
-        session_id,
-        job_id,
-        user_text,
-        history[-4:],
-    )
-
+    executor.submit(chat_in_background, session_id, job_id, user_text, history[-4:])
     return make_response(
         body,
-        "Хорошо, готовлю ответ. Скажи «Продолжи» через несколько секунд.",
+        "Мне нужно немного больше времени. Спроси меня «Ну что там?» чуть позже.",
     )
+
