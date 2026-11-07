@@ -112,12 +112,8 @@ def ask_ai(messages, timeout=25):
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": "deepseek/deepseek-v4-pro",
-            "messages": messages,
-            "thinking": {"type": "disabled"},
-            "max_tokens": 1000,
-        },
+        json=search_payload,
+  
         timeout=timeout,
     )
 
@@ -300,15 +296,18 @@ def search_and_answer(session_id, job_id, user_text, history):
                 "Authorization": f"Bearer {TAVILY_KEY}",
                 "Content-Type": "application/json",
             },
-            json={
+             
+            search_payload = {
                 "query": search_query,
                 "search_depth": "fast",
                 "max_results": 7,
                 "topic": search_topic,
-                "days": search_days,
                 "include_published_date": True,
-            },            
-           timeout=20,
+            }
+
+            if search_topic == "news":
+                search_payload["days"] = search_days 
+            timeout=20,
         )
 
         response.raise_for_status()
