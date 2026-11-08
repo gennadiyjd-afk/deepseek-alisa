@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 app = FastAPI()
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("deepseek_alisa")
+logger = logging.getLogger("deepseek_marusya")
 
 API_URL = "https://routerapi.ru/api/v1/chat/completions"
 API_KEY = os.getenv("ROUTER_API_KEY")
@@ -93,8 +93,8 @@ def remove_source_links(text):
 
 
 def is_wake_command(text):
-    """Команда, которой пользователь забирает готовый ответ у Алисы."""
-    return normalize_command(text) == "алиса"
+    """Команда, которой пользователь забирает готовый ответ у Маруси."""
+    return normalize_command(text) == "маруся"
 
 
 def is_continue_command(text):
@@ -138,6 +138,9 @@ def get_social_reply(text):
         "спасибо алиса",
         "спасибо большое алиса",
         "благодарю алиса",
+        "спасибо маруся",
+        "спасибо большое маруся",
+        "благодарю маруся",
     }
     if normalized in thanks_phrases:
         return "Пожалуйста! Рада была помочь!"
@@ -145,9 +148,9 @@ def get_social_reply(text):
     # Убираем приветствие и обращение к Алисе в начале фразы,
     # чтобы распознавались сочетания вроде «Привет, Алиса, как дела?».
     greeting_prefix = re.compile(
-        r"^(?:(?:алиса)\s+)?"
+        r"^(?:(?:алиса|маруся)\s+)?"
         r"(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)"
-        r"(?:\s+алиса)?(?:\s+|$)"
+        r"(?:\s+(?:алиса|маруся))?(?:\s+|$)"
     )
     question = normalized
     while True:
@@ -155,12 +158,12 @@ def get_social_reply(text):
         if cleaned == question:
             break
         question = cleaned
-        question = re.sub(r"^алиса\s+", "", question).strip()
+        question = re.sub(r"^(?:алиса|маруся)\s+", "", question).strip()
 
     # Отдельное приветствие — тоже мгновенный локальный ответ,
     # без запуска модели и ожидания команды «Алиса».
     standalone_greeting = re.fullmatch(
-        r"(?:алиса\s+)?(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)(?:\s+алиса)?",
+        r"(?:(?:алиса|маруся)\s+)?(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)(?:\s+(?:алиса|маруся))?",
         normalized,
     )
     if standalone_greeting:
@@ -175,6 +178,9 @@ def get_social_reply(text):
         "как дела алиса",
         "алиса как дела",
         "как твои дела алиса",
+        "как дела маруся",
+        "маруся как дела",
+        "как твои дела маруся",
     }
     if question in how_are_you_phrases or normalized in how_are_you_phrases:
         return "У меня всё отлично! Спасибо, что интересуешься!"
@@ -818,10 +824,10 @@ def build_chat_messages(user_text, history):
         {
             "role": "system",
             "content": (
-                "Ты — DeepSeek Alisa, голосовой ИИ-помощник "
+                "Ты — DeepSeek Маруся, голосовой ИИ-помощник "
                 "для навыка Яндекс Алисы. "
                 "Если спрашивают имя, отвечай: "
-                "«Я твой интеллектуальный помощник DeepSeek Alisa». "
+                "«Я твой интеллектуальный помощник DeepSeek Маруся». "
                 "Всегда говори о себе в женском роде: "
                 "я рада, я поняла, я подготовила, я нашла. "
                 "Твоего постоянного собеседника зовут Геннадий. "
@@ -1117,7 +1123,7 @@ def search_and_answer(session_id, job_id, user_text, history):
             {
                 "role": "system",
                 "content": (
-                    "Ты — DeepSeek Alisa, голосовой ИИ-помощник "
+                    "Ты — DeepSeek Маруся, голосовой ИИ-помощник "
                     "для Яндекс Алисы. "
                     f"Сегодняшняя дата: {today}. "
                     "Это единственная текущая дата, на которую "
@@ -1256,7 +1262,7 @@ async def main(body: dict):
     if not user_text:
         return make_response(
             body,
-            "Привет! Я твой интеллектуальный помощник DeepSeek Alisa. Чем могу помочь?",
+            "Привет! Я твой интеллектуальный помощник DeepSeek Маруся. Чем могу помочь?",
         )
 
     session = body.get("session", {})
@@ -1295,7 +1301,7 @@ async def main(body: dict):
                 search_jobs.pop(job_key, None)
         job = None
 
-    # Готовый ответ выдаём по слову «Алиса», а следующие части —
+    # Готовый ответ выдаём по слову «Маруся», а следующие части —
     # по командам «Да», «Продолжи» или «Продолжай».
     if job and job.get("status") == "ready":
         if retrieval_command:
@@ -1319,7 +1325,7 @@ async def main(body: dict):
         )
 
     # Если команды получения результата нет и фоновой задачи тоже нет,
-    # не отправляем слово «Алиса» модели как обычный вопрос.
+    # не отправляем слово «Маруся» модели как обычный вопрос.
     if retrieval_command:
         return make_response(body, "Я слушаю. Чем могу помочь?")
 
@@ -1329,7 +1335,7 @@ async def main(body: dict):
     if social_reply:
         return make_response(body, social_reply)
 
-    # Интернет-поиск выполняется в фоне. Результат забирается командой «Алиса».
+    # Интернет-поиск выполняется в фоне. Результат забирается командой «Маруся».
     if needs_search(user_text):
         job_id = uuid.uuid4().hex
         with jobs_lock:
@@ -1421,7 +1427,7 @@ async def main(body: dict):
 
     except asyncio.TimeoutError:
         logger.info(
-            "Chat is still running after %.2f seconds; returning control to Alice",
+            "Chat is still running after %.2f seconds; returning control to Marusya",
             wait_timeout,
         )
         return make_response(body, "Секундочку")
