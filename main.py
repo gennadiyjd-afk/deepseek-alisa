@@ -107,6 +107,43 @@ def is_continue_command(text):
     )
 
 
+def get_social_reply(text):
+    """Мгновенные ответы на благодарность и вопрос о самочувствии."""
+    normalized = normalize_command(text)
+    normalized = " ".join(re.sub(r"[^a-zа-я0-9 ]+", " ", normalized).split())
+
+    thanks_phrases = {
+        "спасибо",
+        "спасибо большое",
+        "большое спасибо",
+        "спасибо тебе",
+        "спасибо большое тебе",
+        "благодарю",
+        "очень благодарен",
+        "очень благодарна",
+        "спасибо алиса",
+        "спасибо большое алиса",
+        "благодарю алиса",
+    }
+    if normalized in thanks_phrases:
+        return "Пожалуйста! Рада была помочь!"
+
+    how_are_you_phrases = {
+        "как дела",
+        "как твои дела",
+        "как у тебя дела",
+        "как поживаешь",
+        "как ты",
+        "как дела алиса",
+        "алиса как дела",
+        "как твои дела алиса",
+    }
+    if normalized in how_are_you_phrases:
+        return "У меня всё отлично! Спасибо, что интересуешься!"
+
+    return None
+
+
 def is_joke_request(text):
     """Определяет просьбы рассказать анекдот или шутку."""
     normalized = normalize_command(text)
@@ -1226,6 +1263,12 @@ async def main(body: dict):
     # не отправляем слово «Алиса» модели как обычный вопрос.
     if retrieval_command:
         return make_response(body, "Я слушаю. Чем могу помочь?")
+
+    # Благодарности и приветственные вопросы обрабатываем мгновенно,
+    # не запуская фоновую задачу и не обращаясь к нейросети.
+    social_reply = get_social_reply(user_text)
+    if social_reply:
+        return make_response(body, social_reply)
 
     # Интернет-поиск выполняется в фоне. Результат забирается командой «Алиса».
     if needs_search(user_text):
