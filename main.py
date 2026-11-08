@@ -9,7 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from fastapi import FastAPI
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 app = FastAPI()
 
@@ -227,11 +228,275 @@ def deliver_job_part(body, job_key, job):
 
     return make_response(body, answer)
 
+def is_stock_quote_request(text):
+    """Распознаёт запросы о биржевых ценах акций."""
+    normalized = normalize_command(text)
+    if any(word in normalized for word in (
+        "котиров", "тикер", "биржевую цену", "биржевая цена",
+    )):
+        return True
+    return bool(
+        re.search(r"(?:сколько\s+стоит|цен[аыуе]|стоимост[ьи]|курс)\s+.{0,35}акци", normalized)
+        or re.search(r"акци\w*\s+.{0,35}(?:цен[аыуе]|стоимост[ьи]|курс|котиров)", normalized)
+    )
+
+
 def needs_search(text):
     text = str(text or "").lower().replace("ё", "е")
     return (
         "найди в интернете" in text
         or "посмотри в интернете" in text
+        or is_stock_quote_request(text)
+    )
+
+
+def extract_stock_query(user_text):
+    """Оставляет в запросе название компании или биржевой тикер."""
+    query = str(user_text or "").strip()
+    query = re.sub(
+        r"(?i)\bнайди\s+в\s+интернете\b|\bпосмотри\s+в\s+интернете\b",
+        " ", query,
+    )
+    query = re.sub(
+        r"(?i)\b(последн\w*|предыдущ\w*|прошл\w*|историческ\w*|текущ\w*|актуальн\w*|свеж\w*|котиров\w*|"
+        r"акци\w*|бумаг\w*|стоимост\w*|цен\w*|курс\w*|биржев\w*|"
+        r"найди|покажи|скажи|какая|какие|сколько|стоит|сейчас|на сегодня|"
+        r"за сегодня|на данный момент)\b",
+        " ", query,
+    )
+    query = re.sub(r"[?!.:,;]+", " ", query)
+    return " ".join(query.split()).strip()
+
+
+def _moex_table_rows(payload, block_name):
+    block = payload.get(block_name, {}) if isinstance(payload, dict) else {}
+    columns = block.get("columns", [])
+    rows = block.get("data", [])
+    parsed = []
+    for values in rows:
+        if not isinstance(values, list):
+            continue
+        item = dict(zip(columns, values))
+        # ISS использует разный регистр названий полей в разных блоках.
+        for key, value in list(item.items()):
+            item.setdefault(str(key).lower(), value)
+            item.setdefault(str(key).upper(), value)
+        parsed.append(item)
+    return parsed
+
+
+def fetch_moex_stock_quote(company_query):
+    """Ищет российскую акцию и получает последнюю цену из MOEX ISS."""
+    headers = {"User-Agent": "Mozilla/5.0 DeepSeekAlisa/1.0"}
+    terms = [company_query]
+    # Русская речь часто использует родительный падеж: «акции Газпрома».
+    if len(company_query) > 4 and company_query[-1:].lower() in ("а", "я", "ы", "и"):
+        terms.append(company_query[:-1])
+
+    for term in dict.fromkeys(t for t in terms if t):
+        search_response = requests.get(
+            "https://iss.moex.com/iss/securities.json",
+            params={"q": term, "iss.meta": "off"},
+            headers=headers,
+            timeout=12,
+        )
+        search_response.raise_for_status()
+        candidates = _moex_table_rows(search_response.json(), "securities")
+        if not candidates:
+            continue
+
+        # Основной режим торгов акциями на MOEX — TQBR.
+        candidates.sort(key=lambda item: (
+            0 if str(item.get("primary_boardid", "")).upper() == "TQBR" else 1,
+            0 if str(item.get("is_trading", "0")) in ("1", "True", "true") else 1,
+        ))
+
+        for candidate in candidates[:12]:
+            secid = str(candidate.get("secid") or "").strip().upper()
+            if not secid:
+                continue
+            quote_response = requests.get(
+                f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{secid}.json",
+                params={"iss.meta": "off", "iss.only": "securities,marketdata"},
+                headers=headers,
+                timeout=12,
+            )
+            if quote_response.status_code == 404:
+                continue
+            quote_response.raise_for_status()
+            payload = quote_response.json()
+            market_rows = _moex_table_rows(payload, "marketdata")
+            if not market_rows:
+                continue
+
+            market_rows.sort(key=lambda item: (
+                0 if str(item.get("BOARDID", "")).upper() == "TQBR" else 1,
+                0 if item.get("LAST") is not None else 1,
+            ))
+            market = market_rows[0]
+            price_key = next((key for key in (
+                "LAST", "LCURRENTPRICE", "MARKETPRICE", "PREVPRICE"
+            ) if market.get(key) not in (None, "", 0, "0")), None)
+            if not price_key:
+                continue
+
+            security_rows = _moex_table_rows(payload, "securities")
+            security = security_rows[0] if security_rows else candidate
+            price = float(market[price_key])
+            currency = str(security.get("CURRENCYID") or "RUB")
+            name = str(
+                security.get("SHORTNAME") or security.get("NAME")
+                or candidate.get("shortname") or candidate.get("name") or secid
+            )
+            date_value = (
+                market.get("LASTTRADEDATE") or market.get("PREVDATE")
+                or security.get("PREVDATE")
+            )
+            time_value = market.get("TIME") or market.get("UPDATETIME")
+            return {
+                "source": "Московская биржа",
+                "symbol": secid,
+                "name": name,
+                "price": price,
+                "currency": currency,
+                "date": str(date_value or ""),
+                "time": str(time_value or ""),
+                "price_type": {
+                    "LAST": "цена последней сделки",
+                    "LCURRENTPRICE": "текущая цена",
+                    "MARKETPRICE": "рыночная цена",
+                    "PREVPRICE": "цена закрытия предыдущей сессии",
+                }.get(price_key, "последняя доступная цена"),
+                "delayed": True,
+                "decimals": int(security.get("DECIMALS") or candidate.get("decimals") or 2),
+            }
+    return None
+
+
+def fetch_yahoo_stock_quote(company_query):
+    """Находит зарубежную акцию и получает цену через Yahoo Finance chart API."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    search_response = requests.get(
+        "https://query1.finance.yahoo.com/v1/finance/search",
+        params={"q": company_query, "quotesCount": 12, "newsCount": 0},
+        headers=headers,
+        timeout=12,
+    )
+    search_response.raise_for_status()
+    quotes = search_response.json().get("quotes", [])
+    equities = [item for item in quotes if item.get("quoteType") == "EQUITY" and item.get("symbol")]
+    if not equities:
+        return None
+
+    query_norm = re.sub(r"[^a-zа-я0-9]", "", company_query.lower().replace("ё", "е"))
+    equities.sort(key=lambda item: (
+        0 if str(item.get("symbol", "")).lower() == company_query.lower() else 1,
+        0 if query_norm and query_norm in re.sub(r"[^a-zа-я0-9]", "", str(item.get("longname") or item.get("shortname") or "").lower().replace("ё", "е")) else 1,
+    ))
+
+    for match in equities[:5]:
+        symbol = str(match["symbol"])
+        chart_response = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+            params={"range": "5d", "interval": "1d", "includePrePost": "false"},
+            headers=headers,
+            timeout=12,
+        )
+        chart_response.raise_for_status()
+        chart = chart_response.json().get("chart", {})
+        results = chart.get("result") or []
+        if not results:
+            continue
+        meta = results[0].get("meta", {})
+        price = meta.get("regularMarketPrice")
+        if price is None:
+            continue
+
+        timestamp = meta.get("regularMarketTime")
+        quote_time = ""
+        if timestamp:
+            try:
+                zone_name = meta.get("exchangeTimezoneName")
+                tz = ZoneInfo(zone_name) if zone_name else timezone.utc
+                quote_time = datetime.fromtimestamp(int(timestamp), tz=tz).strftime("%d.%m.%Y, %H:%M")
+            except Exception:
+                quote_time = datetime.fromtimestamp(int(timestamp), tz=timezone.utc).strftime("%d.%m.%Y, %H:%M UTC")
+
+        return {
+            "source": "Yahoo Finance",
+            "symbol": symbol,
+            "name": str(meta.get("longName") or meta.get("shortName") or match.get("longname") or match.get("shortname") or symbol),
+            "price": float(price),
+            "currency": str(meta.get("currency") or "валюта не указана"),
+            "date": quote_time,
+            "time": "",
+            "price_type": "последняя доступная биржевая котировка",
+            "delayed": False,
+            "decimals": int(meta.get("priceHint") or 2),
+        }
+    return None
+
+
+def format_stock_quote(quote):
+    decimals = max(0, min(int(quote.get("decimals", 2)), 6))
+    price = f"{quote['price']:,.{decimals}f}".replace(",", " ").replace(".", ",")
+    currency_names = {"RUB": "рубля", "USD": "доллара США", "EUR": "евро", "GBP": "фунта стерлингов", "HKD": "гонконгских долларов", "CNY": "юаня"}
+    currency = currency_names.get(quote["currency"], quote["currency"])
+    answer = (
+        f"{quote['name']} ({quote['symbol']}): {quote['price_type']} — "
+        f"{price} {currency} за акцию."
+    )
+    quote_date = quote.get("date", "")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", quote_date):
+        quote_date = datetime.strptime(quote_date, "%Y-%m-%d").strftime("%d.%m.%Y")
+    if quote_date and quote.get("time"):
+        answer += f" Дата и время последней сделки: {quote_date}, {quote['time']}."
+    elif quote_date:
+        answer += f" Дата котировки: {quote_date}."
+    elif quote.get("time"):
+        answer += f" Время последнего обновления: {quote['time']}."
+    else:
+        answer += " Точное время сделки источник не указал."
+    answer += f" Источник: {quote['source']}."
+    if quote.get("delayed"):
+        answer += " Бесплатные данные Московской биржи могут поступать с задержкой до 15 минут."
+    return answer
+
+
+def get_stock_quote_answer(user_text, history=None):
+    company_query = extract_stock_query(user_text)
+    if not company_query and history:
+        # Для уточнений вроде «найди предыдущие котировки» берём компанию
+        # из недавнего запроса пользователя, если она там явно названа.
+        for item in reversed(history[-4:]):
+            if isinstance(item, dict) and item.get("role") == "user":
+                previous_text = str(item.get("content", ""))
+                if is_stock_quote_request(previous_text):
+                    company_query = extract_stock_query(previous_text)
+                    if company_query:
+                        break
+    if not company_query:
+        return "Уточни, акции какой компании тебя интересуют."
+
+    # Кириллические названия в первую очередь ищем на Московской бирже.
+    is_cyrillic = bool(re.search(r"[а-яё]", company_query, flags=re.IGNORECASE))
+    providers = (fetch_moex_stock_quote, fetch_yahoo_stock_quote) if is_cyrillic else (fetch_yahoo_stock_quote, fetch_moex_stock_quote)
+    errors = []
+    for provider in providers:
+        try:
+            quote = provider(company_query)
+            if quote:
+                return format_stock_quote(quote)
+        except Exception as exc:
+            logger.warning("Stock quote provider %s failed: %s", provider.__name__, exc)
+            errors.append(provider.__name__)
+
+    return (
+        f"Не удалось надёжно найти биржевую котировку для «{company_query}». "
+        "Попробуй назвать тикер акции или уточнить биржу."
     )
 
 
@@ -531,6 +796,16 @@ def complete_answer_if_cut_off(answer, messages):
 def search_and_answer(session_id, job_id, user_text, history):
     try:
         logger.info("Background search started")
+
+        if is_stock_quote_request(user_text):
+            logger.info("Dedicated stock quote lookup started")
+            answer = get_stock_quote_answer(user_text, history)
+            save_job_result(session_id, job_id, {
+                "status": "ready",
+                "answer": answer,
+            })
+            logger.info("Dedicated stock quote lookup completed")
+            return {"status": "ready", "answer": answer}
 
         if not TAVILY_KEY:
             raise RuntimeError("TAVILY_API_KEY is missing")
