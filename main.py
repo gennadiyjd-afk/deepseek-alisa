@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 app = FastAPI()
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("deepseek_marusya")
+logger = logging.getLogger("deepseek_alisa")
 
 API_URL = "https://routerapi.ru/api/v1/chat/completions"
 API_KEY = os.getenv("ROUTER_API_KEY")
@@ -93,8 +93,15 @@ def remove_source_links(text):
 
 
 def is_wake_command(text):
-    """Команда, которой пользователь забирает готовый ответ у Маруси."""
-    return normalize_command(text) == "маруся"
+    """Имя помощника, которым можно запросить готовый ответ."""
+    return normalize_command(text) in ("алиса")
+
+
+def is_wait_command(text):
+    """Команда получения ответа после ожидания; учитываем перехват слова «Алиса» Яндексом."""
+    command = normalize_command(text).replace(",", " ")
+    command = " ".join(command.split())
+    return command in ("алиса я жду", "я жду")
 
 
 def is_continue_command(text):
@@ -109,7 +116,9 @@ def is_continue_command(text):
 
 def is_stop_command(text):
     """Команды отказа от продолжения текущего многочастного ответа."""
-    return normalize_command(text) in (
+    command = normalize_command(text)
+    command = re.sub(r"^(?:алиса)\s+", "", command).strip()
+    return command in (
         "нет",
         "не надо",
         "не нужно",
@@ -138,19 +147,16 @@ def get_social_reply(text):
         "спасибо алиса",
         "спасибо большое алиса",
         "благодарю алиса",
-        "спасибо маруся",
-        "спасибо большое маруся",
-        "благодарю маруся",
-    }
+            }
     if normalized in thanks_phrases:
         return "Пожалуйста! Рада была помочь!"
 
     # Убираем приветствие и обращение к Алисе в начале фразы,
     # чтобы распознавались сочетания вроде «Привет, Алиса, как дела?».
     greeting_prefix = re.compile(
-        r"^(?:(?:алиса|маруся)\s+)?"
+        r"^(?:(?:алиса)\s+)?"
         r"(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)"
-        r"(?:\s+(?:алиса|маруся))?(?:\s+|$)"
+        r"(?:\s+(?:алиса))?(?:\s+|$)"
     )
     question = normalized
     while True:
@@ -158,12 +164,12 @@ def get_social_reply(text):
         if cleaned == question:
             break
         question = cleaned
-        question = re.sub(r"^(?:алиса|маруся)\s+", "", question).strip()
+        question = re.sub(r"^(?:алиса)\s+", "", question).strip()
 
     # Отдельное приветствие — тоже мгновенный локальный ответ,
     # без запуска модели и ожидания команды «Алиса».
     standalone_greeting = re.fullmatch(
-        r"(?:(?:алиса|маруся)\s+)?(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)(?:\s+(?:алиса|маруся))?",
+        r"(?:(?:алиса)\s+)?(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)(?:\s+(?:алиса))?",
         normalized,
     )
     if standalone_greeting:
@@ -178,10 +184,7 @@ def get_social_reply(text):
         "как дела алиса",
         "алиса как дела",
         "как твои дела алиса",
-        "как дела маруся",
-        "маруся как дела",
-        "как твои дела маруся",
-    }
+            }
     if question in how_are_you_phrases or normalized in how_are_you_phrases:
         return "У меня всё отлично! Спасибо, что интересуешься!"
 
@@ -393,7 +396,7 @@ def _moex_table_rows(payload, block_name):
 
 def fetch_moex_stock_quote(company_query):
     """Ищет российскую акцию и получает последнюю цену из MOEX ISS."""
-    headers = {"User-Agent": "Mozilla/5.0 DeepSeekAlisa/1.0"}
+    headers = {"User-Agent": "Mozilla/5.0 DeepSeekAlice/1.0"}
     terms = [company_query]
     # Русская речь часто использует родительный падеж: «акции Газпрома».
     if len(company_query) > 4 and company_query[-1:].lower() in ("а", "я", "ы", "и"):
@@ -631,7 +634,7 @@ def fetch_cbr_currency_rate(currency_code):
     response = requests.get(
         "https://www.cbr.ru/scripts/XML_daily.asp",
         params={"date_req": today_moscow.strftime("%d/%m/%Y")},
-        headers={"User-Agent": "Mozilla/5.0 DeepSeekAlisa/1.0"},
+        headers={"User-Agent": "Mozilla/5.0 DeepSeekAlice/1.0"},
         timeout=15,
     )
     response.raise_for_status()
@@ -824,10 +827,10 @@ def build_chat_messages(user_text, history):
         {
             "role": "system",
             "content": (
-                "Ты — DeepSeek Маруся, голосовой ИИ-помощник "
+                "Ты — DeepSeek Алиса, голосовой ИИ-помощник "
                 "для навыка Яндекс Алисы. "
                 "Если спрашивают имя, отвечай: "
-                "«Я твой интеллектуальный помощник DeepSeek Маруся». "
+                "«Я твой интеллектуальный помощник DeepSeek Алиса». "
                 "Всегда говори о себе в женском роде: "
                 "я рада, я поняла, я подготовила, я нашла. "
                 "Твоего постоянного собеседника зовут Геннадий. "
@@ -1123,7 +1126,7 @@ def search_and_answer(session_id, job_id, user_text, history):
             {
                 "role": "system",
                 "content": (
-                    "Ты — DeepSeek Маруся, голосовой ИИ-помощник "
+                    "Ты — DeepSeek Алиса, голосовой ИИ-помощник "
                     "для Яндекс Алисы. "
                     f"Сегодняшняя дата: {today}. "
                     "Это единственная текущая дата, на которую "
@@ -1262,7 +1265,7 @@ async def main(body: dict):
     if not user_text:
         return make_response(
             body,
-            "Привет! Я твой интеллектуальный помощник DeepSeek Маруся. Чем могу помочь?",
+            "Привет! Я твой интеллектуальный помощник DeepSeek Алиса. Чем могу помочь?",
         )
 
     session = body.get("session", {})
@@ -1274,7 +1277,8 @@ async def main(body: dict):
     history = state.get("history", [])
     wake_command = is_wake_command(user_text)
     continue_command = is_continue_command(user_text)
-    retrieval_command = wake_command or continue_command
+    wait_command = is_wait_command(user_text)
+    retrieval_command = wake_command or wait_command or continue_command
 
     with jobs_lock:
         job = search_jobs.get(job_key)
@@ -1288,7 +1292,7 @@ async def main(body: dict):
                 search_jobs.pop(job_key, None)
         return make_response(body, "Хорошо, больше не буду продолжать.")
 
-    # Если задача ещё выполняется, команда «Алиса» или продолжения
+    # Если задача ещё выполняется, команда ожидания «Алиса, я жду» / «Я жду», имя «Алиса» либо продолжения
     # сообщает только о задержке — без дополнительных инструкций.
     if job and job.get("status") == "pending":
         if retrieval_command:
@@ -1301,7 +1305,7 @@ async def main(body: dict):
                 search_jobs.pop(job_key, None)
         job = None
 
-    # Готовый ответ выдаём по слову «Маруся», а следующие части —
+    # Готовый ответ выдаём по команде «Алиса, я жду» / «Я жду» или по имени «Алиса», а следующие части —
     # по командам «Да», «Продолжи» или «Продолжай».
     if job and job.get("status") == "ready":
         if retrieval_command:
@@ -1325,7 +1329,7 @@ async def main(body: dict):
         )
 
     # Если команды получения результата нет и фоновой задачи тоже нет,
-    # не отправляем слово «Маруся» модели как обычный вопрос.
+    # не отправляем имя помощника модели как обычный вопрос.
     if retrieval_command:
         return make_response(body, "Я слушаю. Чем могу помочь?")
 
@@ -1335,7 +1339,7 @@ async def main(body: dict):
     if social_reply:
         return make_response(body, social_reply)
 
-    # Интернет-поиск выполняется в фоне. Результат забирается командой «Маруся».
+    # Интернет-поиск выполняется в фоне. Результат забирается командой «Алиса, я жду» / «Я жду».
     if needs_search(user_text):
         job_id = uuid.uuid4().hex
         with jobs_lock:
