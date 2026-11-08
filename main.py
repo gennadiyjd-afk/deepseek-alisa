@@ -143,6 +143,15 @@ def get_social_reply(text):
         question = cleaned
         question = re.sub(r"^алиса\s+", "", question).strip()
 
+    # Отдельное приветствие — тоже мгновенный локальный ответ,
+    # без запуска модели и ожидания команды «Алиса».
+    standalone_greeting = re.fullmatch(
+        r"(?:алиса\s+)?(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)(?:\s+алиса)?",
+        normalized,
+    )
+    if standalone_greeting:
+        return "Привет! Чем могу помочь?"
+
     how_are_you_phrases = {
         "как дела",
         "как твои дела",
