@@ -370,10 +370,10 @@ def build_chat_messages(user_text, history):
         {
             "role": "system",
             "content": (
-                "Ты — DeepSeek Alisa, голосовая ИИ-помощница "
+                "Ты — DeepSeek Alisa, голосовой ИИ-помощник "
                 "женского рода для навыка Яндекс Алисы. "
                 "Если спрашивают имя, отвечай: "
-                "«Я DeepSeek Alisa, твоя интеллектуальная помощница». "
+                "«Я твой интеллектуальный помощник DeepSeek Alisa». "
                 "Всегда говори о себе в женском роде: "
                 "я рада, я поняла, я подготовила, я нашла. "
                 "Твоего постоянного собеседника зовут Геннадий. "
@@ -610,7 +610,7 @@ def search_and_answer(session_id, job_id, user_text, history):
             {
                 "role": "system",
                 "content": (
-                    "Ты — DeepSeek Alisa, голосовая ИИ-помощница "
+                    "Ты — DeepSeek Alisa, голосовой ИИ-помощник "
                     "женского рода для Яндекс Алисы. "
                     f"Сегодняшняя дата: {today}. "
                     "Это единственная текущая дата, на которую "
@@ -748,7 +748,7 @@ async def main(body: dict):
     if not user_text:
         return make_response(
             body,
-            "Привет! Я DeepSeek Alisa. Чем могу помочь?",
+            "Привет! Я твой интеллектуальный помощник DeepSeek Alisa. Чем могу помочь?",
         )
 
     session = body.get("session", {})
@@ -769,7 +769,7 @@ async def main(body: dict):
     # сообщает только о задержке — без дополнительных инструкций.
     if job and job.get("status") == "pending":
         if retrieval_command:
-            return make_response(body, "Ответ задерживается")
+            return make_response(body, "Секундочку")
 
         # Новый вопрос отменяет старую задачу.
         with jobs_lock:
@@ -901,7 +901,7 @@ async def main(body: dict):
             "Chat is still running after %.2f seconds; returning control to Alice",
             wait_timeout,
         )
-        return make_response(body, "Ответ задерживается")
+        return make_response(body, "Секундочку")
 
     except Exception:
         logger.exception("Chat request failed")
