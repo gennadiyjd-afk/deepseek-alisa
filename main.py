@@ -105,6 +105,14 @@ def is_continue_command(text):
     )
 
 
+def is_joke_request(text):
+    """Определяет просьбы рассказать анекдот или шутку."""
+    normalized = normalize_command(text)
+    return any(phrase in normalized for phrase in (
+        "анекдот", "шутку", "шутка", "пошути", "рассмеши"
+    ))
+
+
 def split_answer_into_parts(answer, chunk_size=300):
     """Делит длинный ответ на законченные голосовые фрагменты."""
     text = str(answer or "").strip()
@@ -371,7 +379,7 @@ def build_chat_messages(user_text, history):
             "role": "system",
             "content": (
                 "Ты — DeepSeek Alisa, голосовой ИИ-помощник "
-                "женского рода для навыка Яндекс Алисы. "
+                "для навыка Яндекс Алисы. "
                 "Если спрашивают имя, отвечай: "
                 "«Я твой интеллектуальный помощник DeepSeek Alisa». "
                 "Всегда говори о себе в женском роде: "
@@ -393,7 +401,7 @@ def build_chat_messages(user_text, history):
                 "Если просят подробнее раскрыть отдельный момент, "
                 "сосредоточься именно на нём. "
                 "Говори естественно, как в обычном разговоре. "
-                "Не обрывай ответ на полуслове."
+                "Если пользователь просит анекдот или шутку, обязательно расскажи её целиком, " "с понятной развязкой и смешным финалом. Не заканчивай на завязке. " "Не обрывай ответ на полуслове."
             ),
         }
     ]
@@ -409,6 +417,41 @@ def build_chat_messages(user_text, history):
     return messages
 
 
+def complete_joke_if_needed(answer, messages):
+    """Проверяет, закончен ли анекдот, и при необходимости дописывает финал."""
+    answer = str(answer or "").strip()
+    if not answer:
+        return answer
+
+    review_messages = list(messages)
+    review_messages.append({"role": "assistant", "content": answer})
+    review_messages.append({
+        "role": "user",
+        "content": (
+            "Проверь предыдущий ответ. Если анекдот или шутка полностью "
+            "рассказаны и имеют понятную смешную развязку, ответь ровно "
+            "одним словом: COMPLETE. Если ответ оборван или в нём нет "
+            "развязки, верни полный законченный вариант именно этого "
+            "анекдота: сохрани завязку и допиши недостающую часть с финалом. "
+            "Не объясняй юмор, не добавляй другой анекдот и не обращайся "
+            "к собеседнику. Верни только готовый текст."
+        ),
+    })
+
+    try:
+        checked = ask_ai(review_messages, timeout=35, max_tokens=700).strip()
+        if checked.upper() == "COMPLETE":
+            logger.info("Joke completeness check passed")
+            return answer
+        if checked:
+            logger.info("Incomplete joke repaired")
+            return checked
+    except Exception:
+        logger.exception("Joke completeness check failed")
+
+    return answer
+
+
 def chat_in_background(session_id, job_id, user_text, history):
     try:
         logger.info("Background chat started")
@@ -419,6 +462,9 @@ def chat_in_background(session_id, job_id, user_text, history):
             timeout=60,
             max_tokens=1800 if is_complex_question(user_text) else 1000,
         )
+        if is_joke_request(user_text):
+            answer = complete_joke_if_needed(answer, messages)
+
         logger.info(
             "Background chat AI completed in %.2f seconds",
             time.perf_counter() - ai_started,
@@ -611,7 +657,7 @@ def search_and_answer(session_id, job_id, user_text, history):
                 "role": "system",
                 "content": (
                     "Ты — DeepSeek Alisa, голосовой ИИ-помощник "
-                    "женского рода для Яндекс Алисы. "
+                    "для Яндекс Алисы. "
                     f"Сегодняшняя дата: {today}. "
                     "Это единственная текущая дата, на которую "
                     "нужно ориентироваться. "
