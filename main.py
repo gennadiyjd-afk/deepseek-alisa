@@ -131,9 +131,13 @@ def is_stop_command(text):
 
 
 def get_social_reply(text):
-    """Мгновенные ответы на благодарность и вопрос о самочувствии."""
+    """Мгновенные ответы на благодарность, приветствия и короткие вопросы."""
     normalized = normalize_command(text)
     normalized = " ".join(re.sub(r"[^a-zа-я0-9 ]+", " ", normalized).split())
+
+    # Убираем обращение «Алиса» в начале фразы, чтобы варианты
+    # «Алиса, спасибо» и «Алиса, как дела?» обрабатывались мгновенно.
+    question = re.sub(r"^алиса\s+", "", normalized, count=1).strip()
 
     thanks_phrases = {
         "спасибо",
@@ -147,29 +151,27 @@ def get_social_reply(text):
         "спасибо алиса",
         "спасибо большое алиса",
         "благодарю алиса",
-            }
-    if normalized in thanks_phrases:
+    }
+    if question in thanks_phrases:
         return "Пожалуйста! Рада была помочь!"
 
-    # Убираем приветствие и обращение к Алисе в начале фразы,
-    # чтобы распознавались сочетания вроде «Привет, Алиса, как дела?».
+    # Убираем приветствие и обращение к Алисе,
+    # чтобы распознавались сочетания вроде «Алиса, привет, как дела?».
     greeting_prefix = re.compile(
-        r"^(?:(?:алиса)\s+)?"
+        r"^(?:алиса\s+)?"
         r"(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)"
-        r"(?:\s+(?:алиса))?(?:\s+|$)"
+        r"(?:\s+алиса)?(?:\s+|$)"
     )
-    question = normalized
     while True:
         cleaned = greeting_prefix.sub("", question, count=1).strip()
         if cleaned == question:
             break
         question = cleaned
-        question = re.sub(r"^(?:алиса)\s+", "", question).strip()
+        question = re.sub(r"^алиса\s+", "", question).strip()
 
-    # Отдельное приветствие — тоже мгновенный локальный ответ,
-    # без запуска модели и ожидания команды «Алиса».
+    # Отдельное приветствие — тоже мгновенный локальный ответ.
     standalone_greeting = re.fullmatch(
-        r"(?:(?:алиса)\s+)?(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)(?:\s+(?:алиса))?",
+        r"(?:алиса\s+)?(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)(?:\s+алиса)?",
         normalized,
     )
     if standalone_greeting:
@@ -184,22 +186,23 @@ def get_social_reply(text):
         "как дела алиса",
         "алиса как дела",
         "как твои дела алиса",
-            }
-    if question in how_are_you_phrases or normalized in how_are_you_phrases:
+    }
+    if question in how_are_you_phrases:
         return "У меня всё отлично! Спасибо, что интересуешься!"
 
     where_phrases = {
         "а это где",
         "где где",
     }
-    if question in where_phrases or normalized in where_phrases:
+    if question in where_phrases:
         return "Где-где. В Караганде, где живёт конь в пальто"
 
     who_phrases = {
         "а это кто",
     }
-    if question in who_phrases or normalized in who_phrases:
+    if question in who_phrases:
         return "Кто-кто. Конь в пальто, который живёт в Караганде"
+
 
 def is_joke_request(text):
     """Определяет просьбы рассказать анекдот или шутку."""
