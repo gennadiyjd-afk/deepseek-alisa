@@ -90,23 +90,134 @@ def remove_source_links(text):
     return text.strip()
 
 
-def is_status_command(text):
-    return normalize_command(text) in (
-        "что там",
-        "ну что там",
-        "что там у нас",
-        "ну и что там",
-    )
+def is_wake_command(text):
+    """Команда, которой пользователь забирает готовый ответ у Алисы."""
+    return normalize_command(text) == "алиса"
 
 
 def is_continue_command(text):
+    """Команды перехода к следующей части длинного ответа."""
     return normalize_command(text) in (
+        "да",
         "продолжай",
         "продолжи",
         "продолжить",
-        "готово",
-    ) or is_status_command(text)
+    )
 
+
+def split_answer_into_parts(answer, chunk_size=300):
+    """Делит длинный ответ на законченные голосовые фрагменты."""
+    text = str(answer or "").strip()
+    text = re.sub(r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$", "", text, flags=re.IGNORECASE)
+    if not text:
+        return [""]
+    if len(text) <= 380:
+        return [text]
+
+    # Сначала делим по предложениям, сохраняя знаки конца предложения.
+    sentences = re.findall(r".*?(?:[.!?…](?=\s|$)|$)", text, flags=re.DOTALL)
+    sentences = [part.strip() for part in sentences if part and part.strip()]
+    if not sentences:
+        sentences = [text]
+
+    parts = []
+    current = ""
+
+    def add_long_sentence(sentence):
+        words = sentence.split()
+        piece = ""
+        for word in words:
+            candidate = (piece + " " + word).strip()
+            if len(candidate) > chunk_size and piece:
+                parts.append(piece)
+                piece = word
+            else:
+                piece = candidate
+        if piece:
+            parts.append(piece)
+
+    for sentence in sentences:
+        if len(sentence) > chunk_size:
+            if current:
+                parts.append(current.strip())
+                current = ""
+            add_long_sentence(sentence)
+            continue
+
+        candidate = (current + " " + sentence).strip()
+        if len(candidate) <= chunk_size:
+            current = candidate
+        else:
+            if current:
+                parts.append(current.strip())
+            current = sentence
+
+    if current:
+        parts.append(current.strip())
+
+    # Если регулярное выражение не смогло корректно выделить предложения,
+    # гарантируем непустые части и разрезаем только по границе слова.
+    if not parts:
+        words = text.split()
+        current = ""
+        for word in words:
+            candidate = (current + " " + word).strip()
+            if len(candidate) > chunk_size and current:
+                parts.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            parts.append(current)
+
+    return parts or [text]
+
+
+def prepare_job_parts(job, answer):
+    """Подготавливает части, если вопрос или сам ответ достаточно объёмный."""
+    answer = str(answer or "").strip()
+    user_text = job.get("user_text", "")
+    should_split = is_complex_question(user_text) or len(answer) > 380
+    parts = split_answer_into_parts(answer) if should_split else [answer]
+    job["answer"] = answer
+    job["parts"] = parts
+    job["part_index"] = 0
+    return parts
+
+
+def deliver_job_part(body, job_key, job):
+    """Возвращает очередную часть и сохраняет задачу до последней части."""
+    with jobs_lock:
+        current = search_jobs.get(job_key)
+        if not current or current.get("job_id") != job.get("job_id"):
+            return make_response(body, "Не удалось найти подготовленный ответ. Повтори вопрос, пожалуйста.")
+
+        if not current.get("parts"):
+            prepare_job_parts(current, current.get("answer", ""))
+
+        parts = current.get("parts") or [current.get("answer", "")]
+        index = int(current.get("part_index", 0))
+        if index >= len(parts):
+            search_jobs.pop(job_key, None)
+            return make_response(body, "На этом всё.")
+
+        answer = parts[index]
+        is_last = index == len(parts) - 1
+        if not is_last:
+            answer += " Продолжить?"
+            current["part_index"] = index + 1
+        else:
+            original_text = current.get("user_text", "")
+            original_history = current.get("history", [])
+            complete_answer = current.get("answer", "")
+            new_history = original_history[-3:] + [
+                {"role": "user", "content": original_text[:400]},
+                {"role": "assistant", "content": complete_answer[:400]},
+            ]
+            search_jobs.pop(job_key, None)
+            return make_response(body, answer, new_history)
+
+    return make_response(body, answer)
 
 def needs_search(text):
     text = str(text or "").lower().replace("ё", "е")
@@ -130,6 +241,19 @@ def is_complex_question(text):
         "напиши большую программу",
         "разбери по пунктам",
         "максимально подробно",
+        "подробно расскажи",
+        "расскажи подробно",
+        "объясни подробно",
+        "детально объясни",
+        "развернутый ответ",
+        "развернуто",
+        "пошаговая инструкция",
+        "подробная инструкция",
+        "сравни и объясни",
+        "подробн",
+        "детальн",
+        "развернут",
+        "глубоко",
     )
     if any(phrase in normalized for phrase in complex_phrases):
         return True
@@ -153,7 +277,7 @@ def save_job_result(session_id, job_id, result):
 
         current.update(result)
 
-def ask_ai(messages, timeout=25):
+def ask_ai(messages, timeout=25, max_tokens=1000):
     if not API_KEY:
         raise RuntimeError("ROUTER_API_KEY is missing")
 
@@ -167,7 +291,7 @@ def ask_ai(messages, timeout=25):
             "model": "deepseek/deepseek-v4-pro",
             "messages": messages,
             "thinking": {"type": "disabled"},
-            "max_tokens": 1000,
+            "max_tokens": max_tokens,
         },
         timeout=timeout,
     )
@@ -233,6 +357,15 @@ def ask_ai(messages, timeout=25):
     return answer
 
 def build_chat_messages(user_text, history):
+    detailed = is_complex_question(user_text)
+    detail_instruction = (
+        "Для этого запроса подготовь содержательный, подробный и законченный ответ "
+        "примерно на 1200–1800 символов. Разбей изложение по смыслу на абзацы. "
+        "Не пытайся самостоятельно делить его на голосовые части и не спрашивай "
+        "о продолжении: это сделает программа."
+        if detailed else
+        "На обычный вопрос отвечай кратко, обычно в 1–3 предложениях."
+    )
     messages = [
         {
             "role": "system",
@@ -251,15 +384,11 @@ def build_chat_messages(user_text, history):
                 "и не представляйся повторно. "
                 "Учитывай историю разговора и понимай "
                 "короткие уточнения по контексту. "
-                "Обычные вопросы — отвечай кратко, понятно и по существу, "
-                "обычно в 1–3 предложениях. "
-                "Если просят рассказать подробно, раздели рассказ "
-                "на последовательные законченные части по одной теме. "
-                "Размер одной части — примерно 250–350 символов. "
-                "В конце предложи продолжить. "
-                "Если пользователь говорит «Продолжай» или «Продолжи», "
-                "переходи к следующей части без повторов. "
-                "Сохраняй последовательность рассказа. "
+                "Обычные вопросы — отвечай кратко, понятно и по существу. "
+                + detail_instruction + " "
+                "Если пользователь просит подробный ответ, раскрывай тему "
+                "последовательно и полно. Не дели ответ на части самостоятельно "
+                "и не спрашивай о продолжении: голосовая программа сделает это. "
                 "Если говорят «Кратко», дай краткое изложение. "
                 "Если просят подробнее раскрыть отдельный момент, "
                 "сосредоточься именно на нём. "
@@ -285,7 +414,11 @@ def chat_in_background(session_id, job_id, user_text, history):
         logger.info("Background chat started")
         messages = build_chat_messages(user_text, history)
         ai_started = time.perf_counter()
-        answer = ask_ai(messages, timeout=60)
+        answer = ask_ai(
+            messages,
+            timeout=60,
+            max_tokens=1800 if is_complex_question(user_text) else 1000,
+        )
         logger.info(
             "Background chat AI completed in %.2f seconds",
             time.perf_counter() - ai_started,
@@ -421,6 +554,15 @@ def search_and_answer(session_id, job_id, user_text, history):
                 + "\nФрагмент источника: " + content[:1400]
             )
 
+        detailed_search = is_complex_question(user_text)
+        search_length_instruction = (
+            "Поскольку запрос требует подробного ответа, подготовь развернутое "
+            "изложение примерно на 1200–1800 символов, логично разделённое на абзацы. "
+            "Не задавай вопрос о продолжении: программа сама разделит ответ на части. "
+            if detailed_search else
+            "Ответ должен быть законченным, кратким и понятным. Максимум 650 символов. "
+        )
+
         messages = [
             {
                 "role": "system",
@@ -472,8 +614,7 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "биржа или тип цены. Если причина не ясна, так и скажи "
                     "и приведи обе цифры с названиями источников. "
                     "Учитывай все найденные материалы, а не только первые. "
-                    "Ответ должен быть законченным, кратким и понятным. "
-                    "Максимум 650 символов. "
+                    + search_length_instruction + " "
                     "Не произноси URL, адреса сайтов и ссылки. "
                     "Не предлагай пользователю источники и не спрашивай, "
                     "нужны ли ему ссылки. Давай только сам ответ. "
@@ -502,7 +643,11 @@ def search_and_answer(session_id, job_id, user_text, history):
         })
 
         search_ai_started = time.perf_counter()
-        answer = ask_ai(messages, timeout=60)
+        answer = ask_ai(
+            messages,
+            timeout=60,
+            max_tokens=1800 if detailed_search else 1000,
+        )
         logger.info(
             "Search answer AI completed in %.2f seconds",
             time.perf_counter() - search_ai_started,
@@ -553,11 +698,8 @@ async def health():
 async def main(body: dict):
     request_data = body.get("request", {})
     user_text = str(request_data.get("original_utterance") or "").strip()
-    text_lower = user_text.lower().strip()
 
-    # Запуск навыка без произнесённого вопроса: только приветствуем.
-    # Важно сделать это до проверки фоновых задач, чтобы пустой запуск
-    # не отменял уже выполняющийся запрос.
+    # Пустой запуск навыка только приветствует и не затрагивает фоновые задачи.
     if not user_text:
         return make_response(
             body,
@@ -566,125 +708,86 @@ async def main(body: dict):
 
     session = body.get("session", {})
     session_id = str(session.get("session_id", "default"))
-    # user_id persists across separate Alice sessions; session_id may change
-    # between the initial request and the follow-up phrase "Что там?".
     user_id = session.get("user", {}).get("user_id")
     job_key = str(user_id or session_id)
 
     state = body.get("state", {}).get("session", {})
     history = state.get("history", [])
+    wake_command = is_wake_command(user_text)
+    continue_command = is_continue_command(user_text)
+    retrieval_command = wake_command or continue_command
 
     with jobs_lock:
         job = search_jobs.get(job_key)
 
-    # Если предыдущая задача ещё выполняется, не запускаем вторую
-    # поверх неё. Команда продолжения проверяет готовность результата.
+    # Если задача ещё выполняется, команда «Алиса» или продолжения
+    # сообщает только о задержке — без дополнительных инструкций.
     if job and job.get("status") == "pending":
-        if is_continue_command(text_lower):
-            if job.get("kind") == "search":
-                # Не подсказываем пользователю команду повторно:
-                # он сам спросит «Что там?», когда захочет получить результат.
-                message = "Поиск ещё выполняется. Попробуй немного позже."
-            else:
-                message = "Ответ ещё готовится. Попробуй немного позже."
-            return make_response(body, message)
+        if retrieval_command:
+            return make_response(body, "Ответ задерживается")
 
-        # Новый вопрос отменяет ожидание старого результата.
+        # Новый вопрос отменяет старую задачу.
         with jobs_lock:
             current = search_jobs.get(job_key)
             if current and current.get("job_id") == job.get("job_id"):
                 search_jobs.pop(job_key, None)
         job = None
 
-    # Обрабатываем готовую задачу
+    # Готовый ответ выдаём по слову «Алиса», а следующие части —
+    # по командам «Да», «Продолжи» или «Продолжай».
     if job and job.get("status") == "ready":
-        if job.get("kind") == "search":
-            if is_continue_command(text_lower):
-                answer = job.get("answer", "")
-                with jobs_lock:
-                    current = search_jobs.get(job_key)
-                    if current and current.get("job_id") == job.get("job_id"):
-                        search_jobs.pop(job_key, None)
-                return make_response(body, answer)
+        if retrieval_command:
+            return deliver_job_part(body, job_key, job)
 
-            # Иное сообщение — начинаем обработку нового запроса.
-            with jobs_lock:
-                current = search_jobs.get(job_key)
-                if current and current.get("job_id") == job.get("job_id"):
-                    search_jobs.pop(job_key, None)
-
-        elif job.get("kind") == "chat":
-            if is_continue_command(text_lower):
-                answer = job.get("answer", "")
-                original_text = job.get("user_text", "")
-                original_history = job.get("history", [])
-                new_history = original_history[-3:] + [
-                    {"role": "user", "content": original_text[:400]},
-                    {"role": "assistant", "content": answer[:400]},
-                ]
-
-                with jobs_lock:
-                    current = search_jobs.get(job_key)
-                    if current and current.get("job_id") == job.get("job_id"):
-                        search_jobs.pop(job_key, None)
-
-                return make_response(body, answer, new_history)
-
-            # Пользователь задал новый вопрос — удаляем старый результат.
-            with jobs_lock:
-                current = search_jobs.get(job_key)
-                if current and current.get("job_id") == job.get("job_id"):
-                    search_jobs.pop(job_key, None)
+        # Иное сообщение считается новым запросом.
+        with jobs_lock:
+            current = search_jobs.get(job_key)
+            if current and current.get("job_id") == job.get("job_id"):
+                search_jobs.pop(job_key, None)
+        job = None
 
     elif job and job.get("status") == "error":
         with jobs_lock:
             current = search_jobs.get(job_key)
             if current and current.get("job_id") == job.get("job_id"):
                 search_jobs.pop(job_key, None)
-
         return make_response(
             body,
             "Не удалось получить ответ. Попробуй повторить запрос.",
         )
 
-    # A status phrase is a retrieval command, not a new question for the AI.
-    if is_status_command(user_text):
-        return make_response(
-            body,
-            "Я пока не вижу сохранённого результата поиска. Повтори вопрос "
-            "с фразой «найди в интернете» или «посмотри в интернете».",
-        )
+    # Если команды получения результата нет и фоновой задачи тоже нет,
+    # не отправляем слово «Алиса» модели как обычный вопрос.
+    if retrieval_command:
+        return make_response(body, "Я слушаю. Чем могу помочь?")
 
-    # Запускаем интернет-поиск в фоновом потоке
+    # Интернет-поиск выполняется в фоне. Результат забирается командой «Алиса».
     if needs_search(user_text):
         job_id = uuid.uuid4().hex
-
         with jobs_lock:
             search_jobs[job_key] = {
                 "job_id": job_id,
                 "kind": "search",
                 "status": "pending",
                 "answer": "",
+                "parts": [],
+                "part_index": 0,
                 "user_text": user_text,
                 "history": history[-4:],
             }
 
-        future = executor.submit(
+        executor.submit(
             search_and_answer,
             job_key,
             job_id,
             user_text,
             history[-4:],
         )
-
-        # Не ждём завершения поиска в текущем вебхуке: Алиса сразу
-        # отвечает пользователю, а Tavily и DeepSeek работают в фоне.
-        # Готовый результат пользователь заберёт командой «Что там?».
         logger.info("Search task submitted; returning immediately to Alice")
         return make_response(body, "Сейчас посмотрю.")
 
-    # Обычный разговор: простым вопросам даём почти всё безопасное
-    # время вебхука, а явно сложные сразу продолжаем в фоне.
+    # Обычный разговор: простые вопросы ждут до 3,35 секунды,
+    # сложные быстро переходят в фоновую обработку.
     complex_question = is_complex_question(user_text)
     wait_timeout = 0.35 if complex_question else 3.35
     logger.info(
@@ -699,6 +802,8 @@ async def main(body: dict):
             "kind": "chat",
             "status": "pending",
             "answer": "",
+            "parts": [],
+            "part_index": 0,
             "user_text": user_text,
             "history": history[-4:],
         }
@@ -712,20 +817,36 @@ async def main(body: dict):
     )
 
     try:
-        # shield не позволяет тайм-ауту ожидания отменить фоновый запрос.
         wrapped_future = asyncio.shield(asyncio.wrap_future(future))
         result = await asyncio.wait_for(wrapped_future, timeout=wait_timeout)
 
         if result.get("status") == "ready":
-            answer = result.get("answer", "")
-            new_history = history[-3:] + [
-                {"role": "user", "content": user_text[:400]},
-                {"role": "assistant", "content": answer[:400]},
-            ]
+            answer = str(result.get("answer", "")).strip()
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                if current and current.get("job_id") == job_id:
+                    current["status"] = "ready"
+                    prepare_job_parts(current, answer)
+                    current_job = dict(current)
+                else:
+                    current_job = None
+
+            if current_job is None:
+                return make_response(body, answer)
+
+            parts = current_job.get("parts", [answer])
+            if len(parts) > 1:
+                return deliver_job_part(body, job_key, current_job)
+
+            # Короткий ответ выдаём сразу и очищаем задачу.
             with jobs_lock:
                 current = search_jobs.get(job_key)
                 if current and current.get("job_id") == job_id:
                     search_jobs.pop(job_key, None)
+            new_history = history[-3:] + [
+                {"role": "user", "content": user_text[:400]},
+                {"role": "assistant", "content": answer[:400]},
+            ]
             return make_response(body, answer, new_history)
 
         raise RuntimeError("Background chat returned no answer")
@@ -735,11 +856,7 @@ async def main(body: dict):
             "Chat is still running after %.2f seconds; returning control to Alice",
             wait_timeout,
         )
-        if complex_question:
-            message = "Это непростой вопрос, я готовлю ответ. Скажи «Что там?» немного позже."
-        else:
-            message = "Ответ задерживается. Скажи «Что там?» немного позже."
-        return make_response(body, message)
+        return make_response(body, "Ответ задерживается")
 
     except Exception:
         logger.exception("Chat request failed")
@@ -747,3 +864,4 @@ async def main(body: dict):
             body,
             "Не удалось получить ответ. Попробуй, пожалуйста, ещё раз.",
         )
+
