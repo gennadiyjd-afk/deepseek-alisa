@@ -179,6 +179,13 @@ def get_social_reply(text):
     if question in how_are_you_phrases or normalized in how_are_you_phrases:
         return "У меня всё отлично! Спасибо, что интересуешься!"
 
+    where_phrases = {
+        "где",
+        "где где",
+    }
+    if question in where_phrases or normalized in where_phrases:
+        return "Где-где. В Караганде."
+
     return None
 
 
