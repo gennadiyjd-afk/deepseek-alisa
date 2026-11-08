@@ -441,6 +441,47 @@ def chat_in_background(session_id, job_id, user_text, history):
         save_job_result(session_id, job_id, result)
         return result
 
+def complete_answer_if_cut_off(answer, messages):
+    """Проверяет конец ответа и просит модель закончить оборванную мысль."""
+    answer = str(answer or "").strip()
+    if not answer:
+        return answer
+
+    # Закрывающие кавычки и скобки не должны мешать проверке знака конца.
+    ending = answer.rstrip()
+    if ending.endswith((".", "!", "?", "…", "»", "”", '"', "'", ")", "]")):
+        return answer
+
+    logger.warning("Search answer appears to be cut off; requesting completion")
+    repair_messages = list(messages)
+    repair_messages.append({"role": "assistant", "content": answer})
+    repair_messages.append({
+        "role": "user",
+        "content": (
+            "Предыдущий ответ оборвался до завершения последней мысли. "
+            "Продолжи строго с того места, где он остановился. "
+            "Не повторяй уже сказанное и не начинай новый ответ. "
+            "Закончи оборванную фразу и мысль. Верни только продолжение, "
+            "без вступления и без вопроса о продолжении."
+        ),
+    })
+
+    try:
+        continuation = ask_ai(repair_messages, timeout=35, max_tokens=700).strip()
+        continuation = remove_source_links(continuation)
+        if continuation:
+            answer = answer.rstrip() + " " + continuation.lstrip()
+            logger.info("Search answer completion added")
+    except Exception:
+        logger.exception("Could not complete cut-off search answer")
+
+    # Не выдаём последнюю оборванную фразу как завершённую.
+    final_check = answer.rstrip()
+    if final_check and not final_check.endswith((".", "!", "?", "…", "»", "”", '"', "'", ")", "]")):
+        answer = answer.rstrip(" ,;:-") + "."
+    return answer
+
+
 def search_and_answer(session_id, job_id, user_text, history):
     try:
         logger.info("Background search started")
@@ -557,7 +598,9 @@ def search_and_answer(session_id, job_id, user_text, history):
         detailed_search = is_complex_question(user_text)
         search_length_instruction = (
             "Поскольку запрос требует подробного ответа, подготовь развернутое "
-            "изложение примерно на 1200–1800 символов, логично разделённое на абзацы. "
+            "изложение примерно на 1600–2200 символов, логично разделённое на абзацы. "
+            "Обязательно закончи последнюю мысль полным предложением. "
+            "Не обрывай текст посреди слова или предложения. "
             "Не задавай вопрос о продолжении: программа сама разделит ответ на части. "
             if detailed_search else
             "Ответ должен быть законченным, кратким и понятным. Максимум 650 символов. "
@@ -646,7 +689,7 @@ def search_and_answer(session_id, job_id, user_text, history):
         answer = ask_ai(
             messages,
             timeout=60,
-            max_tokens=1800 if detailed_search else 1000,
+            max_tokens=2600 if detailed_search else 1000,
         )
         logger.info(
             "Search answer AI completed in %.2f seconds",
@@ -654,6 +697,8 @@ def search_and_answer(session_id, job_id, user_text, history):
         )
 
         answer = remove_source_links(answer)
+        if detailed_search:
+            answer = complete_answer_if_cut_off(answer, messages)
         result = {
             "status": "ready",
             "answer": answer,
