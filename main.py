@@ -180,14 +180,17 @@ def get_social_reply(text):
         return "У меня всё отлично! Спасибо, что интересуешься!"
 
     where_phrases = {
-        "где",
+        "а это где",
         "где где",
     }
     if question in where_phrases or normalized in where_phrases:
-        return "Где-где. В Караганде."
+        return "Где-где. В Караганде, где живёт конь в пальто"
 
-    return None
-
+    who_phrases = {
+        "а это кто",
+    }
+    if question in who_phrases or normalized in who_phrases:
+        return "Кто-кто. Конь в пальто, который живёт в Караганде"
 
 def is_joke_request(text):
     """Определяет просьбы рассказать анекдот или шутку."""
