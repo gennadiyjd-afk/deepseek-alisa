@@ -991,7 +991,7 @@ def search_and_answer(session_id, job_id, user_text, history):
 
         oil_words = (
             "нефть", "brent", "брент", "wti","даблъютиай", "urals", "юралс", "марки бренд",
-            "марки brent", "марки брент", "марки даблъютиай", "марки wti", "марки юралс", "марки urals"
+            "марки brent", "марки брент", "марки даблъютиай", "марки wti", "марки юралс", "марки urals",
         )
         is_oil = any(word in lower_text for word in oil_words)
 
