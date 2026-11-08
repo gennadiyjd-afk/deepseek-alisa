@@ -796,7 +796,7 @@ def ask_ai(messages, timeout=25, max_tokens=1000):
 
 def build_chat_messages(user_text, history):
     detailed = is_complex_question(user_text)
-    detail_instruction = (
+    detail_instruction = (oó
         "Для этого запроса подготовь содержательный, подробный и законченный ответ "
         "примерно на 1200–1800 символов. Разбей изложение по смыслу на абзацы. "
         "Не пытайся самостоятельно делить его на голосовые части и не спрашивай "
@@ -990,13 +990,13 @@ def search_and_answer(session_id, job_id, user_text, history):
         lower_text = user_text.lower()
 
         oil_words = (
-            "нефть", "brent", "брент", "wti", "марки бренд",
-            "марки brent", "марки брент",
+            "нефть", "brent", "брент", "wti","даблъютиай", "urals", "юралс", "марки бренд",
+            "марки brent", "марки брент", "марки даблъютиай", "марки wti", "марки юралс", "марки urals"
         )
         is_oil = any(word in lower_text for word in oil_words)
 
         finance_words = (
-            "нефть", "brent", "брент", "wti", "золото", "курс",
+            "нефть", "brent", "брент", "wti", "urals", "юралс", "даблъютиай", "золото", "курс",
             "доллар", "евро", "рубль", "акции", "котировк", "бирж",
             "биткоин", "криптовалют", "стоимость", "цена", "газ",
         )
