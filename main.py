@@ -128,6 +128,21 @@ def get_social_reply(text):
     if normalized in thanks_phrases:
         return "Пожалуйста! Рада была помочь!"
 
+    # Убираем приветствие и обращение к Алисе в начале фразы,
+    # чтобы распознавались сочетания вроде «Привет, Алиса, как дела?».
+    greeting_prefix = re.compile(
+        r"^(?:(?:алиса)\s+)?"
+        r"(?:привет|здравствуй|здравствуйте|добрый день|доброе утро|добрый вечер)"
+        r"(?:\s+алиса)?(?:\s+|$)"
+    )
+    question = normalized
+    while True:
+        cleaned = greeting_prefix.sub("", question, count=1).strip()
+        if cleaned == question:
+            break
+        question = cleaned
+        question = re.sub(r"^алиса\s+", "", question).strip()
+
     how_are_you_phrases = {
         "как дела",
         "как твои дела",
@@ -138,7 +153,7 @@ def get_social_reply(text):
         "алиса как дела",
         "как твои дела алиса",
     }
-    if normalized in how_are_you_phrases:
+    if question in how_are_you_phrases or normalized in how_are_you_phrases:
         return "У меня всё отлично! Спасибо, что интересуешься!"
 
     return None
