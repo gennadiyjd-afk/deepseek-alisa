@@ -368,6 +368,18 @@ def is_weather_request(text):
     )
 
 
+def is_oil_request(text):
+    """Распознаёт запросы о котировках нефти Brent, WTI и Urals."""
+    normalized = str(text or "").lower().replace("ё", "е")
+    oil_names = (
+        "brent", "брент",
+        "wti", "даблъютиай", "дабл ю ти ай", "дабл-ю-ти-ай",
+        "urals", "уралс", "юралс", "юралз",
+        "нефть",
+    )
+    return any(name in normalized for name in oil_names)
+
+
 def needs_search(text):
     text = str(text or "").lower().replace("ё", "е")
     return (
@@ -376,6 +388,7 @@ def needs_search(text):
         or is_stock_quote_request(text)
         or is_currency_rate_request(text)
         or is_weather_request(text)
+        or is_oil_request(text)
     )
 
 
@@ -1521,38 +1534,65 @@ def search_and_answer(session_id, job_id, user_text, history):
         lower_text = user_text.lower()
 
         oil_words = (
-            "нефть", "brent", "брент", "wti", "марки бренд",
-            "марки brent", "марки брент",
+            "нефть", "brent", "брент", "wti",
+            "даблъютиай", "дабл ю ти ай", "дабл-ю-ти-ай",
+            "urals", "уралс", "юралс", "юралз",
+            "марки бренд", "марки brent", "марки брент",
         )
         is_oil = any(word in lower_text for word in oil_words)
 
         finance_words = (
-            "нефть", "brent", "брент", "wti", "золото", "курс",
-            "доллар", "евро", "рубль", "акции", "котировк", "бирж",
-            "биткоин", "криптовалют", "стоимость", "цена", "газ",
+            "нефть", "brent", "брент", "wti",
+            "даблъютиай", "дабл ю ти ай", "дабл-ю-ти-ай",
+            "urals", "уралс", "юралс", "юралз",
+            "золото", "курс", "доллар", "евро", "рубль",
+            "акции", "котировк", "бирж", "биткоин",
+            "криптовалют", "стоимость", "цена", "газ",
         )
         is_finance = any(word in lower_text for word in finance_words)
 
         if is_oil:
             search_topic = "finance"
-            is_wti = "wti" in lower_text
-            benchmark = "WTI" if is_wti else "Brent"
-            exchange_contract = (
-                "NYMEX WTI crude oil futures, front-month contract"
-                if is_wti else
-                "ICE Brent crude oil futures, front-month contract"
-            )
-            search_query = (
-                f"{benchmark} crude oil latest market quote today {today}. "
-                f"Find the actual quoted price for {exchange_contract}, "
-                f"contract delivery month, USD per barrel, exact quote "
-                f"date and time or last update timestamp. Prefer official "
-                f"exchange quote pages and reputable financial news such "
-                f"as ICE, CME, Reuters and major market data providers. "
-                f"Distinguish the futures contract from the general spot "
-                f"benchmark. Russian query: {user_text}. "
-                f"Do not present an old article or historical quote as current."
-            )
+            is_wti = any(name in lower_text for name in (
+                "wti", "даблъютиай", "дабл ю ти ай", "дабл-ю-ти-ай",
+            ))
+            is_urals = any(name in lower_text for name in (
+                "urals", "уралс", "юралс", "юралз",
+            ))
+
+            if is_urals:
+                benchmark = "Urals"
+                search_query = (
+                    f"Urals crude oil latest price assessment today {today}. "
+                    f"Find the latest available Urals export blend price in "
+                    f"USD per barrel, the assessment/quotation date and time, "
+                    f"geographical basis and source. Prefer reputable price "
+                    f"reporting agencies and financial sources such as "
+                    f"Argus, S&P Global Commodity Insights (Platts), Reuters "
+                    f"and other established market data providers. "
+                    f"Distinguish Urals price assessments from Brent or WTI "
+                    f"futures and do not invent an exchange contract month. "
+                    f"Russian query: {user_text}. "
+                    f"Do not present an old article or historical quote as current."
+                )
+            else:
+                benchmark = "WTI" if is_wti else "Brent"
+                exchange_contract = (
+                    "NYMEX WTI crude oil futures, front-month contract"
+                    if is_wti else
+                    "ICE Brent crude oil futures, front-month contract"
+                )
+                search_query = (
+                    f"{benchmark} crude oil latest market quote today {today}. "
+                    f"Find the actual quoted price for {exchange_contract}, "
+                    f"contract delivery month, USD per barrel, exact quote "
+                    f"date and time or last update timestamp. Prefer official "
+                    f"exchange quote pages and reputable financial news such "
+                    f"as ICE, CME, Reuters and major market data providers. "
+                    f"Distinguish the futures contract from the general spot "
+                    f"benchmark. Russian query: {user_text}. "
+                    f"Do not present an old article or historical quote as current."
+                )
         elif is_finance:
             search_topic = "finance"
             search_query = (
@@ -1657,7 +1697,7 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "называй только тогда, когда они прямо подтверждены "
                     "текстом найденного источника. "
                     "Не выдавай старую котировку за текущую. "
-                    "Для нефти Brent и WTI указывай цену за баррель и валюту. "
+                    "Для нефти Brent, WTI и Urals указывай цену за баррель и валюту. "
                     "Если источник указывает месяц поставки фьючерса, "
                     "назови этот контрактный месяц. Не называй цену "
                     "конкретного фьючерсного контракта просто спотовой "
