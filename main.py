@@ -713,9 +713,10 @@ WEATHER_DEFAULT_LOCATION = {
 
 
 def extract_weather_location(user_text):
-    """Извлекает явно названное место; иначе использует село Бурдино."""
+    """Извлекает название места и, если указана, страну; иначе использует Бурдино."""
     text = str(user_text or "").strip()
     text = re.sub(r"^алиса[, ]+", "", text, flags=re.IGNORECASE)
+
     match = re.search(
         r"\b(?:в|для)\s+(?:(?:селе|село|городе|город|деревне|"
         r"поселке|посёлке|поселок|посёлок)\s+)?(.+)",
@@ -725,75 +726,218 @@ def extract_weather_location(user_text):
     if not match:
         return None
 
-    location = match.group(1).strip(" ,.!?")
+    location = match.group(1).strip(" ,.!?;:")
     stop_pattern = (
         r"\b(?:на ближайшую неделю|на послезавтра|на выходных|"
         r"на выходные|на сегодня|на завтра|на неделю|"
         r"сегодня|завтра|послезавтра|сейчас|в выходные|"
         r"утром|днем|днём|вечером|ночью|пожалуйста)\b"
     )
-    location = re.split(stop_pattern, location, maxsplit=1, flags=re.IGNORECASE)[0].strip(" ,.!?")
+    location = re.split(stop_pattern, location, maxsplit=1, flags=re.IGNORECASE)[0]
     location = re.sub(
         r"^(?:селе|село|городе|город|деревне|поселке|посёлке)\s+",
-        "",
-        location,
-        flags=re.IGNORECASE,
+        "", location, flags=re.IGNORECASE,
     )
     location = re.sub(
         r"\s+(?:будет ли|будет|ожидается ли|ожидается|какая|какой|какое).*$",
-        "",
-        location,
-        flags=re.IGNORECASE,
-    ).strip(" ,.!?")
+        "", location, flags=re.IGNORECASE,
+    ).strip(" ,.!?;:")
     return location or None
 
 
+# Частые формы названий в русской речи. Для остальных названий
+# дополнительно используются аккуратные варианты окончания слова.
+WEATHER_LOCATION_ALIASES = {
+    "москве": "Москва",
+    "санкт-петербурге": "Санкт-Петербург",
+    "петербурге": "Санкт-Петербург",
+    "питере": "Санкт-Петербург",
+    "воронеже": "Воронеж",
+    "ростове-на-дону": "Ростов-на-Дону",
+    "ростове": "Ростов",
+    "липецке": "Липецк",
+    "курске": "Курск",
+    "орле": "Орёл",
+    "тамбове": "Тамбов",
+    "туле": "Тула",
+    "рязани": "Рязань",
+    "казани": "Казань",
+    "самаре": "Самара",
+    "саратове": "Саратов",
+    "волгограде": "Волгоград",
+    "краснодаре": "Краснодар",
+    "сочи": "Сочи",
+    "екатеринбурге": "Екатеринбург",
+    "челябинске": "Челябинск",
+    "уфе": "Уфа",
+    "перми": "Пермь",
+    "омске": "Омск",
+    "новосибирске": "Новосибирск",
+    "красноярске": "Красноярск",
+    "иркутске": "Иркутск",
+    "владивостоке": "Владивосток",
+    "калининграде": "Калининград",
+    "париже": "Париж",
+    "берлине": "Берлин",
+    "лондоне": "Лондон",
+    "риме": "Рим",
+    "мадриде": "Мадрид",
+    "праге": "Прага",
+    "вене": "Вена",
+    "стамбуле": "Стамбул",
+    "нью-йорке": "Нью-Йорк",
+}
+
+WEATHER_COUNTRY_CODES = {
+    "россия": "RU", "россии": "RU", "рф": "RU",
+    "франция": "FR", "франции": "FR",
+    "германия": "DE", "германии": "DE",
+    "италия": "IT", "италии": "IT",
+    "литва": "LT", "литве": "LT",
+    "беларусь": "BY", "беларуси": "BY", "белоруссия": "BY",
+    "украина": "UA", "украине": "UA",
+    "польша": "PL", "польше": "PL",
+    "чехия": "CZ", "чехии": "CZ",
+    "австрия": "AT", "австрии": "AT",
+    "турция": "TR", "турции": "TR",
+    "сша": "US", "соединенные штаты": "US",
+    "великобритания": "GB", "англия": "GB",
+    "испания": "ES", "испании": "ES",
+    "греция": "GR", "греции": "GR",
+    "китай": "CN", "китае": "CN",
+    "япония": "JP", "японии": "JP",
+    "казахстан": "KZ", "казахстане": "KZ",
+    "армения": "AM", "армении": "AM",
+    "грузия": "GE", "грузии": "GE",
+}
+
+
+def _weather_normalize(value):
+    return re.sub(r"[^a-zа-я0-9]", "", str(value or "").lower().replace("ё", "е"))
+
+
+def _weather_city_and_country(location_name):
+    """Разделяет город и явно указанную страну (через запятую или предлог)."""
+    raw = str(location_name or "").strip(" ,.!?;:")
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if len(parts) > 1:
+        city = parts[0]
+        country_text = parts[-1].lower()
+    else:
+        country_match = re.search(
+            r"\s+(?:в|во)\s+([а-яёa-z ]+)$", raw, flags=re.IGNORECASE
+        )
+        if country_match and country_match.group(1).strip().lower() in WEATHER_COUNTRY_CODES:
+            city = raw[:country_match.start()].strip()
+            country_text = country_match.group(1).strip().lower()
+        else:
+            city, country_text = raw, ""
+
+    country_text = re.sub(r"^(?:страна\s+)", "", country_text)
+    country_code = WEATHER_COUNTRY_CODES.get(country_text)
+    return city, country_code
+
+
+def _weather_query_variants(city):
+    variants = [city]
+    alias = WEATHER_LOCATION_ALIASES.get(city.lower().replace("ё", "е"))
+    if alias:
+        variants.insert(0, alias)
+
+    # Простые однословные формы: Москве -> Москв / Москва,
+    # Липецке -> Липецк. Для составных и дефисных названий
+    # не применяем эвристику, чтобы не портить название.
+    if " " not in city and "-" not in city:
+        lower = city.lower()
+        if lower.endswith(("ове", "еве", "ине", "ане")):
+            variants.append(city[:-1])
+        elif lower.endswith("е"):
+            variants.extend((city[:-1], city[:-1] + "а"))
+        elif lower.endswith("у"):
+            variants.append(city[:-1] + "а")
+        elif lower.endswith("ю"):
+            variants.append(city[:-1] + "я")
+    return list(dict.fromkeys(v.strip() for v in variants if v.strip()))
+
+
 def resolve_weather_location(location_name):
-    """Находит координаты населённого пункта через Open-Meteo Geocoding."""
+    """Находит координаты места через Open-Meteo Geocoding с проверкой страны."""
     if not location_name:
         return dict(WEATHER_DEFAULT_LOCATION)
 
-    query_variants = [location_name]
-    if "," in location_name:
-        query_variants.append(location_name.split(",", 1)[0].strip())
-    # Пользователь часто называет город в предложном падеже: «в Москве»,
-    # «в Париже», «в Липецке». При необходимости пробуем форму из словаря.
-    lower_name = location_name.lower()
-    if lower_name.endswith("е"):
-        query_variants.extend((location_name[:-1], location_name[:-1] + "а"))
-    elif lower_name.endswith("у"):
-        query_variants.append(location_name[:-1] + "а")
-    elif lower_name.endswith("ю"):
-        query_variants.append(location_name[:-1] + "я")
+    city, requested_country = _weather_city_and_country(location_name)
+    query_variants = _weather_query_variants(city)
 
-    results = []
-    for query_variant in dict.fromkeys(query_variants):
-        response = requests.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={
-                "name": query_variant,
-                "count": 10,
-                "language": "ru",
-                "format": "json",
-            },
-            headers={"User-Agent": "Mozilla/5.0 DeepSeekAlice/1.0"},
-            timeout=12,
-        )
-        response.raise_for_status()
-        results = response.json().get("results") or []
-        if results:
-            break
-    if not results:
+    # Для общеизвестных зарубежных столиц задаём разумный приоритет,
+    # чтобы одноимённые небольшие населённые пункты не подменяли город.
+    preferred_countries = {
+        "париж": "FR", "берлин": "DE", "лондон": "GB",
+        "рим": "IT", "мадрид": "ES", "прага": "CZ",
+        "вена": "AT", "стамбул": "TR", "нью-йорк": "US",
+    }
+    preferred_country = requested_country or preferred_countries.get(
+        city.lower().replace("ё", "е")
+    )
+
+    all_results = []
+    seen = set()
+    for language in ("ru", "en"):
+        for query_variant in query_variants:
+            response = requests.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={
+                    "name": query_variant,
+                    "count": 10,
+                    "language": language,
+                    "format": "json",
+                },
+                headers={"User-Agent": "Mozilla/5.0 DeepSeekAlice/1.0"},
+                timeout=12,
+            )
+            response.raise_for_status()
+            for item in response.json().get("results") or []:
+                key = (
+                    item.get("id"), item.get("latitude"),
+                    item.get("longitude"), item.get("country_code"),
+                )
+                if key not in seen:
+                    seen.add(key)
+                    all_results.append(item)
+            # Не прекращаем поиск после первого результата: проверяем
+            # варианты написания и язык, чтобы выбрать правильную страну.
+
+    if preferred_country:
+        matching = [
+            item for item in all_results
+            if str(item.get("country_code", "")).upper() == preferred_country
+        ]
+        if not matching:
+            country_name = next(
+                (name for name, code in WEATHER_COUNTRY_CODES.items()
+                 if code == preferred_country), preferred_country
+            )
+            raise LookupError(
+                f"Населённый пункт «{city}» в указанной стране не найден"
+            )
+        all_results = matching
+
+    if not all_results:
         raise LookupError(f"Населённый пункт «{location_name}» не найден")
 
-    query_norm = re.sub(r"[^a-zа-я0-9]", "", location_name.lower().replace("ё", "е"))
-    results.sort(key=lambda item: (
-        0 if re.sub(r"[^a-zа-я0-9]", "", str(item.get("name", "")).lower().replace("ё", "е")) == query_norm else 1,
-        0 if str(item.get("country_code", "")).upper() == "RU" else 1,
-        0 if item.get("feature_code") in ("PPL", "PPLA", "PPLA2", "PPLA3", "PPLA4") else 1,
-    ))
-    chosen = results[0]
-    name_parts = [str(chosen.get("name") or location_name)]
+    city_norm = _weather_normalize(city)
+    def rank(item):
+        item_name = _weather_normalize(item.get("name", ""))
+        feature = item.get("feature_code", "")
+        return (
+            0 if item_name == city_norm else 1,
+            0 if feature in ("PPLC", "PPLA", "PPLA2", "PPLA3", "PPLA4", "PPL") else 1,
+            0 if str(item.get("country_code", "")).upper() == "RU" else 1,
+            -int(item.get("population") or 0),
+        )
+
+    all_results.sort(key=rank)
+    chosen = all_results[0]
+    name_parts = [str(chosen.get("name") or city)]
     admin1 = chosen.get("admin1")
     country = chosen.get("country")
     if admin1 and admin1 not in name_parts:
