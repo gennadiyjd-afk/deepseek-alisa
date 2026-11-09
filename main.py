@@ -276,7 +276,9 @@ def is_continue_command(text):
 
 def is_topic_return_command(text):
     """Распознаёт просьбу вернуться к ранее начатой теме."""
-    command = normalize_command(text)
+    # Яндекс может передать обращение «Алиса» вместе с запятой.
+    command = normalize_command(text).replace(",", " ")
+    command = " ".join(command.split())
     return bool(re.match(
         r"^(?:алиса\s+)?(?:(?:пожалуйста)\s+)?(?:вернись|вернуться|возвратись)\s+(?:(?:пожалуйста)\s+)?(?:к|ко)\b",
         command,
@@ -328,17 +330,26 @@ _TOPIC_STOP_WORDS = {
     "и", "продолжи", "продолжай", "продолжить", "с", "того", "места", "где", "остановилась",
     "остановился", "остановились", "мы", "на", "чем", "именно", "прошлому", "прошлой",
     "начатому", "начатой", "мне", "расскажи", "рассказать", "подробно", "пожалуйста",
+    "прежней", "прежнюю", "прежний", "прежняя", "прежнему", "прежнее",
+    "прошлую", "прошлый", "прошлое", "прошлому",
 }
 
 
 def topic_tokens(text):
     normalized = normalize_command(text).replace("ё", "е")
     meaningful_short_tokens = {"ии", "ai", "сша", "нлп", "аги"}
-    return [
+    tokens = [
         token for token in re.findall(r"[a-zа-я0-9]+", normalized)
         if (len(token) >= 4 or token in meaningful_short_tokens)
         and token not in _TOPIC_STOP_WORDS
     ]
+    # Считаем «ИИ» и полную формулировку «искусственный интеллект» одной темой.
+    if (
+        any(token.startswith("искусствен") for token in tokens)
+        and any(token.startswith("интеллект") for token in tokens)
+    ):
+        tokens.append("ии")
+    return tokens
 
 
 def _topic_words_match(left, right):
