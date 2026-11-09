@@ -246,13 +246,13 @@ def pending_job_notice(job):
 
 
 def is_continue_command(text):
-    """Команды перехода к следующей части длинного ответа."""
-    return normalize_command(text) in (
-        "да",
-        "продолжай",
-        "продолжи",
-        "продолжить",
-    )
+    """Распознаёт короткое подтверждение и явную просьбу продолжить прошлый ответ."""
+    command = normalize_command(text)
+    if command in ("да", "продолжай", "продолжи", "продолжить"):
+        return True
+    # Пользователь может назвать тему и попросить продолжить с места остановки.
+    # Такая фраза тоже является командой восстановления, а не новым запросом к ИИ.
+    return bool(re.match(r"^(?:алиса\s+)?(?:продолжи|продолжай|продолжить)\b", command))
 
 
 def is_continuation_repair_request(text):
@@ -2240,7 +2240,7 @@ async def main(body: dict):
 
     # Если пользователь исправляет оговорку или подтверждает продолжение,
     # возвращаем именно прежний многочастный ответ, а не ответ на случайную реплику.
-    if interrupted and (continue_command or wait_command or is_continuation_repair_request(user_text)):
+    if interrupted and (continue_command or is_continuation_repair_request(user_text)):
         with jobs_lock:
             interrupted = interrupted_jobs.pop(job_key, None)
             current = search_jobs.get(job_key)
@@ -2268,11 +2268,8 @@ async def main(body: dict):
                     persist_job_maps()
             return make_response(body, "Не удалось получить ответ. Попробуй повторить вопрос.")
 
-    # Длинный новый запрос означает смену темы; старый прерванный ответ больше не нужен.
-    if interrupted and not is_short_ambiguous_interruption(user_text) and not retrieval_command:
-        with jobs_lock:
-            interrupted_jobs.pop(job_key, None)
-            persist_job_maps()
+    # Незавершённый ответ хранится отдельно даже при полноценном запросе по другой теме.
+    # Он будет восстановлен только явной командой продолжения; новый запрос обрабатывается отдельно.
 
     # Отказ относится только к активному многочастному ответу.
     # Удаление задачи также не позволит позднему фоновому результату её восстановить.
@@ -2310,12 +2307,12 @@ async def main(body: dict):
             with jobs_lock:
                 current = search_jobs.get(job_key)
                 if current and current.get("job_id") == job.get("job_id"):
-                    if is_short_ambiguous_interruption(user_text):
-                        interrupted_jobs[job_key] = current
-                    else:
-                        interrupted_jobs.pop(job_key, None)
+                    # Сохраняем даже при полноценном новом вопросе: это может быть
+                    # переключение темы (например, с рассказа об ИИ на погоду).
+                    interrupted_jobs[job_key] = current
                     search_jobs.pop(job_key, None)
                     persist_job_maps()
+                    logger.info("Conversation task paused and saved before topic switch")
             job = None
 
     # Готовый ответ выдаём по команде «Алиса, я жду» / «Я жду» или по имени «Алиса», а следующие части —
@@ -2329,10 +2326,14 @@ async def main(body: dict):
         with jobs_lock:
             current = search_jobs.get(job_key)
             if current and current.get("job_id") == job.get("job_id"):
-                if is_short_ambiguous_interruption(user_text):
+                # Ответ уже готов, но ещё не выдан целиком: сохраняем его независимо
+                # от длины новой реплики и даём обработать новую тему отдельно.
+                parts = current.get("parts") or []
+                part_index = int(current.get("part_index", 0))
+                has_remaining_parts = len(parts) > part_index
+                if has_remaining_parts and len(parts) > 1:
                     interrupted_jobs[job_key] = current
-                else:
-                    interrupted_jobs.pop(job_key, None)
+                    logger.info("Multi-part answer paused and saved before topic switch")
                 search_jobs.pop(job_key, None)
                 persist_job_maps()
         job = None
