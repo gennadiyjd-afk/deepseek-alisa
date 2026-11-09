@@ -1532,6 +1532,9 @@ def ask_ai(messages, timeout=25, max_tokens=1000):
     raise last_error or RuntimeError("Empty AI response")
 
 def build_chat_messages(user_text, history):
+    # Передаём модели актуальную дату по московскому времени,
+    # чтобы она не полагалась на устаревшие внутренние сведения.
+    today_moscow = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y")
     detailed = is_complex_question(user_text)
     detail_instruction = (
         "Для этого запроса подготовь содержательный, подробный и законченный ответ "
@@ -1547,6 +1550,10 @@ def build_chat_messages(user_text, history):
             "content": (
                 "Ты — DeepSeek Алиса, голосовой ИИ-помощник "
                 "для навыка Яндекс Алисы. "
+                f"Сегодняшняя дата по московскому времени: {today_moscow}. "
+                "Если пользователь спрашивает, какое сегодня число, "
+                "какой сегодня день или какой сейчас год, отвечай по этой дате, "
+                "не полагайся на собственные внутренние сведения о текущей дате. "
                 "Если спрашивают имя, отвечай: "
                 "«Я твой интеллектуальный помощник DeepSeek Алиса». "
                 "Всегда говори о себе в женском роде: "
