@@ -1250,68 +1250,99 @@ def save_job_result(session_id, job_id, result):
         current.update(result)
 
 def ask_ai(messages, timeout=25, max_tokens=1000):
+    """Запрашивает ответ у RouterAPI с одной повторной попыткой при сбое."""
     if not API_KEY:
         raise RuntimeError("ROUTER_API_KEY is missing")
 
-    response = requests.post(
-        API_URL,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "deepseek/deepseek-v4-pro",
-            "messages": messages,
-            "thinking": {"type": "disabled"},
-            "max_tokens": max_tokens,
-        },
-        timeout=timeout,
-    )
+    last_error = None
 
-    response.raise_for_status()
-    data = response.json()
+    # Повторяем только временные сбои и ответы без текста.
+    # История и результаты Tavily при этом не запрашиваются повторно.
+    for attempt in range(2):
+        current_max_tokens = max_tokens if attempt == 0 else max(max_tokens * 2, 4000)
+        current_timeout = timeout if attempt == 0 else max(timeout, 75)
 
-    choices = data.get("choices") if isinstance(data, dict) else None
+        if attempt:
+            logger.warning(
+                "Retrying RouterAPI request: max_tokens=%s, timeout=%s",
+                current_max_tokens,
+                current_timeout,
+            )
 
-    if not isinstance(choices, list) or not choices:
-        logger.error(
-            "AI response has no choices: status=%s, keys=%s",
-            response.status_code,
-            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-        )
-        raise RuntimeError("Empty AI response")
+        try:
+            response = requests.post(
+                API_URL,
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "deepseek/deepseek-v4-pro",
+                    "messages": messages,
+                    "thinking": {"type": "disabled"},
+                    "max_tokens": current_max_tokens,
+                },
+                timeout=current_timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
 
-    choice = choices[0] if isinstance(choices[0], dict) else {}
-    message = choice.get("message") or {}
+        except requests.exceptions.Timeout as exc:
+            last_error = exc
+            logger.warning(
+                "RouterAPI timeout on attempt %s/2 after %s seconds",
+                attempt + 1,
+                current_timeout,
+            )
+            if attempt == 0:
+                continue
+            raise
 
-    if not isinstance(message, dict):
-        message = {}
+        choices = data.get("choices") if isinstance(data, dict) else None
 
-    content = message.get("content", "")
-    answer = ""
+        if not isinstance(choices, list) or not choices:
+            logger.error(
+                "AI response has no choices: status=%s, keys=%s",
+                response.status_code,
+                list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+            )
+            last_error = RuntimeError("Empty AI response")
+            if attempt == 0:
+                continue
+            raise last_error
 
-    if isinstance(content, str):
-        answer = content.strip()
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            message = {}
 
-    elif isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text_part = item.get("text")
-                if isinstance(text_part, str):
-                    parts.append(text_part)
+        content = message.get("content", "")
+        answer = ""
 
-        answer = "\n".join(parts).strip()
+        if isinstance(content, str):
+            answer = content.strip()
+        elif isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text_part = item.get("text")
+                    if isinstance(text_part, str):
+                        parts.append(text_part)
+            answer = "\n".join(parts).strip()
 
-    if not answer:
-        logger.error(
-            "Empty AI content: status=%s, finish_reason=%s, "
-            "message_keys=%s, content_type=%s, "
-            "content_length=%s, reasoning_present=%s, "
-            "reasoning_length=%s, refusal_present=%s, "
+        if answer:
+            if attempt:
+                logger.info("RouterAPI response recovered on retry")
+            return answer
+
+        logger.warning(
+            "Empty AI content: attempt=%s/2, status=%s, finish_reason=%s, "
+            "message_keys=%s, content_type=%s, content_length=%s, "
+            "reasoning_present=%s, reasoning_length=%s, refusal_present=%s, "
             "tool_calls_present=%s, usage=%s",
+            attempt + 1,
             response.status_code,
             choice.get("finish_reason"),
             list(message.keys()),
@@ -1323,10 +1354,12 @@ def ask_ai(messages, timeout=25, max_tokens=1000):
             bool(message.get("tool_calls")),
             data.get("usage"),
         )
+        last_error = RuntimeError("Empty AI response")
+        if attempt == 0:
+            continue
+        raise last_error
 
-        raise RuntimeError("Empty AI response")
-
-    return answer
+    raise last_error or RuntimeError("Empty AI response")
 
 def build_chat_messages(user_text, history):
     detailed = is_complex_question(user_text)
@@ -1758,7 +1791,9 @@ def search_and_answer(session_id, job_id, user_text, history):
         answer = ask_ai(
             messages,
             timeout=60,
-            max_tokens=2600 if detailed_search else 1000,
+            # Обычный поисковый ответ тоже получает запас токенов:
+            # RouterAPI может расходовать их на reasoning до текста ответа.
+            max_tokens=5000 if detailed_search else 3500,
         )
         logger.info(
             "Search answer AI completed in %.2f seconds",
