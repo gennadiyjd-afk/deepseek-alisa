@@ -28,6 +28,44 @@ executor = ThreadPoolExecutor(max_workers=2)
 search_jobs = {}
 jobs_lock = threading.Lock()
 
+# Небольшой серверный кэш снижает число одинаковых запросов к погодным API.
+WEATHER_CACHE = {}
+WEATHER_FAILURE_CACHE = {}
+WEATHER_CACHE_LOCK = threading.Lock()
+
+
+def _weather_cached_json(
+    url, params, headers=None, timeout=15, ttl=1800, failure_ttl=0
+):
+    key = (url, tuple(sorted((str(k), str(v)) for k, v in params.items())))
+    now = time.monotonic()
+    with WEATHER_CACHE_LOCK:
+        cached = WEATHER_CACHE.get(key)
+        if cached and now - cached[0] < ttl:
+            logger.info("Weather cache hit: %s", url)
+            return cached[1]
+        failed = WEATHER_FAILURE_CACHE.get(key)
+        if failed and now - failed[0] < failure_ttl:
+            raise requests.HTTPError(
+                f"Cached HTTP {failed[1]} response for {url}"
+            )
+    response = requests.get(
+        url, params=params, headers=headers or {}, timeout=timeout
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        status = getattr(response, "status_code", None)
+        if failure_ttl and status == 429:
+            with WEATHER_CACHE_LOCK:
+                WEATHER_FAILURE_CACHE[key] = (time.monotonic(), status)
+        raise
+    data = response.json()
+    with WEATHER_CACHE_LOCK:
+        WEATHER_CACHE[key] = (time.monotonic(), data)
+        WEATHER_FAILURE_CACHE.pop(key, None)
+    return data
+
 
 
 def limit_text(text, limit=1024):
@@ -926,19 +964,19 @@ def resolve_weather_location(location_name):
     seen = set()
     for language in ("ru", "en"):
         for query_variant in query_variants:
-            response = requests.get(
+            geocoding_data = _weather_cached_json(
                 "https://geocoding-api.open-meteo.com/v1/search",
-                params={
+                {
                     "name": query_variant,
                     "count": 10,
                     "language": language,
                     "format": "json",
                 },
-                headers={"User-Agent": "Mozilla/5.0 DeepSeekAlice/1.0"},
+                headers={"User-Agent": "DeepSeekAlisa/1.0"},
                 timeout=12,
+                ttl=86400,
             )
-            response.raise_for_status()
-            for item in response.json().get("results") or []:
+            for item in geocoding_data.get("results") or []:
                 key = (
                     item.get("id"), item.get("latitude"),
                     item.get("longitude"), item.get("country_code"),
@@ -995,7 +1033,7 @@ def resolve_weather_location(location_name):
         "name": ", ".join(name_parts),
         "latitude": float(chosen["latitude"]),
         "longitude": float(chosen["longitude"]),
-        "timezone": "auto",
+        "timezone": chosen.get("timezone") or "auto",
     }
 
 
@@ -1035,35 +1073,167 @@ def wind_direction_text(degrees):
     return directions[int((float(degrees) + 22.5) // 45) % 8]
 
 
+def _met_symbol_to_wmo(symbol):
+    """Приближённо сопоставляет погодные символы MET Norway кодам WMO."""
+    symbol = str(symbol or "").lower().split("_")[0]
+    if symbol.startswith("clearsky"):
+        return 0
+    if symbol.startswith("fair"):
+        return 1
+    if symbol.startswith("partlycloudy"):
+        return 2
+    if symbol.startswith("cloudy"):
+        return 3
+    if symbol.startswith("fog"):
+        return 45
+    if "thunder" in symbol:
+        return 95
+    if "snow" in symbol:
+        return 71 if "light" in symbol or "showers" in symbol else 73
+    if "sleet" in symbol:
+        return 66
+    if "rain" in symbol:
+        if "heavy" in symbol:
+            return 65
+        if "showers" in symbol:
+            return 80
+        return 61
+    return 3
+
+
+def _get_met_weather_data(location):
+    """Получает и приводит прогноз MET Norway к структуре Open-Meteo."""
+    params = {
+        "lat": f"{location['latitude']:.5f}",
+        "lon": f"{location['longitude']:.5f}",
+    }
+    data = _weather_cached_json(
+        "https://api.met.no/weatherapi/locationforecast/2.0/compact",
+        params,
+        headers={
+            "User-Agent": (
+                "DeepSeekAlisa/1.0 "
+                "(https://github.com/gennadiyjd-afk/deepseek-alisa/issues)"
+            ),
+            "Accept": "application/json",
+        },
+        timeout=20,
+        ttl=10800,
+    )
+    series = (data.get("properties") or {}).get("timeseries") or []
+    if not series:
+        raise ValueError("MET Norway вернул пустой прогноз")
+
+    tz_name = location.get("timezone") or "Europe/Moscow"
+    try:
+        local_tz = ZoneInfo(tz_name)
+    except Exception:
+        local_tz = ZoneInfo("UTC")
+
+    parsed = []
+    for item in series:
+        try:
+            stamp = datetime.fromisoformat(
+                item["time"].replace("Z", "+00:00")
+            ).astimezone(local_tz)
+        except Exception:
+            continue
+        details = ((item.get("data") or {}).get("instant") or {}).get("details") or {}
+        next_data = (item.get("data") or {}).get("next_1_hours") or (item.get("data") or {}).get("next_6_hours") or {}
+        summary = next_data.get("summary") or {}
+        symbol = summary.get("symbol_code")
+        precip = (next_data.get("details") or {}).get("precipitation_amount")
+        parsed.append((stamp, details, _met_symbol_to_wmo(symbol), precip))
+    if not parsed:
+        raise ValueError("MET Norway не вернул пригодные временные точки")
+
+    now_local = datetime.now(local_tz)
+    current_entry = min(parsed, key=lambda row: abs((row[0] - now_local).total_seconds()))
+    _, current_details, current_code, _ = current_entry
+    current = {
+        "temperature_2m": current_details.get("air_temperature"),
+        "relative_humidity_2m": current_details.get("relative_humidity"),
+        "weather_code": current_code,
+        "wind_speed_10m": current_details.get("wind_speed"),
+        "wind_direction_10m": current_details.get("wind_from_direction"),
+    }
+
+    grouped = {}
+    for row in parsed:
+        grouped.setdefault(row[0].date().isoformat(), []).append(row)
+    dates = sorted(grouped)
+    daily = {
+        "time": [], "weather_code": [], "temperature_2m_max": [],
+        "temperature_2m_min": [], "precipitation_probability_max": [],
+        "precipitation_sum": [], "wind_speed_10m_max": [],
+    }
+    for date_text in dates:
+        rows = grouped[date_text]
+        temps = [r[1].get("air_temperature") for r in rows if r[1].get("air_temperature") is not None]
+        if not temps:
+            continue
+        representative = min(
+            rows,
+            key=lambda r: abs((r[0].hour * 60 + r[0].minute) - 12 * 60),
+        )
+        winds = [r[1].get("wind_speed") for r in rows if r[1].get("wind_speed") is not None]
+        precip_values = [r[3] for r in rows if r[3] is not None]
+        daily["time"].append(date_text)
+        daily["weather_code"].append(representative[2])
+        daily["temperature_2m_max"].append(max(temps))
+        daily["temperature_2m_min"].append(min(temps))
+        daily["precipitation_probability_max"].append(None)
+        daily["precipitation_sum"].append(sum(precip_values) if precip_values else None)
+        daily["wind_speed_10m_max"].append(max(winds) if winds else None)
+
+    if not daily["time"]:
+        raise ValueError("MET Norway не вернул дневные значения температуры")
+    return {
+        "current": current,
+        "daily": daily,
+        "timezone": tz_name,
+    }
+
+
 def get_weather_answer(user_text):
-    """Получает актуальные условия и прогноз через Open-Meteo."""
+    """Получает прогноз через Open-Meteo с резервным источником MET Norway."""
     try:
         location_query = extract_weather_location(user_text)
         location = resolve_weather_location(location_query)
-        response = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": location["latitude"],
-                "longitude": location["longitude"],
-                "current": (
-                    "temperature_2m,relative_humidity_2m,apparent_temperature,"
-                    "precipitation,rain,showers,snowfall,weather_code,"
-                    "wind_speed_10m,wind_direction_10m,wind_gusts_10m"
-                ),
-                "daily": (
-                    "weather_code,temperature_2m_max,temperature_2m_min,"
-                    "precipitation_probability_max,precipitation_sum,"
-                    "wind_speed_10m_max,sunrise,sunset"
-                ),
-                "forecast_days": 10,
-                "timezone": location.get("timezone", "auto"),
-                "wind_speed_unit": "ms",
-            },
-            headers={"User-Agent": "Mozilla/5.0 DeepSeekAlice/1.0"},
-            timeout=15,
-        )
-        response.raise_for_status()
-        data = response.json()
+        forecast_params = {
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "current": (
+                "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                "precipitation,rain,showers,snowfall,weather_code,"
+                "wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+            ),
+            "daily": (
+                "weather_code,temperature_2m_max,temperature_2m_min,"
+                "precipitation_probability_max,precipitation_sum,"
+                "wind_speed_10m_max,sunrise,sunset"
+            ),
+            "forecast_days": 10,
+            "timezone": location.get("timezone", "auto"),
+            "wind_speed_unit": "ms",
+        }
+        weather_source = "Open-Meteo"
+        try:
+            data = _weather_cached_json(
+                "https://api.open-meteo.com/v1/forecast",
+                forecast_params,
+                headers={"User-Agent": "DeepSeekAlisa/1.0"},
+                timeout=15,
+                ttl=1800,
+                failure_ttl=600,
+            )
+        except Exception as primary_exc:
+            logger.warning(
+                "Open-Meteo failed; trying MET Norway fallback: %s",
+                primary_exc,
+            )
+            data = _get_met_weather_data(location)
+            weather_source = "MET Norway"
         current = data.get("current") or {}
         daily = data.get("daily") or {}
         dates = daily.get("time") or []
@@ -1100,7 +1270,7 @@ def get_weather_answer(user_text):
                     f"{weekday.capitalize()}: {weather_description(code)}, "
                     f"от {round(low)} до {round(high)} градусов"
                 )
-            return f"Прогноз на неделю для {place}. " + ". ".join(day_lines) + "."
+            return f"Прогноз на неделю для {place}. " + ". ".join(day_lines) + f". Данные прогноза — {weather_source}."
 
         if is_weekend:
             days_until_saturday = (5 - today.weekday()) % 7
@@ -1126,7 +1296,7 @@ def get_weather_answer(user_text):
                         f"в {weekday} — {weather_description(code)}, "
                         f"от {round(low)} до {round(high)} градусов"
                     )
-                return f"Прогноз на выходные. Населённый пункт: {place}. " + "; ".join(day_lines) + ". Данные прогноза — Open-Meteo."
+                return f"Прогноз на выходные. Населённый пункт: {place}. " + "; ".join(day_lines) + f". Данные прогноза — {weather_source}."
 
         target_date = today
         if is_tomorrow:
@@ -1175,7 +1345,7 @@ def get_weather_answer(user_text):
                 answer += f". Ветер {wind_direction_text(wind_dir or 0)}, скорость около {round(wind)} метров в секунду"
             if humidity is not None:
                 answer += f". Влажность {int(humidity)} процентов"
-            return answer + ". Данные прогноза — Open-Meteo."
+            return answer + f". Данные прогноза — {weather_source}."
         if location_query is None:
             place_phrase = f"для {place}"
         else:
@@ -1190,7 +1360,7 @@ def get_weather_answer(user_text):
             answer += f", ожидается около {float(rain_sum):.1f}".replace(".", ",") + " миллиметра осадков"
         if wind_max is not None:
             answer += f". Максимальная скорость ветра около {round(wind_max)} метров в секунду"
-        return answer + ". Данные прогноза — Open-Meteo."
+        return answer + f". Данные прогноза — {weather_source}."
 
     except Exception as exc:
         logger.warning("Weather lookup failed: %s", exc)
