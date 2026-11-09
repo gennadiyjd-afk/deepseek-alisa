@@ -2231,8 +2231,9 @@ async def main(body: dict):
     history = state.get("history", [])
     wake_command = is_wake_command(user_text)
     continue_command = is_continue_command(user_text)
+    repair_continue_command = is_continuation_repair_request(user_text)
     wait_command = is_wait_command(user_text)
-    retrieval_command = wake_command or wait_command or continue_command
+    retrieval_command = wake_command or wait_command or continue_command or repair_continue_command
 
     with jobs_lock:
         job = search_jobs.get(job_key)
@@ -2240,7 +2241,10 @@ async def main(body: dict):
 
     # Если пользователь исправляет оговорку или подтверждает продолжение,
     # возвращаем именно прежний многочастный ответ, а не ответ на случайную реплику.
-    if interrupted and (continue_command or is_continuation_repair_request(user_text)):
+    # Приоритет у текущей темы: если по ней уже есть активная задача,
+    # «Да» должно продолжать именно её. Прерванная предыдущая тема
+    # восстанавливается только тогда, когда активной задачи нет.
+    if interrupted and not job and (continue_command or repair_continue_command):
         with jobs_lock:
             interrupted = interrupted_jobs.pop(job_key, None)
             current = search_jobs.get(job_key)
