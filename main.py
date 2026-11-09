@@ -699,17 +699,15 @@ def extract_currency_code(text):
     return None, None, None
 
 
-def fetch_cbr_currency_rate(currency_code):
-    """Получает официальный курс ЦБ РФ на текущую дату (с учётом выходных)."""
-    today_moscow = datetime.now(ZoneInfo("Europe/Moscow")).date()
-    response = requests.get(
-        "https://www.cbr.ru/scripts/XML_daily.asp",
-        params={"date_req": today_moscow.strftime("%d/%m/%Y")},
-        headers={"User-Agent": "Mozilla/5.0 DeepSeekAlice/1.0"},
-        timeout=15,
+def _parse_cbr_currency_xml(xml_content, currency_code):
+    """Извлекает курс валюты и дату, с которой он действует, из XML ЦБ РФ."""
+    root = ET.fromstring(xml_content)
+    effective_date_text = root.attrib.get("Date", "")
+    effective_date = (
+        datetime.strptime(effective_date_text, "%d.%m.%Y").date()
+        if effective_date_text else None
     )
-    response.raise_for_status()
-    root = ET.fromstring(response.content)
+
     for item in root.findall("Valute"):
         code = (item.findtext("CharCode") or "").strip().upper()
         if code != currency_code.upper():
@@ -720,17 +718,48 @@ def fetch_cbr_currency_rate(currency_code):
         value = float(value_text)
         if nominal <= 0:
             raise ValueError("Некорректный номинал валюты в ответе Банка России")
-        date_text = root.attrib.get("Date", "")
-        if date_text:
-            date_text = datetime.strptime(date_text, "%d.%m.%Y").strftime("%d.%m.%Y")
         return {
             "code": code,
             "name": (item.findtext("Name") or code).strip(),
             "value": value / nominal,
             "nominal": nominal,
-            "date": date_text,
+            "date": effective_date.strftime("%d.%m.%Y") if effective_date else "",
+            "effective_date": effective_date,
         }
     raise LookupError(f"В ответе Банка России нет курса {currency_code}")
+
+
+def fetch_cbr_currency_rate(currency_code):
+    """Получает действующий сегодня и самый новый опубликованный курс ЦБ РФ.
+
+    Запрос с date_req возвращает курс на выбранную дату. Запрос без date_req,
+    согласно документации ЦБ РФ, возвращает последнюю зарегистрированную дату;
+    это позволяет заметить новый курс, опубликованный сегодня для действия завтра.
+    """
+    today_moscow = datetime.now(ZoneInfo("Europe/Moscow")).date()
+    headers = {"User-Agent": "Mozilla/5.0 DeepSeekAlice/1.0"}
+    url = "https://www.cbr.ru/scripts/XML_daily.asp"
+
+    current_response = requests.get(
+        url,
+        params={"date_req": today_moscow.strftime("%d/%m/%Y")},
+        headers=headers,
+        timeout=15,
+    )
+    current_response.raise_for_status()
+    current_rate = _parse_cbr_currency_xml(current_response.content, currency_code)
+
+    latest_response = requests.get(
+        url,
+        headers=headers,
+        timeout=15,
+    )
+    latest_response.raise_for_status()
+    latest_rate = _parse_cbr_currency_xml(latest_response.content, currency_code)
+
+    current_rate["today"] = today_moscow
+    current_rate["latest"] = latest_rate
+    return current_rate
 
 
 def get_currency_rate_answer(user_text):
@@ -742,11 +771,27 @@ def get_currency_rate_answer(user_text):
         value = f"{rate['value']:,.4f}".replace(",", " ").replace(".", ",")
         nominal = int(rate["nominal"])
         nominal_phrase = f"за 1 {currency_singular}" if nominal == 1 else f"за {nominal} {currency_plural}"
-        date_phrase = f" на {rate['date']}" if rate.get("date") else ""
-        return (
-            f"Официальный курс Банка России: {value} рубля {nominal_phrase}. "
-            f"Курс установлен{date_phrase}."
+        answer = (
+            f"Официальный курс Банка России на сегодня: {value} рубля {nominal_phrase}."
         )
+
+        latest = rate.get("latest") or {}
+        latest_date = latest.get("effective_date")
+        today = rate.get("today")
+        if latest_date and today and latest_date > today:
+            latest_value = f"{latest['value']:,.4f}".replace(",", " ").replace(".", ",")
+            latest_nominal = int(latest["nominal"])
+            latest_nominal_phrase = (
+                f"за 1 {currency_singular}" if latest_nominal == 1
+                else f"за {latest_nominal} {currency_plural}"
+            )
+            answer += (
+                f" Сегодня Банк России установил новый курс: {latest_value} рубля "
+                f"{latest_nominal_phrase}; он вступит в силу {latest_date.strftime('%d.%m.%Y')}."
+            )
+        elif rate.get("date"):
+            answer += f" Этот курс действует с {rate['date']}."
+        return answer
     except Exception as exc:
         logger.warning("CBR currency rate lookup failed for %s: %s", code, exc)
         return (
