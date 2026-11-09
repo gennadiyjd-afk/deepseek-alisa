@@ -142,6 +142,17 @@ def is_wait_command(text):
     return command in ("алиса я жду", "я жду")
 
 
+def pending_job_notice(job):
+    """Не повторяет «Секундочку» при каждом обращении к ещё работающей задаче."""
+    if not job.get("pending_notice_sent", False):
+        job["pending_notice_sent"] = True
+        return "Секундочку"
+
+    if job.get("kind") == "search":
+        return "Поиск ещё продолжается."
+    return "Ответ ещё готовится."
+
+
 def is_continue_command(text):
     """Команды перехода к следующей части длинного ответа."""
     return normalize_command(text) in (
@@ -2105,14 +2116,28 @@ async def main(body: dict):
     # сообщает только о задержке — без дополнительных инструкций.
     if job and job.get("status") == "pending":
         if retrieval_command:
-            return make_response(body, "Секундочку")
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                if current and current.get("job_id") == job.get("job_id"):
+                    if current.get("status") == "pending":
+                        notice = pending_job_notice(current)
+                        job = dict(current)
+                    else:
+                        notice = None
+                        job = dict(current)
+                else:
+                    notice = "Секундочку"
 
-        # Новый вопрос отменяет старую задачу.
-        with jobs_lock:
-            current = search_jobs.get(job_key)
-            if current and current.get("job_id") == job.get("job_id"):
-                search_jobs.pop(job_key, None)
-        job = None
+            if notice is not None:
+                return make_response(body, notice)
+            # Задача успела завершиться между проверками — ниже выдадим результат.
+        else:
+            # Новый вопрос отменяет старую задачу.
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                if current and current.get("job_id") == job.get("job_id"):
+                    search_jobs.pop(job_key, None)
+            job = None
 
     # Готовый ответ выдаём по команде «Алиса, я жду» / «Я жду» или по имени «Алиса», а следующие части —
     # по командам «Да», «Продолжи» или «Продолжай».
@@ -2156,6 +2181,7 @@ async def main(body: dict):
                 "job_id": job_id,
                 "kind": "search",
                 "status": "pending",
+                "pending_notice_sent": False,
                 "answer": "",
                 "parts": [],
                 "part_index": 0,
@@ -2188,6 +2214,7 @@ async def main(body: dict):
             "job_id": job_id,
             "kind": "chat",
             "status": "pending",
+            "pending_notice_sent": False,
             "answer": "",
             "parts": [],
             "part_index": 0,
@@ -2239,6 +2266,10 @@ async def main(body: dict):
         raise RuntimeError("Background chat returned no answer")
 
     except asyncio.TimeoutError:
+        with jobs_lock:
+            current = search_jobs.get(job_key)
+            if current and current.get("job_id") == job_id:
+                current["pending_notice_sent"] = True
         logger.info(
             "Chat is still running after %.2f seconds; returning control to Marusya",
             wait_timeout,
