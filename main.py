@@ -754,6 +754,7 @@ WEATHER_LOCATION_ALIASES = {
     "питере": "Санкт-Петербург",
     "воронеже": "Воронеж",
     "ростове-на-дону": "Ростов-на-Дону",
+    "ростове на дону": "Ростов-на-Дону",
     "ростове": "Ростов",
     "липецке": "Липецк",
     "курске": "Курск",
@@ -840,13 +841,24 @@ def _weather_city_and_country(location_name):
 
 def _weather_query_variants(city):
     variants = [city]
-    alias = WEATHER_LOCATION_ALIASES.get(city.lower().replace("ё", "е"))
+    normalized_key = city.lower().replace("ё", "е")
+    alias = WEATHER_LOCATION_ALIASES.get(normalized_key)
     if alias:
         variants.insert(0, alias)
 
-    # Простые однословные формы: Москве -> Москв / Москва,
-    # Липецке -> Липецк. Для составных и дефисных названий
-    # не применяем эвристику, чтобы не портить название.
+    # Open-Meteo может не находить составные названия с дефисом
+    # или русскую транслитерацию. Пробуем несколько эквивалентных форм.
+    if normalized_key in ("ростове-на-дону", "ростове на дону",
+                          "ростов-на-дону", "ростов на дону"):
+        variants.extend(("Ростов-на-Дону", "Ростов на Дону",
+                         "Rostov-on-Don", "Rostov-na-Donu", "Rostov"))
+    elif normalized_key in ("санкт-петербурге", "санкт-петербург"):
+        variants.extend(("Санкт-Петербург", "Санкт Петербург",
+                         "Saint Petersburg"))
+    elif normalized_key in ("нью-йорке", "нью-йорк"):
+        variants.extend(("Нью-Йорк", "New York"))
+
+    # Простые однословные формы: Москве -> Москва, Липецке -> Липецк.
     if " " not in city and "-" not in city:
         lower = city.lower()
         if lower.endswith(("ове", "еве", "ине", "ане")):
@@ -871,9 +883,19 @@ def resolve_weather_location(location_name):
     # Для общеизвестных зарубежных столиц задаём разумный приоритет,
     # чтобы одноимённые небольшие населённые пункты не подменяли город.
     preferred_countries = {
-        "париж": "FR", "берлин": "DE", "лондон": "GB",
-        "рим": "IT", "мадрид": "ES", "прага": "CZ",
-        "вена": "AT", "стамбул": "TR", "нью-йорк": "US",
+        "москва": "RU", "москве": "RU",
+        "воронеж": "RU", "воронеже": "RU",
+        "ростов-на-дону": "RU", "ростове-на-дону": "RU",
+        "липецк": "RU", "липецке": "RU",
+        "париж": "FR", "париже": "FR",
+        "берлин": "DE", "берлине": "DE",
+        "лондон": "GB", "лондоне": "GB",
+        "рим": "IT", "риме": "IT",
+        "мадрид": "ES", "мадриде": "ES",
+        "прага": "CZ", "праге": "CZ",
+        "вена": "AT", "вене": "AT",
+        "стамбул": "TR", "стамбуле": "TR",
+        "нью-йорк": "US", "нью-йорке": "US",
     }
     preferred_country = requested_country or preferred_countries.get(
         city.lower().replace("ё", "е")
@@ -924,7 +946,10 @@ def resolve_weather_location(location_name):
     if not all_results:
         raise LookupError(f"Населённый пункт «{location_name}» не найден")
 
-    city_norm = _weather_normalize(city)
+    canonical_city = WEATHER_LOCATION_ALIASES.get(
+        city.lower().replace("ё", "е"), city
+    )
+    city_norm = _weather_normalize(canonical_city)
     def rank(item):
         item_name = _weather_normalize(item.get("name", ""))
         feature = item.get("feature_code", "")
