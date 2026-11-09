@@ -26,6 +26,9 @@ TAVILY_KEY = os.getenv("TAVILY_API_KEY")
 
 executor = ThreadPoolExecutor(max_workers=2)
 search_jobs = {}
+# Последний прерванный многочастный ответ сохраняется отдельно,
+# чтобы короткое случайное сообщение не уничтожало контекст продолжения.
+interrupted_jobs = {}
 jobs_lock = threading.Lock()
 
 # Небольшой серверный кэш снижает число одинаковых запросов к погодным API.
@@ -161,6 +164,33 @@ def is_continue_command(text):
         "продолжи",
         "продолжить",
     )
+
+
+def is_continuation_repair_request(text):
+    """Распознаёт пояснение, что пользователь хотел подтвердить продолжение."""
+    command = normalize_command(text)
+    correction = any(phrase in command for phrase in (
+        "я ошибся",
+        "я ошиблась",
+        "я хотел сказать",
+        "я хотела сказать",
+        "я имел в виду",
+        "я имела в виду",
+        "оговорился",
+        "оговорилась",
+    ))
+    explicit_continue = any(word in command for word in (
+        "продолжи",
+        "продолжай",
+        "продолжить",
+    ))
+    return correction and ("да" in command or explicit_continue)
+
+
+def is_short_ambiguous_interruption(text):
+    """Короткое сообщение может быть оговоркой, а не новым полноценным запросом."""
+    command = normalize_command(text)
+    return len(command) <= 24 and len(command.split()) <= 2
 
 
 def is_stop_command(text):
@@ -1465,15 +1495,20 @@ def is_complex_question(text):
 
 
 def save_job_result(session_id, job_id, result):
-    """Записывает результат, только если это всё ещё актуальная задача."""
+    """Записывает результат активной или временно прерванной задачи."""
     with jobs_lock:
         current = search_jobs.get(session_id)
-
-        if not current or current.get("job_id") != job_id:
-            logger.info("Discarded result of an outdated task")
+        if current and current.get("job_id") == job_id:
+            current.update(result)
             return
 
-        current.update(result)
+        interrupted = interrupted_jobs.get(session_id)
+        if interrupted and interrupted.get("job_id") == job_id:
+            interrupted.update(result)
+            logger.info("Background result saved for an interrupted conversation")
+            return
+
+        logger.info("Discarded result of an outdated task")
 
 def ask_ai(messages, timeout=25, max_tokens=1000):
     """Запрашивает ответ у RouterAPI с одной повторной попыткой при сбое."""
@@ -2102,14 +2137,49 @@ async def main(body: dict):
 
     with jobs_lock:
         job = search_jobs.get(job_key)
+        interrupted = interrupted_jobs.get(job_key)
+
+    # Если пользователь исправляет оговорку или подтверждает продолжение,
+    # возвращаем именно прежний многочастный ответ, а не ответ на случайную реплику.
+    if interrupted and (continue_command or wait_command or is_continuation_repair_request(user_text)):
+        with jobs_lock:
+            interrupted = interrupted_jobs.pop(job_key, None)
+            current = search_jobs.get(job_key)
+            if current and current.get("job_id") != (interrupted or {}).get("job_id"):
+                search_jobs.pop(job_key, None)
+            if interrupted:
+                search_jobs[job_key] = interrupted
+                job = interrupted
+            else:
+                job = search_jobs.get(job_key)
+
+        if job and job.get("status") == "pending":
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                notice = pending_job_notice(current) if current else "Секундочку"
+            return make_response(body, notice)
+        if job and job.get("status") == "ready":
+            return deliver_job_part(body, job_key, job)
+        if job and job.get("status") == "error":
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                if current and current.get("job_id") == job.get("job_id"):
+                    search_jobs.pop(job_key, None)
+            return make_response(body, "Не удалось получить ответ. Попробуй повторить вопрос.")
+
+    # Длинный новый запрос означает смену темы; старый прерванный ответ больше не нужен.
+    if interrupted and not is_short_ambiguous_interruption(user_text) and not retrieval_command:
+        with jobs_lock:
+            interrupted_jobs.pop(job_key, None)
 
     # Отказ относится только к активному многочастному ответу.
     # Удаление задачи также не позволит позднему фоновому результату её восстановить.
-    if job and is_stop_command(user_text):
+    if (job or interrupted) and is_stop_command(user_text):
         with jobs_lock:
             current = search_jobs.get(job_key)
-            if current and current.get("job_id") == job.get("job_id"):
+            if current and (not job or current.get("job_id") == job.get("job_id")):
                 search_jobs.pop(job_key, None)
+            interrupted_jobs.pop(job_key, None)
         return make_response(body, "Хорошо, больше не буду продолжать.")
 
     # Если задача ещё выполняется, команда ожидания «Алиса, я жду» / «Я жду», имя «Алиса» либо продолжения
@@ -2132,10 +2202,15 @@ async def main(body: dict):
                 return make_response(body, notice)
             # Задача успела завершиться между проверками — ниже выдадим результат.
         else:
-            # Новый вопрос отменяет старую задачу.
+            # Короткая реплика может оказаться оговоркой. Сохраняем задачу,
+            # чтобы последующее «Да» или пояснение вернуло пользователя к ответу.
             with jobs_lock:
                 current = search_jobs.get(job_key)
                 if current and current.get("job_id") == job.get("job_id"):
+                    if is_short_ambiguous_interruption(user_text):
+                        interrupted_jobs[job_key] = current
+                    else:
+                        interrupted_jobs.pop(job_key, None)
                     search_jobs.pop(job_key, None)
             job = None
 
@@ -2145,10 +2220,15 @@ async def main(body: dict):
         if retrieval_command:
             return deliver_job_part(body, job_key, job)
 
-        # Иное сообщение считается новым запросом.
+        # Короткая посторонняя реплика может быть ошибкой ввода/распознавания.
+        # Не уничтожаем из-за неё готовый многочастный ответ.
         with jobs_lock:
             current = search_jobs.get(job_key)
             if current and current.get("job_id") == job.get("job_id"):
+                if is_short_ambiguous_interruption(user_text):
+                    interrupted_jobs[job_key] = current
+                else:
+                    interrupted_jobs.pop(job_key, None)
                 search_jobs.pop(job_key, None)
         job = None
 
