@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from fastapi import FastAPI
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 app = FastAPI()
@@ -352,6 +352,22 @@ def is_currency_rate_request(text):
     return has_currency and has_rate_intent and not is_stock_quote_request(normalized)
 
 
+def is_weather_request(text):
+    """Распознаёт самостоятельные вопросы о погоде и прогнозе."""
+    normalized = normalize_command(text)
+    weather_terms = (
+        "погод", "прогноз", "дожд", "ливень", "снег", "снегопад",
+        "гроза", "замороз", "температур", "ветер", "зонт",
+    )
+    return any(term in normalized for term in weather_terms) and (
+        any(term in normalized for term in (
+            "погод", "прогноз", "дожд", "ливень", "снег", "снегопад",
+            "гроза", "замороз", "температур", "ветер", "брать зонт", "нужен зонт",
+            "нужно ли брать зонт",
+        ))
+    )
+
+
 def needs_search(text):
     text = str(text or "").lower().replace("ё", "е")
     return (
@@ -359,6 +375,7 @@ def needs_search(text):
         or "посмотри в интернете" in text
         or is_stock_quote_request(text)
         or is_currency_rate_request(text)
+        or is_weather_request(text)
     )
 
 
@@ -687,6 +704,311 @@ def get_currency_rate_answer(user_text):
         )
 
 
+WEATHER_DEFAULT_LOCATION = {
+    "name": "Бурдино",
+    "latitude": 52.1373815,
+    "longitude": 38.4722745,
+    "timezone": "Europe/Moscow",
+}
+
+
+def extract_weather_location(user_text):
+    """Извлекает явно названное место; иначе использует село Бурдино."""
+    text = str(user_text or "").strip()
+    text = re.sub(r"^алиса[, ]+", "", text, flags=re.IGNORECASE)
+    match = re.search(
+        r"\b(?:в|для)\s+(?:(?:селе|село|городе|город|деревне|"
+        r"поселке|посёлке|поселок|посёлок)\s+)?(.+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    location = match.group(1).strip(" ,.!?")
+    stop_pattern = (
+        r"\b(?:на ближайшую неделю|на послезавтра|на выходных|"
+        r"на выходные|на сегодня|на завтра|на неделю|"
+        r"сегодня|завтра|послезавтра|сейчас|в выходные|"
+        r"утром|днем|днём|вечером|ночью|пожалуйста)\b"
+    )
+    location = re.split(stop_pattern, location, maxsplit=1, flags=re.IGNORECASE)[0].strip(" ,.!?")
+    location = re.sub(
+        r"^(?:селе|село|городе|город|деревне|поселке|посёлке)\s+",
+        "",
+        location,
+        flags=re.IGNORECASE,
+    )
+    location = re.sub(
+        r"\s+(?:будет ли|будет|ожидается ли|ожидается|какая|какой|какое).*$",
+        "",
+        location,
+        flags=re.IGNORECASE,
+    ).strip(" ,.!?")
+    return location or None
+
+
+def resolve_weather_location(location_name):
+    """Находит координаты населённого пункта через Open-Meteo Geocoding."""
+    if not location_name:
+        return dict(WEATHER_DEFAULT_LOCATION)
+
+    query_variants = [location_name]
+    if "," in location_name:
+        query_variants.append(location_name.split(",", 1)[0].strip())
+    # Пользователь часто называет город в предложном падеже: «в Москве»,
+    # «в Париже», «в Липецке». При необходимости пробуем форму из словаря.
+    lower_name = location_name.lower()
+    if lower_name.endswith("е"):
+        query_variants.extend((location_name[:-1], location_name[:-1] + "а"))
+    elif lower_name.endswith("у"):
+        query_variants.append(location_name[:-1] + "а")
+    elif lower_name.endswith("ю"):
+        query_variants.append(location_name[:-1] + "я")
+
+    results = []
+    for query_variant in dict.fromkeys(query_variants):
+        response = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={
+                "name": query_variant,
+                "count": 10,
+                "language": "ru",
+                "format": "json",
+            },
+            headers={"User-Agent": "Mozilla/5.0 DeepSeekAlice/1.0"},
+            timeout=12,
+        )
+        response.raise_for_status()
+        results = response.json().get("results") or []
+        if results:
+            break
+    if not results:
+        raise LookupError(f"Населённый пункт «{location_name}» не найден")
+
+    query_norm = re.sub(r"[^a-zа-я0-9]", "", location_name.lower().replace("ё", "е"))
+    results.sort(key=lambda item: (
+        0 if re.sub(r"[^a-zа-я0-9]", "", str(item.get("name", "")).lower().replace("ё", "е")) == query_norm else 1,
+        0 if str(item.get("country_code", "")).upper() == "RU" else 1,
+        0 if item.get("feature_code") in ("PPL", "PPLA", "PPLA2", "PPLA3", "PPLA4") else 1,
+    ))
+    chosen = results[0]
+    name_parts = [str(chosen.get("name") or location_name)]
+    admin1 = chosen.get("admin1")
+    country = chosen.get("country")
+    if admin1 and admin1 not in name_parts:
+        name_parts.append(str(admin1))
+    if country and country not in name_parts:
+        name_parts.append(str(country))
+
+    return {
+        "name": ", ".join(name_parts),
+        "latitude": float(chosen["latitude"]),
+        "longitude": float(chosen["longitude"]),
+        "timezone": "auto",
+    }
+
+
+def weather_description(code):
+    """Переводит коды погоды WMO в короткие русские описания."""
+    code = int(code)
+    if code == 0:
+        return "ясно"
+    if code == 1:
+        return "преимущественно ясно"
+    if code == 2:
+        return "переменная облачность"
+    if code == 3:
+        return "пасмурно"
+    if code in (45, 48):
+        return "туман"
+    if code in (51, 53, 55, 56, 57):
+        return "морось"
+    if code in (61, 63, 65, 66, 67):
+        return "дождь"
+    if code in (71, 73, 75, 77):
+        return "снег"
+    if code in (80, 81, 82):
+        return "ливень"
+    if code in (85, 86):
+        return "снегопад"
+    if code in (95, 96, 99):
+        return "гроза"
+    return "переменная погода"
+
+
+def wind_direction_text(degrees):
+    directions = (
+        "северный", "северо-восточный", "восточный", "юго-восточный",
+        "южный", "юго-западный", "западный", "северо-западный",
+    )
+    return directions[int((float(degrees) + 22.5) // 45) % 8]
+
+
+def get_weather_answer(user_text):
+    """Получает актуальные условия и прогноз через Open-Meteo."""
+    try:
+        location_query = extract_weather_location(user_text)
+        location = resolve_weather_location(location_query)
+        response = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": location["latitude"],
+                "longitude": location["longitude"],
+                "current": (
+                    "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                    "precipitation,rain,showers,snowfall,weather_code,"
+                    "wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+                ),
+                "daily": (
+                    "weather_code,temperature_2m_max,temperature_2m_min,"
+                    "precipitation_probability_max,precipitation_sum,"
+                    "wind_speed_10m_max,sunrise,sunset"
+                ),
+                "forecast_days": 10,
+                "timezone": location.get("timezone", "auto"),
+                "wind_speed_unit": "ms",
+            },
+            headers={"User-Agent": "Mozilla/5.0 DeepSeekAlice/1.0"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        current = data.get("current") or {}
+        daily = data.get("daily") or {}
+        dates = daily.get("time") or []
+        if not current or not dates:
+            raise ValueError("Open-Meteo вернул неполный прогноз")
+
+        tz_name = data.get("timezone") or "Europe/Moscow"
+        try:
+            local_now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            local_now = datetime.now(ZoneInfo("Europe/Moscow"))
+        today = local_now.date()
+        tomorrow = today.fromordinal(today.toordinal() + 1)
+        query = normalize_command(user_text)
+        is_tomorrow = "завтра" in query or "послезавтра" in query
+        is_day_after = "послезавтра" in query
+        is_weekend = "выходн" in query
+        is_week = any(term in query for term in ("на неделю", "неделю", "на 7 дней", "семь дней"))
+
+        place = location["name"]
+        if location_query is None:
+            place = "Бурдино"
+
+        if is_week:
+            day_lines = []
+            for index, date_text in enumerate(dates[:7]):
+                date_obj = datetime.strptime(date_text, "%Y-%m-%d").date()
+                weekday = ("понедельник", "вторник", "среда", "четверг",
+                           "пятница", "суббота", "воскресенье")[date_obj.weekday()]
+                code = (daily.get("weather_code") or [])[index]
+                low = (daily.get("temperature_2m_min") or [])[index]
+                high = (daily.get("temperature_2m_max") or [])[index]
+                day_lines.append(
+                    f"{weekday.capitalize()}: {weather_description(code)}, "
+                    f"от {round(low)} до {round(high)} градусов"
+                )
+            return f"Прогноз на неделю для {place}. " + ". ".join(day_lines) + "."
+
+        if is_weekend:
+            days_until_saturday = (5 - today.weekday()) % 7
+            if today.weekday() == 6:
+                days_until_saturday = 6
+            weekend_start = today + timedelta(days=days_until_saturday)
+            weekend_indexes = []
+            for index, date_text in enumerate(dates):
+                date_obj = datetime.strptime(date_text, "%Y-%m-%d").date()
+                if date_obj.weekday() >= 5 and date_obj >= weekend_start:
+                    weekend_indexes.append(index)
+                if len(weekend_indexes) == 2:
+                    break
+            if weekend_indexes:
+                day_lines = []
+                for index in weekend_indexes:
+                    date_obj = datetime.strptime(dates[index], "%Y-%m-%d").date()
+                    weekday = "субботу" if date_obj.weekday() == 5 else "воскресенье"
+                    code = daily["weather_code"][index]
+                    low = daily["temperature_2m_min"][index]
+                    high = daily["temperature_2m_max"][index]
+                    day_lines.append(
+                        f"в {weekday} — {weather_description(code)}, "
+                        f"от {round(low)} до {round(high)} градусов"
+                    )
+                return f"Прогноз на выходные. Населённый пункт: {place}. " + "; ".join(day_lines) + ". Данные прогноза — Open-Meteo."
+
+        target_date = today
+        if is_tomorrow:
+            target_date = tomorrow if not is_day_after else today.fromordinal(today.toordinal() + 2)
+        target_index = next(
+            (i for i, date_text in enumerate(dates) if date_text == target_date.isoformat()),
+            None,
+        )
+        if target_index is None:
+            raise LookupError("На запрошенную дату прогноза нет")
+
+        code = daily["weather_code"][target_index]
+        low = daily["temperature_2m_min"][target_index]
+        high = daily["temperature_2m_max"][target_index]
+        rain_chance = (daily.get("precipitation_probability_max") or [None] * len(dates))[target_index]
+        rain_sum = (daily.get("precipitation_sum") or [None] * len(dates))[target_index]
+        wind_max = (daily.get("wind_speed_10m_max") or [None] * len(dates))[target_index]
+        day_label = "послезавтра" if is_day_after else ("завтра" if is_tomorrow else "сегодня")
+
+        if not is_tomorrow:
+            temp = current.get("temperature_2m")
+            feels = current.get("apparent_temperature")
+            humidity = current.get("relative_humidity_2m")
+            current_code = current.get("weather_code", code)
+            wind = current.get("wind_speed_10m")
+            wind_dir = current.get("wind_direction_10m")
+            if location_query is None:
+                answer = (
+                    f"Погода в {place} сейчас: {round(temp)} градусов, "
+                    f"{weather_description(current_code)}"
+                )
+            else:
+                answer = (
+                    f"Погода сейчас. Населённый пункт: {place}. "
+                    f"Температура {round(temp)} градусов, {weather_description(current_code)}"
+                )
+            if feels is not None:
+                answer += f", ощущается как {round(feels)}"
+            answer += (
+                f". Сегодня ожидается от {round(low)} до {round(high)} градусов"
+                f", {weather_description(code)}"
+            )
+            if rain_chance is not None:
+                answer += f", вероятность осадков до {int(rain_chance)} процентов"
+            if wind is not None:
+                answer += f". Ветер {wind_direction_text(wind_dir or 0)}, скорость около {round(wind)} метров в секунду"
+            if humidity is not None:
+                answer += f". Влажность {int(humidity)} процентов"
+            return answer + ". Данные прогноза — Open-Meteo."
+        if location_query is None:
+            place_phrase = f"для {place}"
+        else:
+            place_phrase = f"для населённого пункта {place}"
+        answer = (
+            f"Прогноз на {day_label} {place_phrase}: {weather_description(code)}, "
+            f"температура от {round(low)} до {round(high)} градусов"
+        )
+        if rain_chance is not None:
+            answer += f", вероятность осадков до {int(rain_chance)} процентов"
+        if rain_sum is not None and float(rain_sum) > 0:
+            answer += f", ожидается около {float(rain_sum):.1f}".replace(".", ",") + " миллиметра осадков"
+        if wind_max is not None:
+            answer += f". Максимальная скорость ветра около {round(wind_max)} метров в секунду"
+        return answer + ". Данные прогноза — Open-Meteo."
+
+    except Exception as exc:
+        logger.warning("Weather lookup failed: %s", exc)
+        if isinstance(exc, LookupError):
+            return str(exc) + ". Уточни название населённого пункта или попробуй ещё раз."
+        return "Не удалось получить прогноз погоды. Попробуй повторить запрос немного позже."
+
+
 def is_complex_question(text):
     """Определяет запросы, которым обычно требуется длительная обработка."""
     normalized = normalize_command(text)
@@ -984,6 +1306,16 @@ def complete_answer_if_cut_off(answer, messages):
 def search_and_answer(session_id, job_id, user_text, history):
     try:
         logger.info("Background search started")
+
+        if is_weather_request(user_text):
+            logger.info("Dedicated Open-Meteo weather lookup started")
+            answer = get_weather_answer(user_text)
+            save_job_result(session_id, job_id, {
+                "status": "ready",
+                "answer": answer,
+            })
+            logger.info("Dedicated Open-Meteo weather lookup completed")
+            return {"status": "ready", "answer": answer}
 
         if is_currency_rate_request(user_text):
             logger.info("Dedicated CBR currency rate lookup started")
