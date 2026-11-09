@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import asyncio
 import uuid
@@ -29,12 +30,99 @@ search_jobs = {}
 # Последний прерванный многочастный ответ сохраняется отдельно,
 # чтобы короткое случайное сообщение не уничтожало контекст продолжения.
 interrupted_jobs = {}
-jobs_lock = threading.Lock()
+jobs_lock = threading.RLock()
 
 # Небольшой серверный кэш снижает число одинаковых запросов к погодным API.
 WEATHER_CACHE = {}
 WEATHER_FAILURE_CACHE = {}
 WEATHER_CACHE_LOCK = threading.Lock()
+
+# Upstash Redis REST: persistent storage for pending and interrupted answers.
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+REDIS_STATE_KEY = "deepseek-alisa:conversation-jobs:v1"
+REDIS_STATE_LOCK = threading.Lock()
+REDIS_AVAILABLE = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+
+
+def redis_command(command):
+    """Executes one Upstash Redis REST command; never logs credentials."""
+    if not REDIS_AVAILABLE:
+        raise RuntimeError("Upstash Redis environment variables are missing")
+    response = requests.post(
+        UPSTASH_REDIS_REST_URL,
+        headers={
+            "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json=command,
+        timeout=5,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError("Upstash Redis command failed")
+    return payload.get("result")
+
+
+def persist_job_maps():
+    """Persists current job state; memory remains a fallback if Redis is unavailable."""
+    if not REDIS_AVAILABLE:
+        return False
+    try:
+        # Keep the state lock through the write so an older snapshot cannot
+        # overtake a newer one when multiple webhook/background threads save.
+        with jobs_lock:
+            snapshot = {
+                "search_jobs": search_jobs,
+                "interrupted_jobs": interrupted_jobs,
+                "saved_at": int(time.time()),
+            }
+            serialized = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+            with REDIS_STATE_LOCK:
+                redis_command(["SET", REDIS_STATE_KEY, serialized, "EX", 604800])
+        return True
+    except Exception as exc:
+        logger.warning("Redis state save failed; continuing with in-memory state: %s", exc)
+        return False
+
+
+def load_job_maps():
+    """Restores pending and interrupted conversation jobs after a Render restart."""
+    if not REDIS_AVAILABLE:
+        logger.warning("Upstash Redis is not configured; conversation state is memory-only")
+        return
+    try:
+        with REDIS_STATE_LOCK:
+            raw = redis_command(["GET", REDIS_STATE_KEY])
+        if not raw:
+            logger.info("Redis state store is empty; starting with fresh conversation state")
+            return
+        saved = json.loads(raw)
+        restored_search = saved.get("search_jobs", {})
+        restored_interrupted = saved.get("interrupted_jobs", {})
+        if not isinstance(restored_search, dict) or not isinstance(restored_interrupted, dict):
+            raise ValueError("Unexpected Redis state format")
+        # Background Python threads do not survive a Render restart.
+        # Keep completed/interrupted answers, but mark orphaned pending jobs as failed
+        # instead of leaving the user waiting forever for work that no longer exists.
+        for collection in (restored_search, restored_interrupted):
+            for saved_job in collection.values():
+                if saved_job.get("status") == "pending":
+                    saved_job["status"] = "error"
+                    saved_job["answer"] = ""
+        with jobs_lock:
+            search_jobs.update(restored_search)
+            interrupted_jobs.update(restored_interrupted)
+        if restored_search or restored_interrupted:
+            persist_job_maps()
+        logger.info(
+            "Restored conversation state from Redis: %s active, %s interrupted",
+            len(restored_search), len(restored_interrupted),
+        )
+    except Exception as exc:
+        logger.error("Could not restore conversation state from Redis: %s", exc)
+
 
 
 def _weather_cached_json(
@@ -149,6 +237,7 @@ def pending_job_notice(job):
     """Не повторяет «Секундочку» при каждом обращении к ещё работающей задаче."""
     if not job.get("pending_notice_sent", False):
         job["pending_notice_sent"] = True
+        persist_job_maps()
         return "Секундочку"
 
     if job.get("kind") == "search":
@@ -385,6 +474,7 @@ def deliver_job_part(body, job_key, job):
         index = int(current.get("part_index", 0))
         if index >= len(parts):
             search_jobs.pop(job_key, None)
+            persist_job_maps()
             return make_response(body, "На этом всё.")
 
         answer = parts[index]
@@ -392,6 +482,7 @@ def deliver_job_part(body, job_key, job):
         if not is_last:
             answer += " Продолжить?"
             current["part_index"] = index + 1
+            persist_job_maps()
         else:
             original_text = current.get("user_text", "")
             original_history = current.get("history", [])
@@ -401,6 +492,7 @@ def deliver_job_part(body, job_key, job):
                 {"role": "assistant", "content": complete_answer[:400]},
             ]
             search_jobs.pop(job_key, None)
+            persist_job_maps()
             return make_response(body, answer, new_history)
 
     return make_response(body, answer)
@@ -1500,11 +1592,13 @@ def save_job_result(session_id, job_id, result):
         current = search_jobs.get(session_id)
         if current and current.get("job_id") == job_id:
             current.update(result)
+            persist_job_maps()
             return
 
         interrupted = interrupted_jobs.get(session_id)
         if interrupted and interrupted.get("job_id") == job_id:
             interrupted.update(result)
+            persist_job_maps()
             logger.info("Background result saved for an interrupted conversation")
             return
 
@@ -2106,9 +2200,14 @@ def make_response(body, answer, history=None):
     return response_data
 
 
+@app.on_event("startup")
+async def startup_restore_redis_state():
+    load_job_maps()
+
+
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "redis_configured": REDIS_AVAILABLE}
 
 
 @app.post("/")
@@ -2152,6 +2251,7 @@ async def main(body: dict):
                 job = interrupted
             else:
                 job = search_jobs.get(job_key)
+            persist_job_maps()
 
         if job and job.get("status") == "pending":
             with jobs_lock:
@@ -2165,12 +2265,14 @@ async def main(body: dict):
                 current = search_jobs.get(job_key)
                 if current and current.get("job_id") == job.get("job_id"):
                     search_jobs.pop(job_key, None)
+                    persist_job_maps()
             return make_response(body, "Не удалось получить ответ. Попробуй повторить вопрос.")
 
     # Длинный новый запрос означает смену темы; старый прерванный ответ больше не нужен.
     if interrupted and not is_short_ambiguous_interruption(user_text) and not retrieval_command:
         with jobs_lock:
             interrupted_jobs.pop(job_key, None)
+            persist_job_maps()
 
     # Отказ относится только к активному многочастному ответу.
     # Удаление задачи также не позволит позднему фоновому результату её восстановить.
@@ -2180,6 +2282,7 @@ async def main(body: dict):
             if current and (not job or current.get("job_id") == job.get("job_id")):
                 search_jobs.pop(job_key, None)
             interrupted_jobs.pop(job_key, None)
+            persist_job_maps()
         return make_response(body, "Хорошо, больше не буду продолжать.")
 
     # Если задача ещё выполняется, команда ожидания «Алиса, я жду» / «Я жду», имя «Алиса» либо продолжения
@@ -2212,6 +2315,7 @@ async def main(body: dict):
                     else:
                         interrupted_jobs.pop(job_key, None)
                     search_jobs.pop(job_key, None)
+                    persist_job_maps()
             job = None
 
     # Готовый ответ выдаём по команде «Алиса, я жду» / «Я жду» или по имени «Алиса», а следующие части —
@@ -2230,6 +2334,7 @@ async def main(body: dict):
                 else:
                     interrupted_jobs.pop(job_key, None)
                 search_jobs.pop(job_key, None)
+                persist_job_maps()
         job = None
 
     elif job and job.get("status") == "error":
@@ -2237,6 +2342,7 @@ async def main(body: dict):
             current = search_jobs.get(job_key)
             if current and current.get("job_id") == job.get("job_id"):
                 search_jobs.pop(job_key, None)
+                persist_job_maps()
         return make_response(
             body,
             "Не удалось получить ответ. Попробуй повторить запрос.",
@@ -2268,6 +2374,7 @@ async def main(body: dict):
                 "user_text": user_text,
                 "history": history[-4:],
             }
+            persist_job_maps()
 
         executor.submit(
             search_and_answer,
@@ -2301,6 +2408,7 @@ async def main(body: dict):
             "user_text": user_text,
             "history": history[-4:],
         }
+        persist_job_maps()
 
     future = executor.submit(
         chat_in_background,
@@ -2321,6 +2429,7 @@ async def main(body: dict):
                 if current and current.get("job_id") == job_id:
                     current["status"] = "ready"
                     prepare_job_parts(current, answer)
+                    persist_job_maps()
                     current_job = dict(current)
                 else:
                     current_job = None
@@ -2337,6 +2446,7 @@ async def main(body: dict):
                 current = search_jobs.get(job_key)
                 if current and current.get("job_id") == job_id:
                     search_jobs.pop(job_key, None)
+                    persist_job_maps()
             new_history = history[-3:] + [
                 {"role": "user", "content": user_text[:400]},
                 {"role": "assistant", "content": answer[:400]},
