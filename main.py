@@ -30,6 +30,7 @@ search_jobs = {}
 # Последний прерванный многочастный ответ сохраняется отдельно,
 # чтобы короткое случайное сообщение не уничтожало контекст продолжения.
 interrupted_jobs = {}
+MAX_CONVERSATION_TOPICS = 2
 jobs_lock = threading.RLock()
 
 # Небольшой серверный кэш снижает число одинаковых запросов к погодным API.
@@ -100,17 +101,37 @@ def load_job_maps():
             return
         saved = json.loads(raw)
         restored_search = saved.get("search_jobs", {})
-        restored_interrupted = saved.get("interrupted_jobs", {})
-        if not isinstance(restored_search, dict) or not isinstance(restored_interrupted, dict):
+        restored_interrupted_raw = saved.get("interrupted_jobs", {})
+        if not isinstance(restored_search, dict) or not isinstance(restored_interrupted_raw, dict):
             raise ValueError("Unexpected Redis state format")
+
+        # Older deployments stored one interrupted job as an object. Migrate it
+        # in memory to the new list format without losing the saved answer.
+        restored_interrupted = {}
+        for key, value in restored_interrupted_raw.items():
+            if isinstance(value, dict):
+                restored_interrupted[key] = [value] if value else []
+            elif isinstance(value, list):
+                restored_interrupted[key] = [item for item in value if isinstance(item, dict)][-MAX_CONVERSATION_TOPICS:]
+            else:
+                restored_interrupted[key] = []
+
         # Background Python threads do not survive a Render restart.
         # Keep completed/interrupted answers, but mark orphaned pending jobs as failed
         # instead of leaving the user waiting forever for work that no longer exists.
-        for collection in (restored_search, restored_interrupted):
-            for saved_job in collection.values():
+        for saved_job in restored_search.values():
+            if saved_job.get("status") == "pending":
+                saved_job["status"] = "error"
+                saved_job["answer"] = ""
+        for saved_jobs in restored_interrupted.values():
+            for saved_job in saved_jobs:
                 if saved_job.get("status") == "pending":
                     saved_job["status"] = "error"
                     saved_job["answer"] = ""
+        # An active answer plus one interrupted answer is the two-topic limit.
+        for key in restored_search:
+            if key in restored_interrupted:
+                restored_interrupted[key] = restored_interrupted[key][-1:]
         with jobs_lock:
             search_jobs.update(restored_search)
             interrupted_jobs.update(restored_interrupted)
@@ -246,13 +267,114 @@ def pending_job_notice(job):
 
 
 def is_continue_command(text):
-    """Распознаёт короткое подтверждение и явную просьбу продолжить прошлый ответ."""
+    """Распознаёт короткое подтверждение продолжения текущей темы."""
     command = normalize_command(text)
     if command in ("да", "продолжай", "продолжи", "продолжить"):
         return True
-    # Пользователь может назвать тему и попросить продолжить с места остановки.
-    # Такая фраза тоже является командой восстановления, а не новым запросом к ИИ.
     return bool(re.match(r"^(?:алиса\s+)?(?:продолжи|продолжай|продолжить)\b", command))
+
+
+def is_topic_return_command(text):
+    """Распознаёт просьбу вернуться к ранее начатой теме."""
+    command = normalize_command(text)
+    return bool(re.match(
+        r"^(?:алиса\s+)?(?:(?:пожалуйста)\s+)?(?:вернись|вернуться|возвратись)\s+(?:(?:пожалуйста)\s+)?(?:к|ко)\b",
+        command,
+    )) or bool(re.match(
+        r"^(?:алиса\s+)?(?:продолжи|продолжай|продолжить)\s+(?:тему|рассказ|ответ|вопрос)\b",
+        command,
+    ))
+
+
+def interrupted_list(job_key):
+    """Возвращает список сохранённых тем и мигрирует старый формат при необходимости."""
+    saved = interrupted_jobs.get(job_key)
+    if isinstance(saved, dict):
+        saved = [saved]
+        interrupted_jobs[job_key] = saved
+    elif not isinstance(saved, list):
+        saved = []
+        interrupted_jobs[job_key] = saved
+    return saved
+
+
+def save_interrupted_job(job_key, job):
+    """Добавляет/обновляет прерванную тему, не допуская дубликатов."""
+    if not job:
+        return
+    saved = interrupted_list(job_key)
+    job_id = job.get("job_id")
+    saved[:] = [item for item in saved if item.get("job_id") != job_id]
+    saved.append(job)
+    del saved[:-MAX_CONVERSATION_TOPICS]
+    interrupted_jobs[job_key] = saved
+
+
+def trim_interrupted_for_active(job_key):
+    """Оставляет одну прерванную тему рядом с активной: всего не более двух."""
+    saved = interrupted_list(job_key)
+    if len(saved) > MAX_CONVERSATION_TOPICS - 1:
+        del saved[:len(saved) - (MAX_CONVERSATION_TOPICS - 1)]
+    if saved:
+        interrupted_jobs[job_key] = saved
+    else:
+        interrupted_jobs.pop(job_key, None)
+
+
+_TOPIC_STOP_WORDS = {
+    "алиса", "пожалуйста", "вернись", "вернуться", "возвратись", "верни", "к", "ко",
+    "предыдущему", "предыдущей", "предыдущий", "предыдущая", "вопросу", "вопрос", "ответу",
+    "ответ", "рассказу", "рассказ", "теме", "тему", "тема", "про", "об", "обо", "о", "по",
+    "и", "продолжи", "продолжай", "продолжить", "с", "того", "места", "где", "остановилась",
+    "остановился", "остановились", "мы", "на", "чем", "именно", "прошлому", "прошлой",
+    "начатому", "начатой", "мне", "расскажи", "рассказать", "подробно", "пожалуйста",
+}
+
+
+def topic_tokens(text):
+    normalized = normalize_command(text).replace("ё", "е")
+    meaningful_short_tokens = {"ии", "ai", "сша", "нлп", "аги"}
+    return [
+        token for token in re.findall(r"[a-zа-я0-9]+", normalized)
+        if (len(token) >= 4 or token in meaningful_short_tokens)
+        and token not in _TOPIC_STOP_WORDS
+    ]
+
+
+def _topic_words_match(left, right):
+    if left == right:
+        return True
+    common = 0
+    for a, b in zip(left, right):
+        if a != b:
+            break
+        common += 1
+    return common >= 4
+
+
+def choose_interrupted_topic(user_text, candidates):
+    """Выбирает сохранённый ответ по словам темы; общий возврат берёт самый свежий."""
+    if not candidates:
+        return None
+    query_tokens = topic_tokens(user_text)
+    if not query_tokens:
+        return candidates[-1]
+
+    best_job = None
+    best_score = 0.0
+    for candidate in candidates:
+        saved_tokens = list(dict.fromkeys(topic_tokens(candidate.get("user_text", ""))))
+        if not saved_tokens:
+            continue
+        matched = sum(
+            1 for saved_word in saved_tokens
+            if any(_topic_words_match(saved_word, query_word) for query_word in query_tokens)
+        )
+        score = matched / len(saved_tokens)
+        if score > best_score:
+            best_score = score
+            best_job = candidate
+    return best_job if best_score >= 0.25 else None
 
 
 def is_continuation_repair_request(text):
@@ -1595,12 +1717,13 @@ def save_job_result(session_id, job_id, result):
             persist_job_maps()
             return
 
-        interrupted = interrupted_jobs.get(session_id)
-        if interrupted and interrupted.get("job_id") == job_id:
-            interrupted.update(result)
-            persist_job_maps()
-            logger.info("Background result saved for an interrupted conversation")
-            return
+        interrupted = interrupted_list(session_id)
+        for saved_job in interrupted:
+            if saved_job.get("job_id") == job_id:
+                saved_job.update(result)
+                persist_job_maps()
+                logger.info("Background result saved for an interrupted conversation")
+                return
 
         logger.info("Discarded result of an outdated task")
 
@@ -2232,30 +2355,50 @@ async def main(body: dict):
     wake_command = is_wake_command(user_text)
     continue_command = is_continue_command(user_text)
     repair_continue_command = is_continuation_repair_request(user_text)
+    topic_return_command = is_topic_return_command(user_text)
     wait_command = is_wait_command(user_text)
-    retrieval_command = wake_command or wait_command or continue_command or repair_continue_command
+    retrieval_command = (
+        wake_command or wait_command or continue_command
+        or repair_continue_command or topic_return_command
+    )
 
     with jobs_lock:
         job = search_jobs.get(job_key)
-        interrupted = interrupted_jobs.get(job_key)
+        interrupted = interrupted_list(job_key)
 
-    # Если пользователь исправляет оговорку или подтверждает продолжение,
-    # возвращаем именно прежний многочастный ответ, а не ответ на случайную реплику.
-    # Приоритет у текущей темы: если по ней уже есть активная задача,
-    # «Да» должно продолжать именно её. Прерванная предыдущая тема
-    # восстанавливается только тогда, когда активной задачи нет.
-    if interrupted and not job and (continue_command or repair_continue_command):
+    # Явный возврат выбирает нужную тему по словам исходного вопроса.
+    # При переключении текущий ответ сохраняется, а выбранный становится активным.
+    if topic_return_command:
         with jobs_lock:
-            interrupted = interrupted_jobs.pop(job_key, None)
             current = search_jobs.get(job_key)
-            if current and current.get("job_id") != (interrupted or {}).get("job_id"):
-                search_jobs.pop(job_key, None)
-            if interrupted:
-                search_jobs[job_key] = interrupted
-                job = interrupted
+            saved = interrupted_list(job_key)
+            candidates = ([current] if current else []) + list(saved)
+            selected = choose_interrupted_topic(user_text, candidates)
+
+            if selected is None:
+                return make_response(
+                    body,
+                    "Не нашла эту тему среди двух сохранённых разговоров. Назови тему ещё раз, пожалуйста.",
+                )
+
+            if current and selected.get("job_id") == current.get("job_id"):
+                job = current
             else:
-                job = search_jobs.get(job_key)
-            persist_job_maps()
+                if current:
+                    search_jobs.pop(job_key, None)
+                    parts = current.get("parts") or []
+                    part_index = int(current.get("part_index", 0))
+                    if current.get("status") == "pending" or (
+                        current.get("status") == "ready" and len(parts) > part_index and len(parts) > 1
+                    ):
+                        save_interrupted_job(job_key, current)
+
+                saved = interrupted_list(job_key)
+                saved[:] = [item for item in saved if item.get("job_id") != selected.get("job_id")]
+                search_jobs[job_key] = selected
+                trim_interrupted_for_active(job_key)
+                job = selected
+                persist_job_maps()
 
         if job and job.get("status") == "pending":
             with jobs_lock:
@@ -2270,10 +2413,37 @@ async def main(body: dict):
                 if current and current.get("job_id") == job.get("job_id"):
                     search_jobs.pop(job_key, None)
                     persist_job_maps()
-            return make_response(body, "Не удалось получить ответ. Попробуй повторить вопрос.")
+            return make_response(body, "Не удалось получить ответ. Попробуй повторить запрос.")
 
-    # Незавершённый ответ хранится отдельно даже при полноценном запросе по другой теме.
-    # Он будет восстановлен только явной командой продолжения; новый запрос обрабатывается отдельно.
+    # Обычное «Да» продолжает активную тему. Если активной нет, восстанавливаем
+    # самую недавно прерванную из сохранённых.
+    if not job and (continue_command or repair_continue_command):
+        with jobs_lock:
+            saved = interrupted_list(job_key)
+            if saved:
+                restored = saved.pop()
+                search_jobs[job_key] = restored
+                job = restored
+                if saved:
+                    interrupted_jobs[job_key] = saved
+                else:
+                    interrupted_jobs.pop(job_key, None)
+                persist_job_maps()
+
+        if job and job.get("status") == "pending":
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                notice = pending_job_notice(current) if current else "Секундочку"
+            return make_response(body, notice)
+        if job and job.get("status") == "ready":
+            return deliver_job_part(body, job_key, job)
+        if job and job.get("status") == "error":
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                if current and current.get("job_id") == job.get("job_id"):
+                    search_jobs.pop(job_key, None)
+                    persist_job_maps()
+            return make_response(body, "Не удалось получить ответ. Попробуй повторить запрос.")
 
     # Отказ относится только к активному многочастному ответу.
     # Удаление задачи также не позволит позднему фоновому результату её восстановить.
@@ -2313,7 +2483,7 @@ async def main(body: dict):
                 if current and current.get("job_id") == job.get("job_id"):
                     # Сохраняем даже при полноценном новом вопросе: это может быть
                     # переключение темы (например, с рассказа об ИИ на погоду).
-                    interrupted_jobs[job_key] = current
+                    save_interrupted_job(job_key, current)
                     search_jobs.pop(job_key, None)
                     persist_job_maps()
                     logger.info("Conversation task paused and saved before topic switch")
@@ -2336,7 +2506,7 @@ async def main(body: dict):
                 part_index = int(current.get("part_index", 0))
                 has_remaining_parts = len(parts) > part_index
                 if has_remaining_parts and len(parts) > 1:
-                    interrupted_jobs[job_key] = current
+                    save_interrupted_job(job_key, current)
                     logger.info("Multi-part answer paused and saved before topic switch")
                 search_jobs.pop(job_key, None)
                 persist_job_maps()
@@ -2379,6 +2549,7 @@ async def main(body: dict):
                 "user_text": user_text,
                 "history": history[-4:],
             }
+            trim_interrupted_for_active(job_key)
             persist_job_maps()
 
         executor.submit(
@@ -2413,6 +2584,7 @@ async def main(body: dict):
             "user_text": user_text,
             "history": history[-4:],
         }
+        trim_interrupted_for_active(job_key)
         persist_job_maps()
 
     future = executor.submit(
