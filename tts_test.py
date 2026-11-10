@@ -245,7 +245,10 @@ def yandex_login():
         # Не записываем токены, cookies и тела ответов в журнал.
         detail = str(exc).split(" for url:")[0].split(" with url:")[0][:180]
         tb = traceback.extract_tb(exc.__traceback__)
-        where = f"{tb[-1].name}, строка {tb[-1].lineno}" if tb else "место неизвестно"
+        where = " -> ".join(
+            f"{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}"
+            for frame in tb[-5:]
+        )
         log.warning("Авторизация: %s; %s; %s", type(exc).__name__, where, detail)
         with _guard:
             _state.update(
