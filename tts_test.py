@@ -255,8 +255,8 @@ def yandex_login():
                 status="ready",
                 message="Яндекс подключён. Выбери колонку и отправь тестовую фразу.",
                 link=None,
-                session=quasar,
-                csrf=csrf,
+                session=None,
+                csrf=None,
                 devices=speakers,
                 error=None,
             )
@@ -351,7 +351,6 @@ def say(payload: dict, _: bool = Depends(require_password)):
                     }
                 ]
             },
-            headers={"x-csrf-token": csrf},
             timeout=20,
         )
         response_json(result, "Отправка фразы")
