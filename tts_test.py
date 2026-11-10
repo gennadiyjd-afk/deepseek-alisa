@@ -181,6 +181,8 @@ def yandex_login():
             ),
             "Обновление сессии Яндекса",
         )
+        # Безопасная диагностика структуры ответа авторизации: только имена полей.
+        log.info("Quasar auth response fields: %s", sorted(auth.keys()))
         passport_host = auth.get("passport_host")
         auth_track = auth.get("track_id")
         if not passport_host or not auth_track:
@@ -201,6 +203,36 @@ def yandex_login():
             len(quasar.cookies),
             sorted({cookie.domain for cookie in quasar.cookies if cookie.domain}),
         )
+        log.info(
+            "Quasar finish response: HTTP %s; content_type=%s; csrf_header_present=%s",
+            finish.status_code,
+            finish.headers.get("Content-Type", "").split(";")[0],
+            any("csrf" in name.lower() for name in finish.headers),
+        )
+
+        # Проверяем, можно ли получить устройства через API без HTML-страницы.
+        device_data = None
+        log.info("Quasar API precheck: запрос списка устройств без CSRF начат")
+        try:
+            precheck = quasar.get(f"{QUASAR_API}/v3/user/devices", timeout=20)
+            log.info("Quasar API precheck: HTTP %s", precheck.status_code)
+            if precheck.status_code == 200:
+                device_data = precheck.json()
+                if isinstance(device_data, dict):
+                    log.info(
+                        "Quasar API precheck: JSON fields=%s",
+                        sorted(device_data.keys()),
+                    )
+                else:
+                    log.info(
+                        "Quasar API precheck: JSON type=%s",
+                        type(device_data).__name__,
+                    )
+        except requests.RequestException as exc:
+            log.warning(
+                "Quasar API precheck: ошибка=%s",
+                type(exc).__name__,
+            )
 
         # Проверяем несколько вариантов адреса страницы Quasar.
         # Не журналируем URL с параметрами, заголовки, cookies или текст ответа.
@@ -246,23 +278,24 @@ def yandex_login():
             raise RuntimeError("Не удалось получить защитный токен Quasar ни по одному адресу")
         quasar.headers.update({"x-csrf-token": csrf})
 
-        log.info("Quasar devices check: запрос списка устройств начат")
-        try:
-            devices_response = quasar.get(
-                f"{QUASAR_API}/v3/user/devices",
-                timeout=20,
+        if device_data is None:
+            log.info("Quasar devices check: запрос списка устройств после CSRF начат")
+            try:
+                devices_response = quasar.get(
+                    f"{QUASAR_API}/v3/user/devices",
+                    timeout=20,
+                )
+            except requests.RequestException as exc:
+                log.warning(
+                    "Quasar devices check: запрос не выполнен; тип ошибки=%s; endpoint=iot.quasar.yandex.ru/m/v3/user/devices",
+                    type(exc).__name__,
+                )
+                raise
+            log.info("Quasar devices check: HTTP %s", devices_response.status_code)
+            device_data = response_json(
+                devices_response,
+                "Получение списка устройств",
             )
-        except requests.RequestException as exc:
-            log.warning(
-                "Quasar devices check: запрос не выполнен; тип ошибки=%s; endpoint=iot.quasar.yandex.ru/m/v3/user/devices",
-                type(exc).__name__,
-            )
-            raise
-        log.info("Quasar devices check: HTTP %s", devices_response.status_code)
-        device_data = response_json(
-            devices_response,
-            "Получение списка устройств",
-        )
         devices = device_data.get("devices", [])
         if not isinstance(devices, list):
             raise RuntimeError("Яндекс вернул неизвестный формат списка устройств")
