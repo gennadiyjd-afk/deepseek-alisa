@@ -4,7 +4,6 @@ import re
 import secrets
 import threading
 import time
-import traceback
 from typing import Any
 
 import requests
@@ -147,7 +146,7 @@ def yandex_login():
 
         cookie_header = "; ".join(
             f"{cookie.name}={cookie.value}"
-            for cookie in passport.cookies
+            for cookie in passport.cookies.jar
             if (cookie.domain or "").endswith("yandex.ru")
         )
         token_data = response_json(
@@ -194,6 +193,13 @@ def yandex_login():
         )
         if finish.status_code not in (200, 302, 303):
             finish.raise_for_status()
+
+        # Диагностика: только количество cookies и домены, без значений.
+        log.info(
+            "Quasar session: cookies=%s; domains=%s",
+            len(quasar.cookies),
+            sorted({cookie.domain for cookie in quasar.cookies if cookie.domain}),
+        )
 
         quasar_page = quasar.get("https://yandex.ru/quasar", timeout=20)
         quasar_page.raise_for_status()
@@ -243,77 +249,20 @@ def yandex_login():
 
     except Exception as exc:
         # Не записываем токены, cookies и тела ответов в журнал.
-        detail = str(exc).split(" for url:")[0].split(" with url:")[0][:180]
-        tb = traceback.extract_tb(exc.__traceback__)
-        where = " -> ".join(
-            f"{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}"
-            for frame in tb[-5:]
-        )
-        log.warning("Авторизация: %s; %s; %s", type(exc).__name__, where, detail)
+        log.warning("Авторизация не завершилась: %s", type(exc).__name__)
         with _guard:
             _state.update(
                 status="error",
-                message="Не удалось завершить вход. Проверь сообщение об ошибке ниже.",
+                message="Не удалось завершить вход. Подробности смотри в журнале Render.",
                 link=None,
                 session=None,
                 csrf=None,
                 devices=[],
-                error=str(exc)[:240],
+                # Не показываем текст исключения в веб-панели: он может содержать URL или данные сессии.
+                error="Ошибка авторизации. Подробности записаны в журнал Render.",
             )
 
-@app.get("/api/network-check")
-def network_check(_: bool = Depends(require_password)):
-    try:
-        response = requests.get(
-            "https://yandex.ru/quasar",
-            headers={"User-Agent": USER_AGENT},
-            timeout=15,
-        )
-        return {
-            "ok": True,
-            "status_code": response.status_code,
-            "response_bytes": len(response.content),
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error_type": type(exc).__name__,
-        }
-@app.get("/api/network-check2")
-def network_check2(_: bool = Depends(require_password)):
-    results = {}
 
-    urls = {
-        "yandex": "https://yandex.ru",
-        "quasar_api": "https://iot.quasar.yandex.ru/m/v3/user/devices",
-        "quasar_page": "https://yandex.ru/quasar",
-        "quasar_alt": "https://quasar.yandex.ru/",
-        "quasar_storage": "https://yandex.ru/quasar?storage=1",
-    }
-
-    for name, url in urls.items():
-        try:
-            response = requests.get(
-                url,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                },
-                timeout=15,
-                allow_redirects=False,
-            )
-            results[name] = {
-                "ok": True,
-                "status_code": response.status_code,
-                "location": response.headers.get("Location", ""),
-            }
-        except Exception as exc:
-            results[name] = {
-                "ok": False,
-                "error_type": type(exc).__name__,
-            }
-
-    return results
 @app.get("/", response_class=HTMLResponse)
 def index(_: bool = Depends(require_password)):
     return HTML_PAGE
