@@ -279,6 +279,33 @@ def network_check(_: bool = Depends(require_password)):
             "ok": False,
             "error_type": type(exc).__name__,
         }
+@app.get("/api/network-check2")
+def network_check2(_: bool = Depends(require_password)):
+    results = {}
+
+    urls = {
+        "yandex": "https://yandex.ru",
+        "quasar_api": "https://iot.quasar.yandex.ru/m/v3/user/devices",
+    }
+
+    for name, url in urls.items():
+        try:
+            response = requests.get(
+                url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=15,
+            )
+            results[name] = {
+                "ok": True,
+                "status_code": response.status_code,
+            }
+        except Exception as exc:
+            results[name] = {
+                "ok": False,
+                "error_type": type(exc).__name__,
+            }
+
+    return results
 @app.get("/", response_class=HTMLResponse)
 def index(_: bool = Depends(require_password)):
     return HTML_PAGE
