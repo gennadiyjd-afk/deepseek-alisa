@@ -210,35 +210,35 @@ def yandex_login():
             any("csrf" in name.lower() for name in finish.headers),
         )
 
-# Получаем устройства напрямую из ответа Quasar API.
-households = device_data.get("households", [])
-all_devices = []
+        # Получаем устройства напрямую из ответа Quasar API.
+        households = device_data.get("households", [])
+        all_devices = []
 
-for household in households:
-    all_devices.extend(household.get("all", []))
+        for household in households:
+            all_devices.extend(household.get("all", []))
 
-speakers = []
+        speakers = []
 
-for device in all_devices:
-    quasar_info = device.get("quasar_info") or {}
-    platform = quasar_info.get("platform")
+        for device in all_devices:
+            quasar_info = device.get("quasar_info") or {}
+            platform = quasar_info.get("platform")
 
-    if not quasar_info:
-        continue
+            if not quasar_info:
+                continue
 
-    if platform in {"saturn", "mike", "cherry"}:
-        continue
+            if platform in {"saturn", "mike", "cherry"}:
+                continue
 
-    if not device.get("capabilities"):
-        continue
+            if not device.get("capabilities"):
+                continue
 
-    speakers.append(device)
+            speakers.append(device)
 
-log.info(
-    "Quasar: найдено устройств=%s, колонок с поддержкой TTS=%s",
-    len(all_devices),
-    len(speakers),
-)
+        log.info(
+            "Quasar: найдено устройств=%s, колонок с поддержкой TTS=%s",
+            len(all_devices),
+            len(speakers),
+        )
         if not speakers:
             raise RuntimeError("Не найдена колонка с поддержкой прямой озвучки")
 
