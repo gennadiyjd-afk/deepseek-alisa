@@ -210,112 +210,35 @@ def yandex_login():
             any("csrf" in name.lower() for name in finish.headers),
         )
 
-        # Проверяем, можно ли получить устройства через API без HTML-страницы.
-        device_data = None
-        log.info("Quasar API precheck: запрос списка устройств без CSRF начат")
-        try:
-            precheck = quasar.get(f"{QUASAR_API}/v3/user/devices", timeout=20)
-            log.info("Quasar API precheck: HTTP %s", precheck.status_code)
-            if precheck.status_code == 200:
-                device_data = precheck.json()
-                if isinstance(device_data, dict):
-                    log.info(
-                        "Quasar API precheck: JSON fields=%s",
-                        sorted(device_data.keys()),
-                    )
-                else:
-                    log.info(
-                        "Quasar API precheck: JSON type=%s",
-                        type(device_data).__name__,
-                    )
-        except requests.RequestException as exc:
-            log.warning(
-                "Quasar API precheck: ошибка=%s",
-                type(exc).__name__,
-            )
+# Получаем устройства напрямую из ответа Quasar API.
+households = device_data.get("households", [])
+all_devices = []
 
-        # Проверяем несколько вариантов адреса страницы Quasar.
-        # Не журналируем URL с параметрами, заголовки, cookies или текст ответа.
-        csrf = None
-        quasar_page = None
-        candidates = [
-            ("yandex.ru/quasar", "https://yandex.ru/quasar"),
-            ("www.yandex.ru/quasar", "https://www.yandex.ru/quasar"),
-            ("yandex.ru/quasar/", "https://yandex.ru/quasar/"),
-        ]
-        for endpoint_label, endpoint_url in candidates:
-            log.info("Quasar HTML check: запрос %s начат", endpoint_label)
-            try:
-                candidate_response = quasar.get(endpoint_url, timeout=20)
-            except requests.RequestException as exc:
-                log.warning(
-                    "Quasar HTML check: %s; ошибка=%s",
-                    endpoint_label,
-                    type(exc).__name__,
-                )
-                continue
+for household in households:
+    all_devices.extend(household.get("all", []))
 
-            log.info(
-                "Quasar HTML check: %s; HTTP %s; response_bytes=%s",
-                endpoint_label,
-                candidate_response.status_code,
-                len(candidate_response.content),
-            )
-            if candidate_response.status_code != 200:
-                continue
+speakers = []
 
-            candidate_match = re.search(
-                r'"csrfToken2"\\s*:\\s*"([^"]+)"',
-                candidate_response.text,
-            )
-            if candidate_match:
-                csrf = candidate_match.group(1)
-                quasar_page = candidate_response
-                log.info("Quasar HTML check: CSRF-токен получен через %s", endpoint_label)
-                break
+for device in all_devices:
+    quasar_info = device.get("quasar_info") or {}
+    platform = quasar_info.get("platform")
 
-        if not csrf:
-            raise RuntimeError("Не удалось получить защитный токен Quasar ни по одному адресу")
-        quasar.headers.update({"x-csrf-token": csrf})
+    if not quasar_info:
+        continue
 
-        if device_data is None:
-            log.info("Quasar devices check: запрос списка устройств после CSRF начат")
-            try:
-                devices_response = quasar.get(
-                    f"{QUASAR_API}/v3/user/devices",
-                    timeout=20,
-                )
-            except requests.RequestException as exc:
-                log.warning(
-                    "Quasar devices check: запрос не выполнен; тип ошибки=%s; endpoint=iot.quasar.yandex.ru/m/v3/user/devices",
-                    type(exc).__name__,
-                )
-                raise
-            log.info("Quasar devices check: HTTP %s", devices_response.status_code)
-            device_data = response_json(
-                devices_response,
-                "Получение списка устройств",
-            )
-        devices = device_data.get("devices", [])
-        if not isinstance(devices, list):
-            raise RuntimeError("Яндекс вернул неизвестный формат списка устройств")
+    if platform in {"saturn", "mike", "cherry"}:
+        continue
 
-        speakers = []
-        for device in devices:
-            capabilities = device.get("capabilities") or []
-            supports_phrase = any(
-                item.get("type") == "devices.capabilities.quasar.server_action"
-                for item in capabilities
-                if isinstance(item, dict)
-            )
-            if supports_phrase and device.get("id"):
-                speakers.append(
-                    {
-                        "id": str(device["id"]),
-                        "name": str(device.get("name") or "Колонка Алисы"),
-                    }
-                )
+    if not device.get("capabilities"):
+        continue
 
+    speakers.append(device)
+
+log.info(
+    "Quasar: найдено устройств=%s, колонок с поддержкой TTS=%s",
+    len(all_devices),
+    len(speakers),
+)
         if not speakers:
             raise RuntimeError("Не найдена колонка с поддержкой прямой озвучки")
 
