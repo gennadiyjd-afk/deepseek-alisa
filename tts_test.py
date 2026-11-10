@@ -146,7 +146,7 @@ def yandex_login():
 
         cookie_header = "; ".join(
             f"{cookie.name}={cookie.value}"
-            for cookie in passport.cookies.jar
+            for cookie in passport.cookies
             if (cookie.domain or "").endswith("yandex.ru")
         )
         token_data = response_json(
