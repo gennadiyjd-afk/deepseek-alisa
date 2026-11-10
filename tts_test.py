@@ -242,6 +242,8 @@ def yandex_login():
 
             speakers.append(device)
 
+        speaker_names = [device.get("name", "Имя не указано") for device in speakers]
+        log.info("Названия колонок с поддержкой TTS: %s", speaker_names)
         log.info(
             "Quasar: найдено устройств=%s, колонок с поддержкой TTS=%s",
             len(all_devices),
