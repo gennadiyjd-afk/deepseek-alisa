@@ -210,6 +210,14 @@ def yandex_login():
             any("csrf" in name.lower() for name in finish.headers),
         )
 
+        # Запрашиваем список устройств через Quasar API.
+        devices_response = quasar.get(
+            f"{QUASAR_API}/v3/user/devices",
+            timeout=20,
+        )
+        devices_response.raise_for_status()
+        device_data = devices_response.json()
+
         # Получаем устройства напрямую из ответа Quasar API.
         households = device_data.get("households", [])
         all_devices = []
