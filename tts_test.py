@@ -202,7 +202,22 @@ def yandex_login():
             sorted({cookie.domain for cookie in quasar.cookies if cookie.domain}),
         )
 
-        quasar_page = quasar.get("https://yandex.ru/quasar", timeout=20)
+        # Проверяем именно HTML-страницу Quasar в уже созданной сессии.
+        # Не журналируем URL с параметрами, заголовки, cookies или текст ответа.
+        log.info("Quasar HTML check: запрос страницы начат")
+        try:
+            quasar_page = quasar.get("https://yandex.ru/quasar", timeout=20)
+        except requests.RequestException as exc:
+            log.warning(
+                "Quasar HTML check: запрос не выполнен; тип ошибки=%s; endpoint=yandex.ru/quasar",
+                type(exc).__name__,
+            )
+            raise
+        log.info(
+            "Quasar HTML check: HTTP %s; response_bytes=%s",
+            quasar_page.status_code,
+            len(quasar_page.content),
+        )
         quasar_page.raise_for_status()
         csrf_match = re.search(r'"csrfToken2"\s*:\s*"([^"]+)"', quasar_page.text)
         if not csrf_match:
@@ -210,8 +225,21 @@ def yandex_login():
         csrf = csrf_match.group(1)
         quasar.headers.update({"x-csrf-token": csrf})
 
+        log.info("Quasar devices check: запрос списка устройств начат")
+        try:
+            devices_response = quasar.get(
+                f"{QUASAR_API}/v3/user/devices",
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            log.warning(
+                "Quasar devices check: запрос не выполнен; тип ошибки=%s; endpoint=iot.quasar.yandex.ru/m/v3/user/devices",
+                type(exc).__name__,
+            )
+            raise
+        log.info("Quasar devices check: HTTP %s", devices_response.status_code)
         device_data = response_json(
-            quasar.get(f"{QUASAR_API}/v3/user/devices", timeout=20),
+            devices_response,
             "Получение списка устройств",
         )
         devices = device_data.get("devices", [])
