@@ -147,7 +147,7 @@ def yandex_login():
 
         cookie_header = "; ".join(
             f"{cookie.name}={cookie.value}"
-            for cookie in passport.cookies.jar
+            for cookie in passport.cookies
             if (cookie.domain or "").endswith("yandex.ru")
         )
         token_data = response_json(
@@ -253,7 +253,7 @@ def yandex_login():
         # Текст исключения, URL, токены и cookies не выводятся.
         frames = traceback.extract_tb(exc.__traceback__)
         where = " -> ".join(
-            f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+            f"{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}"
             for frame in frames[-4:]
         )
         log.warning(
