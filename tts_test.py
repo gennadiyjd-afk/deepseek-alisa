@@ -202,27 +202,48 @@ def yandex_login():
             sorted({cookie.domain for cookie in quasar.cookies if cookie.domain}),
         )
 
-        # Проверяем именно HTML-страницу Quasar в уже созданной сессии.
+        # Проверяем несколько вариантов адреса страницы Quasar.
         # Не журналируем URL с параметрами, заголовки, cookies или текст ответа.
-        log.info("Quasar HTML check: запрос страницы начат")
-        try:
-            quasar_page = quasar.get("https://yandex.ru/quasar", timeout=20)
-        except requests.RequestException as exc:
-            log.warning(
-                "Quasar HTML check: запрос не выполнен; тип ошибки=%s; endpoint=yandex.ru/quasar",
-                type(exc).__name__,
+        csrf = None
+        quasar_page = None
+        candidates = [
+            ("yandex.ru/quasar", "https://yandex.ru/quasar"),
+            ("www.yandex.ru/quasar", "https://www.yandex.ru/quasar"),
+            ("yandex.ru/quasar/", "https://yandex.ru/quasar/"),
+        ]
+        for endpoint_label, endpoint_url in candidates:
+            log.info("Quasar HTML check: запрос %s начат", endpoint_label)
+            try:
+                candidate_response = quasar.get(endpoint_url, timeout=20)
+            except requests.RequestException as exc:
+                log.warning(
+                    "Quasar HTML check: %s; ошибка=%s",
+                    endpoint_label,
+                    type(exc).__name__,
+                )
+                continue
+
+            log.info(
+                "Quasar HTML check: %s; HTTP %s; response_bytes=%s",
+                endpoint_label,
+                candidate_response.status_code,
+                len(candidate_response.content),
             )
-            raise
-        log.info(
-            "Quasar HTML check: HTTP %s; response_bytes=%s",
-            quasar_page.status_code,
-            len(quasar_page.content),
-        )
-        quasar_page.raise_for_status()
-        csrf_match = re.search(r'"csrfToken2"\s*:\s*"([^"]+)"', quasar_page.text)
-        if not csrf_match:
-            raise RuntimeError("Не удалось получить защитный токен Quasar")
-        csrf = csrf_match.group(1)
+            if candidate_response.status_code != 200:
+                continue
+
+            candidate_match = re.search(
+                r'"csrfToken2"\\s*:\\s*"([^"]+)"',
+                candidate_response.text,
+            )
+            if candidate_match:
+                csrf = candidate_match.group(1)
+                quasar_page = candidate_response
+                log.info("Quasar HTML check: CSRF-токен получен через %s", endpoint_label)
+                break
+
+        if not csrf:
+            raise RuntimeError("Не удалось получить защитный токен Quasar ни по одному адресу")
         quasar.headers.update({"x-csrf-token": csrf})
 
         log.info("Quasar devices check: запрос списка устройств начат")
