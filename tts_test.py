@@ -242,7 +242,8 @@ def yandex_login():
 
     except Exception as exc:
         # Не записываем токены, cookies и тела ответов в журнал.
-        log.warning("Авторизация не завершилась: %s", type(exc).__name__)
+        detail = str(exc).split(" for url:")[0].split(" with url:")[0][:180]
+        log.warning("Авторизация не завершилась: %s: %s", type(exc).__name__, detail)
         with _guard:
             _state.update(
                 status="error",
