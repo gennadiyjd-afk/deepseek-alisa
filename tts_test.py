@@ -292,12 +292,17 @@ def network_check2(_: bool = Depends(require_password)):
         try:
             response = requests.get(
                 url,
-                headers={"User-Agent": USER_AGENT},
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
                 timeout=15,
+                allow_redirects=False,
             )
             results[name] = {
                 "ok": True,
                 "status_code": response.status_code,
+                "location": response.headers.get("Location", ""),
             }
         except Exception as exc:
             results[name] = {
