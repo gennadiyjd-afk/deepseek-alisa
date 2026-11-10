@@ -4,6 +4,7 @@ import re
 import secrets
 import threading
 import time
+import traceback
 from typing import Any
 
 import requests
@@ -248,8 +249,18 @@ def yandex_login():
             )
 
     except Exception as exc:
-        # Не записываем токены, cookies и тела ответов в журнал.
-        log.warning("Авторизация не завершилась: %s", type(exc).__name__)
+        # В журнал попадают только тип ошибки и расположение в коде.
+        # Текст исключения, URL, токены и cookies не выводятся.
+        frames = traceback.extract_tb(exc.__traceback__)
+        where = " -> ".join(
+            f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+            for frame in frames[-4:]
+        )
+        log.warning(
+            "Авторизация не завершилась: %s; место: %s",
+            type(exc).__name__,
+            where or "место не определено",
+        )
         with _guard:
             _state.update(
                 status="error",
