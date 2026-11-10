@@ -286,6 +286,7 @@ def network_check2(_: bool = Depends(require_password)):
     urls = {
         "yandex": "https://yandex.ru",
         "quasar_api": "https://iot.quasar.yandex.ru/m/v3/user/devices",
+        "quasar_page": "https://yandex.ru/quasar",
     }
 
     for name, url in urls.items():
