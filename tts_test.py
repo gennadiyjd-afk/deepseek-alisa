@@ -4,6 +4,7 @@ import re
 import secrets
 import threading
 import time
+import traceback
 from typing import Any
 
 import requests
@@ -243,7 +244,9 @@ def yandex_login():
     except Exception as exc:
         # Не записываем токены, cookies и тела ответов в журнал.
         detail = str(exc).split(" for url:")[0].split(" with url:")[0][:180]
-        log.warning("Авторизация не завершилась: %s: %s", type(exc).__name__, detail)
+        tb = traceback.extract_tb(exc.__traceback__)
+        where = f"{tb[-1].name}, строка {tb[-1].lineno}" if tb else "место неизвестно"
+        log.warning("Авторизация: %s; %s; %s", type(exc).__name__, where, detail)
         with _guard:
             _state.update(
                 status="error",
