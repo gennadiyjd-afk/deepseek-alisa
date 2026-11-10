@@ -261,7 +261,24 @@ def yandex_login():
                 error=str(exc)[:240],
             )
 
-
+@app.get("/api/network-check")
+def network_check(_: bool = Depends(require_password)):
+    try:
+        response = requests.get(
+            "https://yandex.ru/quasar",
+            headers={"User-Agent": USER_AGENT},
+            timeout=15,
+        )
+        return {
+            "ok": True,
+            "status_code": response.status_code,
+            "response_bytes": len(response.content),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error_type": type(exc).__name__,
+        }
 @app.get("/", response_class=HTMLResponse)
 def index(_: bool = Depends(require_password)):
     return HTML_PAGE
