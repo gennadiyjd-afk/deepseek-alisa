@@ -25,7 +25,6 @@ USER_AGENT = (
 CLIENT_ID = "c0ebe342af7d48fbbbfcf2d2eedb8f9e"
 CLIENT_SECRET = "ad0a908f0aa341a182a37ecd75bc319e"
 QUASAR_API = "https://iot.quasar.yandex.ru/m"
-PERSONAL_STATION_NAME = "Станция Геннадия"
 
 _guard = threading.RLock()
 _state: dict[str, Any] = {
@@ -47,18 +46,18 @@ def require_password(credentials: HTTPBasicCredentials = Depends(security)):
             401, "Неверный пароль", headers={"WWW-Authenticate": "Basic"}
         )
     return True
-def response_json(response: requests.Response, label: str):
+
+
+def response_json(response: requests.Response, stage: str) -> dict:
+    response.raise_for_status()
     try:
         data = response.json()
-    except Exception:
-        raise RuntimeError(
-            f"{label}: сервер вернул не JSON (HTTP {response.status_code})"
-        )
-
-    if response.status_code >= 400:
-        message = data.get("message") or data.get("error") or response.text[:300]
-        raise RuntimeError(f"{label}: HTTP {response.status_code}: {message}")
-
+    except ValueError:
+        raise RuntimeError(f"{stage}: Яндекс вернул неожиданный ответ") from None
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{stage}: неверный формат ответа Яндекса")
+    if data.get("status") not in (None, "ok"):
+        raise RuntimeError(f"{stage}: Яндекс сообщил об ошибке")
     return data
 
 
@@ -66,241 +65,227 @@ def yandex_login():
     passport = requests.Session()
     passport.headers.update({"User-Agent": USER_AGENT})
 
-    # Возвращаем проверенный способ получения CSRF-токена,
-    # который использовался в самой первой версии теста.
-    page = passport.get(
-        "https://passport.yandex.ru/pwl-yandex",
-        timeout=20,
-    )
-    page.raise_for_status()
+    try:
+        page = passport.get("https://passport.yandex.ru/pwl-yandex", timeout=20)
+        page.raise_for_status()
+        match = re.search(r'__CSRF__\s*=\s*"([^"]+)', page.text)
+        if not match:
+            raise RuntimeError("Не удалось получить защитный токен страницы входа")
 
-    match = re.search(r'__CSRF__\s*=\s*"([^"]+)', page.text)
-    if not match:
-        raise RuntimeError(
-            "Не удалось получить защитный токен страницы входа (__CSRF__)"
-        )
+        csrf_login = match.group(1)
+        login_headers = {"X-CSRF-Token": csrf_login}
 
-    csrf_login = match.group(1)
-    login_headers = {"X-CSRF-Token": csrf_login}
-
-    start_data = response_json(
-        passport.post(
-            "https://passport.yandex.ru/pwl-yandex/api/passport/auth/password/submit",
-            json={"retpath": "https://passport.yandex.ru/"},
-            headers=login_headers,
-            timeout=20,
-        ),
-        "Создание QR-входа",
-    )
-    track_id = start_data.get("track_id")
-    if not track_id:
-        raise RuntimeError("Яндекс не создал сессию QR-входа")
-
-    magic = response_json(
-        passport.post(
-            "https://passport.yandex.ru/pwl-yandex/api/passport/auth/magic/code",
-            data={
-                "location_id": "0",
-                "magic_track_id": track_id,
-                "track_id": "",
-            },
-            headers=login_headers,
-            timeout=20,
-        ),
-        "Получение QR-ссылки",
-    )
-    qr_link = magic.get("link")
-    if not qr_link:
-        raise RuntimeError("Яндекс не вернул ссылку для подтверждения")
-
-    with _guard:
-        _state.update(
-            status="waiting",
-            message="Открой ссылку и подтверди вход в приложении Яндекса",
-            link=qr_link,
-            error=None,
-        )
-
-    deadline = time.time() + 180
-    auth_status = {}
-    while time.time() < deadline:
-        time.sleep(3)
-        auth_status = response_json(
+        start = response_json(
             passport.post(
-                "https://passport.yandex.ru/pwl-yandex/api/passport/auth/magic/code/status",
-                json=start_data,
+                "https://passport.yandex.ru/pwl-yandex/api/passport/auth/password/submit",
+                json={"retpath": "https://passport.yandex.ru/"},
                 headers=login_headers,
                 timeout=20,
             ),
-            "Проверка QR-входа",
+            "Создание QR-входа",
         )
-        if auth_status.get("state") == "otp_auth_finished":
-            break
-    else:
-        raise RuntimeError("Время ожидания подтверждения истекло")
+        track_id = start.get("track_id")
+        if not track_id:
+            raise RuntimeError("Яндекс не создал сессию QR-входа")
 
-    session_track = auth_status.get("trackId")
-    if not session_track:
-        raise RuntimeError("Яндекс не подтвердил завершение входа")
+        qr = response_json(
+            passport.post(
+                "https://passport.yandex.ru/pwl-yandex/api/passport/auth/magic/code",
+                data={
+                    "location_id": "0",
+                    "magic_track_id": track_id,
+                    "track_id": "",
+                },
+                headers=login_headers,
+                timeout=20,
+            ),
+            "Получение QR-ссылки",
+        )
+        qr_link = qr.get("link")
+        if not qr_link:
+            raise RuntimeError("Яндекс не вернул ссылку для подтверждения")
 
-    response_json(
-        passport.post(
-            "https://passport.yandex.ru/pwl-yandex/api/passport/sessions/get_session",
-            data={"track_id": session_track},
-            headers=login_headers,
-            timeout=20,
-        ),
-        "Завершение входа",
-    )
+        with _guard:
+            _state.update(
+                status="waiting",
+                message="Открой ссылку и подтверди вход в приложении Яндекса",
+                link=qr_link,
+                error=None,
+            )
 
-    cookie_header = "; ".join(
-        f"{cookie.name}={cookie.value}"
-        for cookie in passport.cookies.jar
-        if (cookie.domain or "").endswith("yandex.ru")
-    )
-    if not cookie_header:
-        raise RuntimeError("Яндекс не выдал cookies после подтверждения входа")
+        deadline = time.time() + 180
+        auth_status = {}
+        while time.time() < deadline:
+            time.sleep(3)
+            auth_status = response_json(
+                passport.post(
+                    "https://passport.yandex.ru/pwl-yandex/api/passport/auth/magic/code/status",
+                    json=start,
+                    headers=login_headers,
+                    timeout=20,
+                ),
+                "Проверка QR-входа",
+            )
+            if auth_status.get("state") == "otp_auth_finished":
+                break
+        else:
+            raise RuntimeError("Время ожидания подтверждения истекло")
 
-    token_data = response_json(
-        passport.post(
-            "https://mobileproxy.passport.yandex.net/1/bundle/oauth/token_by_sessionid",
-            data={
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-            },
-            headers={
-                "Ya-Client-Host": "passport.yandex.ru",
-                "Ya-Client-Cookie": cookie_header,
-            },
-            timeout=20,
-        ),
-        "Получение токена",
-    )
-    x_token = token_data.get("access_token")
-    if not x_token:
-        raise RuntimeError("Яндекс не выдал токен доступа")
+        session_track = auth_status.get("trackId")
+        if not session_track:
+            raise RuntimeError("Яндекс не подтвердил завершение входа")
 
-    token_exchange = response_json(
-        passport.post(
-            "https://mobileproxy.passport.yandex.net/1/bundle/auth/x_token/",
-            data={
-                "type": "x-token",
-                "retpath": "https://www.yandex.ru",
-            },
-            headers={
-                "Ya-Consumer-Authorization": f"OAuth {x_token}",
-            },
-            timeout=20,
-        ),
-        "Обмен токена",
-    )
-
-    passport_host = token_exchange.get("passport_host")
-    track_id = token_exchange.get("track_id")
-    if not passport_host or not track_id:
-        raise RuntimeError("Яндекс не вернул данные для завершения авторизации")
-
-    quasar = requests.Session()
-    quasar.headers.update({"User-Agent": USER_AGENT})
-
-    # Переносим cookies авторизованной сессии в отдельную Quasar-сессию.
-    for cookie in passport.cookies:
-        quasar.cookies.set(
-            cookie.name,
-            cookie.value,
-            domain=cookie.domain,
-            path=cookie.path,
+        response_json(
+            passport.post(
+                "https://passport.yandex.ru/pwl-yandex/api/passport/sessions/get_session",
+                data={"track_id": session_track},
+                headers=login_headers,
+                timeout=20,
+            ),
+            "Завершение входа",
         )
 
-    finish = quasar.get(
-        f"{passport_host}/auth/session/",
-        params={"track_id": track_id},
-        allow_redirects=False,
-        timeout=20,
-    )
-    log.info("Quasar finish response: HTTP %s", finish.status_code)
-    # Получаем CSRF-токен со страницы Яндекса.
-    iot_page = quasar.get(
-        "https://yandex.ru/iot",
-        timeout=20,
-    )
-    iot_page.raise_for_status()
+        cookie_header = "; ".join(
+            f"{cookie.name}={cookie.value}"
+            for cookie in passport.cookies
+            if (cookie.domain or "").endswith("yandex.ru")
+        )
+        token_data = response_json(
+            passport.post(
+                "https://mobileproxy.passport.yandex.net/1/bundle/oauth/token_by_sessionid",
+                data={
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                },
+                headers={
+                    "Ya-Client-Host": "passport.yandex.ru",
+                    "Ya-Client-Cookie": cookie_header,
+                },
+                timeout=20,
+            ),
+            "Получение токена",
+        )
+        x_token = token_data.get("access_token")
+        if not x_token:
+            raise RuntimeError("Яндекс не выдал токен доступа")
 
-    csrf_match = re.search(
-        r'"csrfToken2"\s*:\s*"([^"]+)"',
-        iot_page.text,
-    )
-    if not csrf_match:
-        raise RuntimeError(
-            "Не удалось найти csrfToken2 на странице Яндекса /iot"
+        # Получаем сессию Quasar. Токен остаётся только в памяти процесса.
+        quasar = requests.Session()
+        quasar.headers.update({"User-Agent": USER_AGENT})
+        auth = response_json(
+            quasar.post(
+                "https://mobileproxy.passport.yandex.net/1/bundle/auth/x_token/",
+                data={"type": "x-token", "retpath": "https://www.yandex.ru"},
+                headers={"Ya-Consumer-Authorization": f"OAuth {x_token}"},
+                timeout=20,
+            ),
+            "Обновление сессии Яндекса",
+        )
+        # Безопасная диагностика структуры ответа авторизации: только имена полей.
+        log.info("Quasar auth response fields: %s", sorted(auth.keys()))
+        passport_host = auth.get("passport_host")
+        auth_track = auth.get("track_id")
+        if not passport_host or not auth_track:
+            raise RuntimeError("Яндекс не вернул параметры сессии Quasar")
+
+        finish = quasar.get(
+            f"{passport_host}/auth/session/",
+            params={"track_id": auth_track},
+            allow_redirects=False,
+            timeout=20,
+        )
+        if finish.status_code not in (200, 302, 303):
+            finish.raise_for_status()
+
+        # Диагностика: только количество cookies и домены, без значений.
+        log.info(
+            "Quasar session: cookies=%s; domains=%s",
+            len(quasar.cookies),
+            sorted({cookie.domain for cookie in quasar.cookies if cookie.domain}),
+        )
+        log.info(
+            "Quasar finish response: HTTP %s; content_type=%s; csrf_header_present=%s",
+            finish.status_code,
+            finish.headers.get("Content-Type", "").split(";")[0],
+            any("csrf" in name.lower() for name in finish.headers),
         )
 
-    csrf_token = csrf_match.group(1)
-    quasar.headers.update({"x-csrf-token": csrf_token})
-
-    devices_data = response_json(
-        quasar.get(
+        # Запрашиваем список устройств через Quasar API.
+        devices_response = quasar.get(
             f"{QUASAR_API}/v3/user/devices",
             timeout=20,
-        ),
-        "Получение списка устройств",
-    )
-
-    all_devices = devices_data.get("devices", [])
-    if not isinstance(all_devices, list):
-        raise RuntimeError("Яндекс вернул список устройств в неожиданном формате")
-
-    personal_speakers = []
-
-    for device in all_devices:
-        quasar_info = device.get("quasar_info") or {}
-
-        if device.get("name") != PERSONAL_STATION_NAME:
-            continue
-        if not device.get("id"):
-            continue
-        if not device.get("capabilities"):
-            continue
-        if not quasar_info:
-            continue
-
-        personal_speakers.append(device)
-
-    log.info(
-        "Найдена личная станция: %s",
-        [device.get("name") for device in personal_speakers],
-    )
-
-    if len(personal_speakers) != 1:
-        raise RuntimeError(
-            "Не удалось однозначно определить личную станцию "
-            f"«{PERSONAL_STATION_NAME}». Найдено: {len(personal_speakers)}"
         )
+        devices_response.raise_for_status()
+        device_data = devices_response.json()
 
-    with _guard:
-        _state.update(
-            status="ready",
-            message="Яндекс подключён. Можно отправить тестовую фразу на личную станцию.",
-            link=None,
-            session=quasar,
-            csrf=csrf_token,
-            devices=personal_speakers,
-            error=None,
+        # Получаем устройства напрямую из ответа Quasar API.
+        households = device_data.get("households", [])
+        all_devices = []
+
+        for household in households:
+            all_devices.extend(household.get("all", []))
+
+        speakers = []
+
+        for device in all_devices:
+            quasar_info = device.get("quasar_info") or {}
+            platform = quasar_info.get("platform")
+
+            if not quasar_info:
+                continue
+
+            if platform in {"saturn", "mike", "cherry"}:
+                continue
+
+            if not device.get("capabilities"):
+                continue
+
+            speakers.append(device)
+
+        speaker_names = [device.get("name", "Имя не указано") for device in speakers]
+        log.info("Названия колонок с поддержкой TTS: %s", speaker_names)
+        log.info(
+            "Quasar: найдено устройств=%s, колонок с поддержкой TTS=%s",
+            len(all_devices),
+            len(speakers),
         )
-def login_worker():
-    try:
-        yandex_login()
+        if not speakers:
+            raise RuntimeError("Не найдена колонка с поддержкой прямой озвучки")
+
+        with _guard:
+            _state.update(
+                status="ready",
+                message="Яндекс подключён. Выбери колонку и отправь тестовую фразу.",
+                link=None,
+                session=None,
+                csrf=None,
+                devices=speakers,
+                error=None,
+            )
+
     except Exception as exc:
-        log.exception("Ошибка авторизации Яндекса")
+        # В журнал попадают только тип ошибки и расположение в коде.
+        # Текст исключения, URL, токены и cookies не выводятся.
+        frames = traceback.extract_tb(exc.__traceback__)
+        where = " -> ".join(
+            f"{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}"
+            for frame in frames[-4:]
+        )
+        log.warning(
+            "Авторизация не завершилась: %s; место: %s",
+            type(exc).__name__,
+            where or "место не определено",
+        )
         with _guard:
             _state.update(
                 status="error",
-                message="Не удалось завершить подключение к Яндексу",
+                message="Не удалось завершить вход. Подробности смотри в журнале Render.",
                 link=None,
                 session=None,
                 csrf=None,
                 devices=[],
-                error=f"{type(exc).__name__}: {exc}",
+                # Не показываем текст исключения в веб-панели: он может содержать URL или данные сессии.
+                error="Ошибка авторизации. Подробности записаны в журнал Render.",
             )
 
 
@@ -312,56 +297,50 @@ def index(_: bool = Depends(require_password)):
 @app.post("/api/start")
 def start_login(_: bool = Depends(require_password)):
     with _guard:
-        if _state["status"] in {"waiting", "working"}:
-            return {"ok": True, "message": _state["message"]}
-
+        if _state["status"] in ("starting", "waiting"):
+            return {
+                "status": _state["status"],
+                "message": _state["message"],
+                "link": _state["link"],
+            }
         _state.update(
-            status="working",
-            message="Подготавливаю подключение к Яндексу",
+            status="starting",
+            message="Готовлю вход в Яндекс…",
             link=None,
             session=None,
             csrf=None,
             devices=[],
             error=None,
         )
-
-    threading.Thread(target=login_worker, daemon=True).start()
-    return {"ok": True, "message": "Авторизация запущена"}
+    threading.Thread(target=yandex_login, daemon=True).start()
+    return {"status": "starting", "message": "Готовлю вход в Яндекс…", "link": None}
 
 
 @app.get("/api/status")
 def get_status(_: bool = Depends(require_password)):
     with _guard:
         return {
-            "status": _state["status"],
-            "message": _state["message"],
-            "link": _state["link"],
-            "devices": [
-                {"id": device["id"], "name": device.get("name", "Станция")}
-                for device in _state["devices"]
-            ],
-            "error": _state["error"],
+            key: _state[key]
+            for key in ("status", "message", "link", "devices", "error")
         }
 
 
 @app.post("/api/say")
-def say(_: bool = Depends(require_password)):
+def say(payload: dict, _: bool = Depends(require_password)):
+    device_id = str(payload.get("device_id") or "")
     phrase = "Проверка связи. Я могу говорить с вами напрямую."
 
     with _guard:
         session = _state.get("session")
         csrf = _state.get("csrf")
-        devices = _state.get("devices") or []
-
-        if _state["status"] != "ready" or session is None or not csrf:
+        allowed_ids = {device["id"] for device in _state.get("devices", [])}
+        if _state["status"] != "ready" or session is None:
             raise HTTPException(409, "Сначала подключи Яндекс")
-        if len(devices) != 1:
-            raise HTTPException(409, "Личная станция не определена")
-
-        device_id = str(devices[0]["id"])
+        if device_id not in allowed_ids:
+            raise HTTPException(400, "Неизвестная колонка")
 
     try:
-        response = session.post(
+        result = session.post(
             f"{QUASAR_API}/user/devices/{device_id}/actions",
             json={
                 "actions": [
@@ -374,128 +353,89 @@ def say(_: bool = Depends(require_password)):
                     }
                 ]
             },
-            headers={"x-csrf-token": csrf},
             timeout=20,
         )
-
-        response_json(response, "Отправка тестовой фразы")
-        return {"ok": True, "message": "Команда отправлена"}
+        response_json(result, "Отправка фразы")
+        return {"status": "ok", "message": "Команда отправлена"}
+    except HTTPException:
+        raise
     except Exception as exc:
-        log.exception("Ошибка отправки тестовой фразы")
-        raise HTTPException(
-            502,
-            f"Не удалось отправить фразу: {type(exc).__name__}",
-        )
+        log.warning("Отправка тестовой фразы не удалась: %s", type(exc).__name__)
+        raise HTTPException(502, "Яндекс не принял тестовую фразу") from None
 
 
-HTML_PAGE = r"""
-<!doctype html>
+HTML_PAGE = """<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Проверка Яндекс Станции</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Тест озвучки Алисы</title>
 <style>
-body {
-    font-family: Arial, sans-serif;
-    max-width: 560px;
-    margin: 30px auto;
-    padding: 0 16px;
-    line-height: 1.5;
-}
-button {
-    width: 100%;
-    padding: 14px;
-    margin: 8px 0;
-    font-size: 16px;
-}
-#status {
-    margin: 18px 0;
-    white-space: pre-wrap;
-}
-a { overflow-wrap: anywhere; }
+body{font:16px system-ui;max-width:650px;margin:28px auto;padding:0 16px;line-height:1.5}
+button,select{font:inherit;padding:10px;margin:8px 0;max-width:100%}
+#link{overflow-wrap:anywhere}.muted{color:#666}
 </style>
 </head>
 <body>
-<h2>Подключение Яндекс Станции</h2>
-<p>Будет выбрана только личная станция.</p>
-
+<h2>Тест прямой озвучки Алисы</h2>
+<p>Нажми кнопку. Затем открой ссылку Яндекса и подтверди вход в приложении Яндекса.</p>
 <button id="start">Подключить Яндекс</button>
-<div id="status">Ожидание запуска</div>
-<div id="link"></div>
-<button id="say" hidden>Произнести тестовую фразу</button>
-
+<p id="message">Авторизация ещё не запущена</p>
+<p id="link"></p>
+<div id="controls" hidden>
+<label for="device">Выбери колонку:</label><br>
+<select id="device"></select><br>
+<button id="say">Произнести тестовую фразу</button>
+</div>
+<p class="muted">Токен не показывается на странице и хранится только в оперативной памяти тестового сервиса. После перезапуска сервиса вход потребуется повторить.</p>
 <script>
-const statusBox = document.getElementById("status");
-const linkBox = document.getElementById("link");
-const sayButton = document.getElementById("say");
+const message=document.getElementById('message');
+const link=document.getElementById('link');
+const controls=document.getElementById('controls');
+const device=document.getElementById('device');
 
-async function api(path, method = "GET") {
-    const response = await fetch(path, {method});
-    const data = await response.json();
-    if (!response.ok) {
-        throw new Error(data.detail || "Ошибка запроса");
-    }
-    return data;
+async function callApi(url, body){
+  const options={method:body?'POST':'GET'};
+  if(body){options.headers={'Content-Type':'application/json'};options.body=JSON.stringify(body);}
+  const response=await fetch(url,options);
+  const data=await response.json();
+  if(!response.ok) throw new Error(data.detail||'Ошибка запроса');
+  return data;
 }
-
-async function refresh() {
-    try {
-        const data = await api("/api/status");
-        statusBox.textContent = data.message || data.status;
-        linkBox.innerHTML = "";
-
-        if (data.link) {
-            const link = document.createElement("a");
-            link.href = data.link;
-            link.textContent = "Открыть подтверждение входа";
-            link.target = "_blank";
-            link.rel = "noopener";
-            linkBox.appendChild(link);
-        }
-
-        if (data.error) {
-            statusBox.textContent += "\n\n" + data.error;
-        }
-
-        sayButton.hidden = data.status !== "ready";
-        if (data.status === "waiting" || data.status === "working") {
-            setTimeout(refresh, 2500);
-        }
-    } catch (error) {
-        statusBox.textContent = error.message;
+async function refresh(){
+  try{
+    const data=await callApi('/api/status');
+    message.textContent=data.message;
+    link.replaceChildren();
+    if(data.link){
+      const a=document.createElement('a');
+      a.href=data.link;a.target='_blank';a.rel='noopener';
+      a.textContent='Открыть подтверждение входа Яндекса';
+      link.appendChild(a);
     }
+    if(data.status==='ready'){
+      controls.hidden=false;
+      device.replaceChildren();
+      data.devices.forEach(item=>{
+        const option=document.createElement('option');
+        option.value=item.id;option.textContent=item.name;
+        device.appendChild(option);
+      });
+    }
+    if(data.status==='error'&&data.error) message.textContent+=' '+data.error;
+    if(data.status==='starting'||data.status==='waiting') setTimeout(refresh,2500);
+  }catch(error){message.textContent=error.message;}
 }
-
-document.getElementById("start").addEventListener("click", async () => {
-    statusBox.textContent = "Запускаю авторизацию...";
-    sayButton.hidden = true;
-    linkBox.innerHTML = "";
-
-    try {
-        await api("/api/start", "POST");
-        refresh();
-    } catch (error) {
-        statusBox.textContent = error.message;
-    }
-});
-
-sayButton.addEventListener("click", async () => {
-    sayButton.disabled = true;
-    statusBox.textContent = "Отправляю фразу на личную станцию...";
-
-    try {
-        const data = await api("/api/say", "POST");
-        statusBox.textContent = data.message;
-    } catch (error) {
-        statusBox.textContent = error.message;
-    } finally {
-        sayButton.disabled = false;
-    }
-});
-
-refresh();
+document.getElementById('start').onclick=async()=>{
+  try{await callApi('/api/start',{});refresh();}
+  catch(error){message.textContent=error.message;}
+};
+document.getElementById('say').onclick=async()=>{
+  try{
+    const data=await callApi('/api/say',{device_id:device.value});
+    message.textContent=data.message;
+  }catch(error){message.textContent=error.message;}
+};
 </script>
 </body>
-</html>
-"""
+</html>"""
