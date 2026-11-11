@@ -84,6 +84,30 @@ def yandex_login():
         "csrfToken" in page.text,
     )
 
+    for match in list(re.finditer(
+        "csrf_token", page.text, flags=re.IGNORECASE
+    ))[:5]:
+        start = max(0, match.start() - 120)
+        end = min(len(page.text), match.end() + 250)
+        context = page.text[start:end]
+
+        context = re.sub(
+            r'(?i)(\bvalue\s*=\s*)(["\']).*?\2',
+            r'\1"[СКРЫТО]"',
+            context,
+        )
+
+        context = re.sub(
+            r'(?i)(csrf_token["\']?\s*:\s*["\'])[^"\']*',
+            r'\1[СКРЫТО]',
+            context,
+        )
+
+        log.info(
+            "CSRF context: %s",
+            context.replace("\n", " "),
+        )
+
     csrf_match = None
 
     input_tags = re.findall(
