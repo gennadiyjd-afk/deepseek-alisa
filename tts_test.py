@@ -155,6 +155,17 @@ def yandex_login():
         [len(item.group(1)) for item in csrf_fields[:10]],
     )
 
+    csrf_keys = re.findall(
+        r"""['"]([^'"]*csrf[^'"]*)['"]\s*:\s*(['"])(.*?)\2""",
+        page.text,
+        flags=re.IGNORECASE,
+    )
+
+    log.info(
+        "All CSRF-like fields: %s",
+        [(name, len(value)) for name, _, value in csrf_keys[:20]],
+    )
+
     if not csrf_match:
         raise RuntimeError("Не удалось получить CSRF-токен для QR-входа")
 
