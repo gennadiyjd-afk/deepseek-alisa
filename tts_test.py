@@ -84,13 +84,31 @@ def yandex_login():
         "csrfToken" in page.text,
     )
 
-    csrf_match = re.search(
-        r'name=["\']csrf_token["\']\s+value=["\']([^"\']+)["\']',
+    csrf_match = None
+
+    input_tags = re.findall(
+        r"<input\b[^>]*>",
         page.text,
+        flags=re.IGNORECASE,
     )
+
+    for input_tag in input_tags:
+        if re.search(
+            r"\bname\s*=\s*['\"]csrf_token['\"]",
+            input_tag,
+            flags=re.IGNORECASE,
+        ):
+            csrf_match = re.search(
+                r"\bvalue\s*=\s*['\"]([^'\"]+)['\"]",
+                input_tag,
+                flags=re.IGNORECASE,
+            )
+            if csrf_match:
+                break
+
     if not csrf_match:
         csrf_match = re.search(
-            r'["\']csrfToken["\']\s*:\s*["\']([^"\']+)["\']',
+            r"['\"]csrfToken['\"]\s*:\s*['\"]([^'\"]+)['\"]",
             page.text,
         )
 
