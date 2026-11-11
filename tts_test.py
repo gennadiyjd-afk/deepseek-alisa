@@ -47,7 +47,7 @@ def require_password(credentials: HTTPBasicCredentials = Depends(security)):
             401, "Неверный пароль", headers={"WWW-Authenticate": "Basic"}
         )
     return True
-def response_json(response: requests.Response, label: str):
+    def response_json(response: requests.Response, label: str):
     try:
         data = response.json()
     except Exception:
@@ -70,17 +70,30 @@ def yandex_login():
         "https://passport.yandex.ru/pwl-yandex",
         timeout=20,
     )
+    
     page.raise_for_status()
 
+    log.info(
+        "Passport page diagnostic: status=%s, url=%s, content_type=%s, "
+        "length=%s, has_csrf_token=%s, has_csrfToken=%s",
+        page.status_code,
+        page.url,
+        page.headers.get("Content-Type"),
+        len(page.text),
+        "csrf_token" in page.text,
+        "csrfToken" in page.text,
+    )
+
     csrf_match = re.search(
-        r'name="csrf_token"\s+value="([^"]+)"',
+        r'name=["\']csrf_token["\']\s+value=["\']([^"\']+)["\']',
         page.text,
     )
     if not csrf_match:
         csrf_match = re.search(
-            r'"csrfToken"\s*:\s*"([^"]+)"',
+            r'["\']csrfToken["\']\s*:\s*["\']([^"\']+)["\']',
             page.text,
         )
+
     if not csrf_match:
         raise RuntimeError("Не удалось получить CSRF-токен для QR-входа")
 
@@ -141,7 +154,7 @@ def yandex_login():
             break
     else:
         raise RuntimeError("Время ожидания подтверждения входа истекло")
-    session_data = response_json(
+            session_data = response_json(
         passport.post(
             "https://passport.yandex.ru/pwl-yandex/api/passport/auth/sessions/get_session",
             data={
@@ -212,7 +225,7 @@ def yandex_login():
         timeout=20,
     )
     log.info("Quasar finish response: HTTP %s", finish.status_code)
-    # Получаем CSRF-токен со страницы Яндекса.
+        # Получаем CSRF-токен со страницы Яндекса.
     iot_page = quasar.get(
         "https://yandex.ru/iot",
         timeout=20,
@@ -280,7 +293,7 @@ def yandex_login():
             devices=personal_speakers,
             error=None,
         )
-def login_worker():
+        def login_worker():
     try:
         yandex_login()
     except Exception as exc:
