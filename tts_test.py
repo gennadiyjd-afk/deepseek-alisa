@@ -137,6 +137,13 @@ def yandex_login():
         )
 
     if not csrf_match:
+        csrf_match = re.search(
+            r"""['"]csrf_token['"]\s*:\s*['"]([^'"]+)['"]""",
+            page.text,
+            flags=re.IGNORECASE,
+        )
+
+    if not csrf_match:
         raise RuntimeError("Не удалось получить CSRF-токен для QR-входа")
 
     passport_csrf = csrf_match.group(1)
