@@ -66,136 +66,52 @@ def yandex_login():
     passport = requests.Session()
     passport.headers.update({"User-Agent": USER_AGENT})
 
+    # Возвращаем проверенный способ получения CSRF-токена,
+    # который использовался в самой первой версии теста.
     page = passport.get(
         "https://passport.yandex.ru/pwl-yandex",
         timeout=20,
     )
-    
     page.raise_for_status()
 
-    log.info(
-        "Passport page diagnostic: status=%s, url=%s, content_type=%s, "
-        "length=%s, has_csrf_token=%s, has_csrfToken=%s",
-        page.status_code,
-        page.url,
-        page.headers.get("Content-Type"),
-        len(page.text),
-        "csrf_token" in page.text,
-        "csrfToken" in page.text,
-    )
-
-    for match in list(re.finditer(
-        "csrf_token", page.text, flags=re.IGNORECASE
-    ))[:5]:
-        start = max(0, match.start() - 120)
-        end = min(len(page.text), match.end() + 250)
-        context = page.text[start:end]
-
-        context = re.sub(
-            r'(?i)(\bvalue\s*=\s*)(["\']).*?\2',
-            r'\1"[СКРЫТО]"',
-            context,
+    match = re.search(r'__CSRF__\s*=\s*"([^"]+)', page.text)
+    if not match:
+        raise RuntimeError(
+            "Не удалось получить защитный токен страницы входа (__CSRF__)"
         )
 
-        context = re.sub(
-            r'(?i)(csrf_token["\']?\s*:\s*["\'])[^"\']*',
-            r'\1[СКРЫТО]',
-            context,
-        )
+    csrf_login = match.group(1)
+    login_headers = {"X-CSRF-Token": csrf_login}
 
-        log.info(
-            "CSRF context: %s",
-            context.replace("\n", " "),
-        )
-
-    csrf_match = None
-
-    input_tags = re.findall(
-        r"<input\b[^>]*>",
-        page.text,
-        flags=re.IGNORECASE,
-    )
-
-    for input_tag in input_tags:
-        if re.search(
-            r"\bname\s*=\s*['\"]csrf_token['\"]",
-            input_tag,
-            flags=re.IGNORECASE,
-        ):
-            csrf_match = re.search(
-                r"\bvalue\s*=\s*['\"]([^'\"]+)['\"]",
-                input_tag,
-                flags=re.IGNORECASE,
-            )
-            if csrf_match:
-                break
-
-    if not csrf_match:
-        csrf_match = re.search(
-            r"['\"]csrfToken['\"]\s*:\s*['\"]([^'\"]+)['\"]",
-            page.text,
-        )
-
-    if not csrf_match:
-        csrf_match = re.search(
-            r"""['"]csrf_token['"]\s*:\s*['"]([^'"]+)['"]""",
-            page.text,
-            flags=re.IGNORECASE,
-        )
-
-    csrf_fields = list(re.finditer(
-        r"""['"]csrf_token['"]\s*:\s*['"]([^'"]*)['"]""",
-        page.text,
-        flags=re.IGNORECASE,
-    ))
-
-    log.info(
-        "CSRF fields diagnostic: count=%s, value_lengths=%s",
-        len(csrf_fields),
-        [len(item.group(1)) for item in csrf_fields[:10]],
-    )
-
-    csrf_keys = re.findall(
-        r"""['"]([^'"]*csrf[^'"]*)['"]\s*:\s*(['"])(.*?)\2""",
-        page.text,
-        flags=re.IGNORECASE,
-    )
-
-    log.info(
-        "All CSRF-like fields: %s",
-        [(name, len(value)) for name, _, value in csrf_keys[:20]],
-    )
-
-    if not csrf_match:
-        raise RuntimeError("Не удалось получить CSRF-токен для QR-входа")
-
-    passport_csrf = csrf_match.group(1)
-
-    start = response_json(
+    start_data = response_json(
         passport.post(
             "https://passport.yandex.ru/pwl-yandex/api/passport/auth/password/submit",
-            data={"csrf_token": passport_csrf},
+            json={"retpath": "https://passport.yandex.ru/"},
+            headers=login_headers,
             timeout=20,
         ),
-        "Запуск QR-авторизации",
+        "Создание QR-входа",
     )
+    track_id = start_data.get("track_id")
+    if not track_id:
+        raise RuntimeError("Яндекс не создал сессию QR-входа")
 
     magic = response_json(
         passport.post(
             "https://passport.yandex.ru/pwl-yandex/api/passport/auth/magic/code",
-            data={"csrf_token": passport_csrf},
+            data={
+                "location_id": "0",
+                "magic_track_id": track_id,
+                "track_id": "",
+            },
+            headers=login_headers,
             timeout=20,
         ),
-        "Создание QR-кода",
+        "Получение QR-ссылки",
     )
-
-    qr_link = (
-        magic.get("link")
-        or magic.get("qr_link")
-        or magic.get("url")
-    )
+    qr_link = magic.get("link")
     if not qr_link:
-        raise RuntimeError("Яндекс не вернул ссылку для QR-авторизации")
+        raise RuntimeError("Яндекс не вернул ссылку для подтверждения")
 
     with _guard:
         _state.update(
@@ -207,35 +123,34 @@ def yandex_login():
 
     deadline = time.time() + 180
     auth_status = {}
-
     while time.time() < deadline:
         time.sleep(3)
         auth_status = response_json(
             passport.post(
                 "https://passport.yandex.ru/pwl-yandex/api/passport/auth/magic/code/status",
-                data={
-                    "csrf_token": passport_csrf,
-                    "track_id": magic.get("track_id"),
-                },
+                json=start_data,
+                headers=login_headers,
                 timeout=20,
             ),
-            "Проверка QR-авторизации",
+            "Проверка QR-входа",
         )
-
-        if auth_status.get("status") == "otp_auth_finished":
+        if auth_status.get("state") == "otp_auth_finished":
             break
     else:
-        raise RuntimeError("Время ожидания подтверждения входа истекло")
-    session_data = response_json(
+        raise RuntimeError("Время ожидания подтверждения истекло")
+
+    session_track = auth_status.get("trackId")
+    if not session_track:
+        raise RuntimeError("Яндекс не подтвердил завершение входа")
+
+    response_json(
         passport.post(
-            "https://passport.yandex.ru/pwl-yandex/api/passport/auth/sessions/get_session",
-            data={
-                "csrf_token": passport_csrf,
-                "track_id": magic.get("track_id"),
-            },
+            "https://passport.yandex.ru/pwl-yandex/api/passport/sessions/get_session",
+            data={"track_id": session_track},
+            headers=login_headers,
             timeout=20,
         ),
-        "Получение сессии Яндекса",
+        "Завершение входа",
     )
 
     cookies = "; ".join(
