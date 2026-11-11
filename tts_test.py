@@ -153,25 +153,32 @@ def yandex_login():
         "Завершение входа",
     )
 
-    cookies = "; ".join(
+    cookie_header = "; ".join(
         f"{cookie.name}={cookie.value}"
-        for cookie in passport.cookies
+        for cookie in passport.cookies.jar
+        if (cookie.domain or "").endswith("yandex.ru")
     )
-    if not cookies:
+    if not cookie_header:
         raise RuntimeError("Яндекс не выдал cookies после подтверждения входа")
 
-    token_response = response_json(
+    token_data = response_json(
         passport.post(
             "https://mobileproxy.passport.yandex.net/1/bundle/oauth/token_by_sessionid",
-            data={"sessionid": cookies},
+            data={
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+            },
+            headers={
+                "Ya-Client-Host": "passport.yandex.ru",
+                "Ya-Client-Cookie": cookie_header,
+            },
             timeout=20,
         ),
-        "Получение OAuth-токена",
+        "Получение токена",
     )
-
-    x_token = token_response.get("access_token") or token_response.get("x_token")
+    x_token = token_data.get("access_token")
     if not x_token:
-        raise RuntimeError("Не удалось получить токен доступа Яндекса")
+        raise RuntimeError("Яндекс не выдал токен доступа")
 
     token_exchange = response_json(
         passport.post(
