@@ -247,13 +247,63 @@ def yandex_login():
     )
 
     all_devices = devices_data.get("devices", [])
+    households = devices_data.get("households", [])
     log.info(
         "Quasar devices response: top_level_keys=%s; "
-        "devices_type=%s; devices_count=%s",
+        "devices_type=%s; devices_count=%s; households_type=%s; households_count=%s",
         list(devices_data.keys()),
         type(all_devices).__name__,
         len(all_devices) if isinstance(all_devices, list) else None,
+        type(households).__name__,
+        len(households) if isinstance(households, list) else None,
     )
+
+    # Пока только изучаем вложенную структуру households.
+    # Не выводим идентификаторы, cookies, токены или полный ответ API.
+    if isinstance(households, list):
+        for household_index, household in enumerate(households):
+            if not isinstance(household, dict):
+                log.info(
+                    "Quasar household[%s]: item_type=%s",
+                    household_index,
+                    type(household).__name__,
+                )
+                continue
+
+            log.info(
+                "Quasar household[%s]: keys=%s; name=%r",
+                household_index,
+                list(household.keys()),
+                household.get("name"),
+            )
+
+            for field_name, field_value in household.items():
+                if isinstance(field_value, list):
+                    item_summaries = []
+                    for item in field_value[:30]:
+                        if isinstance(item, dict):
+                            item_summaries.append({
+                                "name": item.get("name"),
+                                "id_present": bool(item.get("id")),
+                                "keys": list(item.keys()),
+                            })
+                        else:
+                            item_summaries.append({"type": type(item).__name__})
+                    log.info(
+                        "Quasar household[%s].%s: count=%s; items=%s",
+                        household_index,
+                        field_name,
+                        len(field_value),
+                        item_summaries,
+                    )
+                elif isinstance(field_value, dict):
+                    log.info(
+                        "Quasar household[%s].%s: dict_keys=%s",
+                        household_index,
+                        field_name,
+                        list(field_value.keys()),
+                    )
+
     if not isinstance(all_devices, list):
         raise RuntimeError("Яндекс вернул список устройств в неожиданном формате")
 
