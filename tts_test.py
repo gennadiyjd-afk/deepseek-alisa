@@ -252,16 +252,39 @@ def yandex_login():
 
     personal_speakers = []
 
+    # Диагностика: выводим только безопасные сведения об устройствах,
+    # без cookies, токенов и полного содержимого ответа Яндекса.
     for device in all_devices:
+        name = device.get("name")
+        capabilities = device.get("capabilities")
         quasar_info = device.get("quasar_info") or {}
 
-        if device.get("name") != PERSONAL_STATION_NAME:
+        log.info(
+            "Quasar device: name=%r; id_present=%s; "
+            "capabilities_type=%s; capabilities_count=%s; "
+            "quasar_info_present=%s; quasar_info_keys=%s",
+            name,
+            bool(device.get("id")),
+            type(capabilities).__name__,
+            len(capabilities) if isinstance(capabilities, (list, dict)) else None,
+            bool(quasar_info),
+            list(quasar_info.keys()) if isinstance(quasar_info, dict) else [],
+        )
+
+        # Сравниваем имя без учёта регистра и случайных пробелов.
+        normalized_name = " ".join(str(name or "").split()).casefold()
+        expected_name = " ".join(PERSONAL_STATION_NAME.split()).casefold()
+
+        if normalized_name != expected_name:
             continue
         if not device.get("id"):
+            log.warning("Личная станция найдена по имени, но у неё отсутствует id")
             continue
-        if not device.get("capabilities"):
+        if not capabilities:
+            log.warning("Личная станция найдена по имени, но capabilities пуст")
             continue
         if not quasar_info:
+            log.warning("Личная станция найдена по имени, но quasar_info пуст")
             continue
 
         personal_speakers.append(device)
