@@ -246,104 +246,70 @@ def yandex_login():
         "Получение списка устройств",
     )
 
-    all_devices = devices_data.get("devices", [])
+    # В ответе Quasar устройства находятся внутри household["all"],
+    # а не в корневом поле "devices".
     households = devices_data.get("households", [])
     log.info(
-        "Quasar devices response: top_level_keys=%s; "
-        "devices_type=%s; devices_count=%s; households_type=%s; households_count=%s",
+        "Quasar devices response: top_level_keys=%s; households_type=%s; households_count=%s",
         list(devices_data.keys()),
-        type(all_devices).__name__,
-        len(all_devices) if isinstance(all_devices, list) else None,
         type(households).__name__,
         len(households) if isinstance(households, list) else None,
     )
 
-    # Пока только изучаем вложенную структуру households.
-    # Не выводим идентификаторы, cookies, токены или полный ответ API.
-    if isinstance(households, list):
-        for household_index, household in enumerate(households):
-            if not isinstance(household, dict):
-                log.info(
-                    "Quasar household[%s]: item_type=%s",
-                    household_index,
-                    type(household).__name__,
-                )
-                continue
+    if not isinstance(households, list):
+        raise RuntimeError("Яндекс вернул households в неожиданном формате")
 
-            log.info(
-                "Quasar household[%s]: keys=%s; name=%r",
-                household_index,
-                list(household.keys()),
-                household.get("name"),
-            )
-
-            for field_name, field_value in household.items():
-                if isinstance(field_value, list):
-                    item_summaries = []
-                    for item in field_value[:30]:
-                        if isinstance(item, dict):
-                            item_summaries.append({
-                                "name": item.get("name"),
-                                "id_present": bool(item.get("id")),
-                                "keys": list(item.keys()),
-                            })
-                        else:
-                            item_summaries.append({"type": type(item).__name__})
-                    log.info(
-                        "Quasar household[%s].%s: count=%s; items=%s",
-                        household_index,
-                        field_name,
-                        len(field_value),
-                        item_summaries,
-                    )
-                elif isinstance(field_value, dict):
-                    log.info(
-                        "Quasar household[%s].%s: dict_keys=%s",
-                        household_index,
-                        field_name,
-                        list(field_value.keys()),
-                    )
-
-    if not isinstance(all_devices, list):
-        raise RuntimeError("Яндекс вернул список устройств в неожиданном формате")
+    all_devices = []
+    for household_index, household in enumerate(households):
+        if not isinstance(household, dict):
+            continue
+        household_name = household.get("name", "")
+        household_devices = household.get("all", [])
+        log.info(
+            "Quasar household[%s]: name=%r; all_type=%s; all_count=%s",
+            household_index,
+            household_name,
+            type(household_devices).__name__,
+            len(household_devices) if isinstance(household_devices, list) else None,
+        )
+        if not isinstance(household_devices, list):
+            continue
+        for device in household_devices:
+            if isinstance(device, dict):
+                # Сохраняем название дома только для безопасной диагностики.
+                device_copy = dict(device)
+                device_copy["_household_name"] = household_name
+                all_devices.append(device_copy)
 
     personal_speakers = []
+    expected_name = " ".join(PERSONAL_STATION_NAME.split()).casefold()
 
-    # Диагностика: выводим только безопасные сведения об устройствах,
-    # без cookies, токенов и полного содержимого ответа Яндекса.
+    # Ищем строго по точному имени личной станции.
+    # Устройства из второго дома не выбираются по одному лишь типу.
     for device in all_devices:
         name = device.get("name")
+        normalized_name = " ".join(str(name or "").split()).casefold()
+        if normalized_name != expected_name:
+            continue
+
         capabilities = device.get("capabilities")
         quasar_info = device.get("quasar_info") or {}
-
         log.info(
-            "Quasar device: name=%r; id_present=%s; "
-            "capabilities_type=%s; capabilities_count=%s; "
-            "quasar_info_present=%s; quasar_info_keys=%s",
-            name,
+            "Личная станция-кандидат: household=%r; id_present=%s; "
+            "capabilities_type=%s; capabilities_count=%s; quasar_info_present=%s",
+            device.get("_household_name"),
             bool(device.get("id")),
             type(capabilities).__name__,
             len(capabilities) if isinstance(capabilities, (list, dict)) else None,
             bool(quasar_info),
-            list(quasar_info.keys()) if isinstance(quasar_info, dict) else [],
         )
 
-        # Сравниваем имя без учёта регистра и случайных пробелов.
-        normalized_name = " ".join(str(name or "").split()).casefold()
-        expected_name = " ".join(PERSONAL_STATION_NAME.split()).casefold()
-
-        if normalized_name != expected_name:
-            continue
         if not device.get("id"):
-            log.warning("Личная станция найдена по имени, но у неё отсутствует id")
-            continue
+            raise RuntimeError("У личной станции отсутствует id")
         if not capabilities:
-            log.warning("Личная станция найдена по имени, но capabilities пуст")
-            continue
+            raise RuntimeError("У личной станции отсутствуют capabilities")
         if not quasar_info:
-            log.warning("Личная станция найдена по имени, но quasar_info пуст")
-            continue
-
+            raise RuntimeError("У личной станции отсутствует quasar_info")
         personal_speakers.append(device)
 
     log.info(
