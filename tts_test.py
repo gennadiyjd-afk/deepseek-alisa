@@ -247,6 +247,13 @@ def yandex_login():
     )
 
     all_devices = devices_data.get("devices", [])
+    log.info(
+        "Quasar devices response: top_level_keys=%s; "
+        "devices_type=%s; devices_count=%s",
+        list(devices_data.keys()),
+        type(all_devices).__name__,
+        len(all_devices) if isinstance(all_devices, list) else None,
+    )
     if not isinstance(all_devices, list):
         raise RuntimeError("Яндекс вернул список устройств в неожиданном формате")
 
