@@ -8,7 +8,7 @@ import traceback
 from typing import Any
 
 import requests
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -391,8 +391,15 @@ def get_status(_: bool = Depends(require_password)):
 
 
 @app.post("/api/say")
-def say(_: bool = Depends(require_password)):
-    phrase = "Проверка связи. Я могу говорить с вами напрямую."
+def say(
+    payload: dict = Body(...),
+    _: bool = Depends(require_password),
+):
+    phrase = str(payload.get("phrase") or "").strip()
+    if not phrase:
+        raise HTTPException(400, "Введи текст для произнесения")
+    if len(phrase) > 500:
+        raise HTTPException(400, "Максимальная длина фразы — 500 символов")
 
     with _guard:
         session = _state.get("session")
@@ -469,15 +476,23 @@ a { overflow-wrap: anywhere; }
 <button id="start">Подключить Яндекс</button>
 <div id="status">Ожидание запуска</div>
 <div id="link"></div>
-<button id="say" hidden>Произнести тестовую фразу</button>
+<label for="phrase">Текст для произнесения:</label>
+<textarea id="phrase" rows="4" maxlength="500" placeholder="Напиши фразу, которую должна произнести колонка" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
+<button id="say" hidden>Произнести текст</button>
 
 <script>
 const statusBox = document.getElementById("status");
 const linkBox = document.getElementById("link");
 const sayButton = document.getElementById("say");
+const phraseInput = document.getElementById("phrase");
 
-async function api(path, method = "GET") {
-    const response = await fetch(path, {method});
+async function api(path, method = "GET", body = null) {
+    const options = {method, headers: {}};
+    if (body !== null) {
+        options.headers["Content-Type"] = "application/json";
+        options.body = JSON.stringify(body);
+    }
+    const response = await fetch(path, options);
     const data = await response.json();
     if (!response.ok) {
         throw new Error(data.detail || "Ошибка запроса");
@@ -527,11 +542,17 @@ document.getElementById("start").addEventListener("click", async () => {
 });
 
 sayButton.addEventListener("click", async () => {
+    const phrase = phraseInput.value.trim();
+    if (!phrase) {
+        statusBox.textContent = "Сначала введи текст для произнесения.";
+        phraseInput.focus();
+        return;
+    }
     sayButton.disabled = true;
-    statusBox.textContent = "Отправляю фразу на личную станцию...";
+    statusBox.textContent = "Отправляю текст на личную станцию...";
 
     try {
-        const data = await api("/api/say", "POST");
+        const data = await api("/api/say", "POST", {phrase});
         statusBox.textContent = data.message;
     } catch (error) {
         statusBox.textContent = error.message;
