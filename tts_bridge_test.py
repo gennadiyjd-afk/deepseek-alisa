@@ -495,6 +495,75 @@ def bridge_say(
         raise HTTPException(502, f"Ошибка отправки: {type(exc).__name__}")
 
 
+def send_voice_command(text: str):
+    """Отправляет текст через Quasar text_action (это не phrase_action/TTS)."""
+    with _guard:
+        session = _state.get("session")
+        csrf = _state.get("csrf")
+        devices = _state.get("devices") or []
+        if _state["status"] != "ready" or session is None or not csrf:
+            raise HTTPException(409, "Мост не подключён к Яндексу")
+        if len(devices) != 1:
+            raise HTTPException(409, "Личная станция не определена")
+        device_id = str(devices[0]["id"])
+
+    try:
+        response = session.post(
+            f"{QUASAR_API}/user/devices/{device_id}/actions",
+            json={
+                "actions": [{
+                    "type": "devices.capabilities.quasar.server_action",
+                    "state": {
+                        "instance": "text_action",
+                        "value": text,
+                    },
+                }]
+            },
+            headers={"x-csrf-token": csrf},
+            timeout=20,
+        )
+        response_json(response, "Отправка текстовой команды")
+        return {"ok": True, "message": "Текстовая команда отправлена на личную станцию"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("Ошибка отправки текстовой команды")
+        raise HTTPException(502, f"Ошибка отправки команды: {type(exc).__name__}")
+
+
+@app.post("/api/command")
+def command(
+    payload: dict = Body(...),
+    _: bool = Depends(require_password),
+):
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "Введи текст команды")
+    if len(text) > 120:
+        raise HTTPException(400, "Максимальная длина команды — 120 символов")
+    return send_voice_command(text)
+
+
+@app.post("/api/bridge/command")
+def bridge_command(
+    payload: dict = Body(...),
+    x_bridge_secret: str = Header(default=""),
+):
+    """Private endpoint: send a text command, not a spoken phrase."""
+    if not BRIDGE_SECRET:
+        raise HTTPException(503, "На Render не задана переменная TTS_BRIDGE_SECRET")
+    if not secrets.compare_digest(x_bridge_secret, BRIDGE_SECRET):
+        raise HTTPException(401, "Неверный ключ моста")
+
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "Пустой текст команды")
+    if len(text) > 120:
+        raise HTTPException(400, "Максимальная длина команды — 120 символов")
+    return send_voice_command(text)
+
+
+
 @app.post("/api/bridge/stop")
 def bridge_stop(x_bridge_secret: str = Header(default="")):
     """Stop/pause playback on the one explicitly selected personal station."""
@@ -568,12 +637,15 @@ a { overflow-wrap: anywhere; }
 <label for="phrase">Текст для произнесения:</label>
 <textarea id="phrase" rows="4" maxlength="500" placeholder="Напиши фразу, которую должна произнести колонка" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
 <button id="say" hidden>Произнести текст</button>
+<p>Тестовая команда: «Алиса, я жду»</p>
+<button id="commandButton" hidden>Отправить команду «Алиса, я жду»</button>
 
 <script>
 const statusBox = document.getElementById("status");
 const linkBox = document.getElementById("link");
 const sayButton = document.getElementById("say");
 const phraseInput = document.getElementById("phrase");
+const commandButton = document.getElementById("commandButton");
 
 async function api(path, method = "GET", body = null) {
     const options = {method, headers: {}};
@@ -625,6 +697,7 @@ async function refresh() {
         }
 
         sayButton.hidden = data.status !== "ready";
+        commandButton.hidden = data.status !== "ready";
         if (data.status === "waiting" || data.status === "working") {
             scheduleRefresh();
         } else if (refreshTimer !== null) {
@@ -650,6 +723,7 @@ document.addEventListener("visibilitychange", () => {
 document.getElementById("start").addEventListener("click", async () => {
     statusBox.textContent = "Запускаю авторизацию...";
     sayButton.hidden = true;
+    commandButton.hidden = true;
     linkBox.innerHTML = "";
 
     try {
@@ -657,6 +731,19 @@ document.getElementById("start").addEventListener("click", async () => {
         refresh();
     } catch (error) {
         statusBox.textContent = error.message;
+    }
+});
+
+commandButton.addEventListener("click", async () => {
+    commandButton.disabled = true;
+    statusBox.textContent = "Отправляю команду «Алиса, я жду» на личную станцию...";
+    try {
+        const data = await api("/api/command", "POST", {text: "Алиса, я жду"});
+        statusBox.textContent = data.message + ". Проверим, попадёт ли команда в активный навык.";
+    } catch (error) {
+        statusBox.textContent = error.message;
+    } finally {
+        commandButton.disabled = false;
     }
 });
 
