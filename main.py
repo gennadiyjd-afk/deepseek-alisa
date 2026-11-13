@@ -46,6 +46,147 @@ REDIS_STATE_LOCK = threading.Lock()
 REDIS_AVAILABLE = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
 
 
+# Необязательный мост к личной Яндекс Станции.
+# Для запуска навыка используется Quasar text_action, а не phrase_action.
+TTS_BRIDGE_URL = os.getenv("TTS_BRIDGE_URL", "").rstrip("/")
+TTS_BRIDGE_SECRET = os.getenv("TTS_BRIDGE_SECRET", "")
+AUTO_WAIT_COMMAND = "Алиса, я жду"
+AUTO_WAIT_INITIAL_DELAY = 12
+AUTO_WAIT_REPEAT_INTERVAL = 25
+AUTO_WAIT_COMMAND_COOLDOWN = 15
+
+
+def send_bridge_wait_command(job_key, job_id):
+    """Передаёт станции команду навыку и не произносит её как обычную фразу."""
+    if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
+        logger.warning("Automatic wait command skipped: TTS bridge is not configured")
+        return False
+
+    now = time.time()
+    with jobs_lock:
+        current = search_jobs.get(job_key)
+        if (
+            not current
+            or current.get("job_id") != job_id
+            or not current.get("auto_delivery")
+            or current.get("status") not in ("pending", "ready")
+        ):
+            return False
+
+        # Если первый фрагмент уже выдан, повторная автоматическая команда
+        # не должна случайно запросить следующий фрагмент ответа.
+        if current.get("status") == "ready" and int(current.get("part_index", 0)) > 0:
+            return False
+
+        last_sent = float(current.get("auto_wait_last_sent_at", 0) or 0)
+        if now - last_sent < AUTO_WAIT_COMMAND_COOLDOWN:
+            return False
+
+        current["auto_wait_last_sent_at"] = now
+        persist_job_maps()
+
+    try:
+        response = requests.post(
+            f"{TTS_BRIDGE_URL}/api/bridge/command",
+            headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
+            json={"text": AUTO_WAIT_COMMAND},
+            timeout=25,
+        )
+        response.raise_for_status()
+        logger.info("Automatic text_action command sent for job %s", job_id[:8])
+        return True
+    except Exception:
+        logger.exception("Could not send automatic text_action wait command")
+        with jobs_lock:
+            current = search_jobs.get(job_key)
+            if current and current.get("job_id") == job_id:
+                if current.get("auto_wait_last_sent_at") == now:
+                    current["auto_wait_last_sent_at"] = 0
+                    persist_job_maps()
+        return False
+
+
+def monitor_delayed_job(job_key, job_id):
+    """Через 12 секунд запускает проверку навыка и повторяет её, пока задача активна."""
+    def run():
+        time.sleep(AUTO_WAIT_INITIAL_DELAY)
+        while True:
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                if (
+                    not current
+                    or current.get("job_id") != job_id
+                    or not current.get("auto_delivery")
+                ):
+                    return
+                status = current.get("status")
+                part_index = int(current.get("part_index", 0))
+
+            if status == "ready":
+                if part_index == 0:
+                    send_bridge_wait_command(job_key, job_id)
+                return
+            if status != "pending":
+                return
+
+            send_bridge_wait_command(job_key, job_id)
+            time.sleep(AUTO_WAIT_REPEAT_INTERVAL)
+
+    threading.Thread(
+        target=run,
+        daemon=True,
+        name=f"auto-wait-{job_id[:8]}",
+    ).start()
+
+
+def auto_deliver_ready_job(job_key, job_id):
+    """Когда фоновый ответ готов, вызывает навык через text_action."""
+    with jobs_lock:
+        current = search_jobs.get(job_key)
+        if (
+            not current
+            or current.get("job_id") != job_id
+            or current.get("auto_delivery_thread_started")
+        ):
+            return
+        current["auto_delivery_thread_started"] = True
+        persist_job_maps()
+
+    def run():
+        # Не отправляем команду раньше чем через 12 секунд после начального ответа.
+        with jobs_lock:
+            current = search_jobs.get(job_key)
+            if not current or current.get("job_id") != job_id:
+                return
+            started_at = float(current.get("auto_wait_started_at", time.time()) or time.time())
+        first_command_at = started_at + AUTO_WAIT_INITIAL_DELAY
+        time.sleep(max(0, first_command_at - time.time()))
+
+        # Если в это время уже была отправлена команда ожидания, ждём окончания
+        # короткого интервала защиты от повторного запроса следующей части.
+        for attempt in range(6):
+            with jobs_lock:
+                current = search_jobs.get(job_key)
+                if (
+                    not current
+                    or current.get("job_id") != job_id
+                    or not current.get("auto_delivery")
+                    or current.get("status") != "ready"
+                    or int(current.get("part_index", 0)) > 0
+                ):
+                    return
+            if send_bridge_wait_command(job_key, job_id):
+                return
+            time.sleep(5)
+
+    threading.Thread(
+        target=run,
+        daemon=True,
+        name=f"auto-deliver-{job_id[:8]}",
+    ).start()
+
+
+
 def redis_command(command):
     """Executes one Upstash Redis REST command; never logs credentials."""
     if not REDIS_AVAILABLE:
@@ -261,8 +402,6 @@ def pending_job_notice(job):
         persist_job_maps()
         return "Секундочку"
 
-    if job.get("kind") == "search":
-        return "Поиск ещё продолжается."
     return "Ответ ещё готовится."
 
 
@@ -1720,23 +1859,31 @@ def is_complex_question(text):
 
 
 def save_job_result(session_id, job_id, result):
-    """Записывает результат активной или временно прерванной задачи."""
+    """Записывает результат и автоматически вызывает навык, если ожидание уже объявлено."""
+    should_auto_deliver = False
     with jobs_lock:
         current = search_jobs.get(session_id)
         if current and current.get("job_id") == job_id:
             current.update(result)
+            should_auto_deliver = (
+                result.get("status") == "ready"
+                and bool(current.get("auto_delivery"))
+            )
             persist_job_maps()
+        else:
+            interrupted = interrupted_list(session_id)
+            for saved_job in interrupted:
+                if saved_job.get("job_id") == job_id:
+                    saved_job.update(result)
+                    persist_job_maps()
+                    logger.info("Background result saved for an interrupted conversation")
+                    return
+            logger.info("Discarded result of an outdated task")
             return
 
-        interrupted = interrupted_list(session_id)
-        for saved_job in interrupted:
-            if saved_job.get("job_id") == job_id:
-                saved_job.update(result)
-                persist_job_maps()
-                logger.info("Background result saved for an interrupted conversation")
-                return
+    if should_auto_deliver:
+        auto_deliver_ready_job(session_id, job_id)
 
-        logger.info("Discarded result of an outdated task")
 
 def ask_ai(messages, timeout=25, max_tokens=1000):
     """Запрашивает ответ у RouterAPI с одной повторной попыткой при сбое."""
@@ -2553,7 +2700,10 @@ async def main(body: dict):
                 "job_id": job_id,
                 "kind": "search",
                 "status": "pending",
-                "pending_notice_sent": False,
+                "pending_notice_sent": True,
+                "auto_delivery": True,
+                "auto_wait_started_at": time.time(),
+                "auto_wait_last_sent_at": 0,
                 "answer": "",
                 "parts": [],
                 "part_index": 0,
@@ -2570,6 +2720,7 @@ async def main(body: dict):
             user_text,
             history[-4:],
         )
+        monitor_delayed_job(job_key, job_id)
         logger.info("Search task submitted; returning immediately to Alice")
         return make_response(body, "Сейчас посмотрю.")
 
@@ -2648,8 +2799,19 @@ async def main(body: dict):
             current = search_jobs.get(job_key)
             if current and current.get("job_id") == job_id:
                 current["pending_notice_sent"] = True
+                current["auto_delivery"] = True
+                current["auto_wait_started_at"] = time.time()
+                current["auto_wait_last_sent_at"] = 0
+                result_already_ready = current.get("status") == "ready"
+                persist_job_maps()
+            else:
+                result_already_ready = False
+
+        monitor_delayed_job(job_key, job_id)
+        if result_already_ready:
+            auto_deliver_ready_job(job_key, job_id)
         logger.info(
-            "Chat is still running after %.2f seconds; returning control to Marusya",
+            "Chat is still running after %.2f seconds; returning control to Alice",
             wait_timeout,
         )
         return make_response(body, "Секундочку")
