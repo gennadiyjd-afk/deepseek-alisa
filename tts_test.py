@@ -500,7 +500,23 @@ async function api(path, method = "GET", body = null) {
     return data;
 }
 
+let refreshTimer = null;
+let refreshInProgress = false;
+
+function scheduleRefresh() {
+    if (refreshTimer !== null) {
+        clearTimeout(refreshTimer);
+        refreshTimer = null;
+    }
+    refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        refresh();
+    }, 2500);
+}
+
 async function refresh() {
+    if (refreshInProgress) return;
+    refreshInProgress = true;
     try {
         const data = await api("/api/status");
         statusBox.textContent = data.message || data.status;
@@ -521,12 +537,26 @@ async function refresh() {
 
         sayButton.hidden = data.status !== "ready";
         if (data.status === "waiting" || data.status === "working") {
-            setTimeout(refresh, 2500);
+            scheduleRefresh();
+        } else if (refreshTimer !== null) {
+            clearTimeout(refreshTimer);
+            refreshTimer = null;
         }
     } catch (error) {
         statusBox.textContent = error.message;
+        scheduleRefresh();
+    } finally {
+        refreshInProgress = false;
     }
 }
+
+// Мобильный браузер может приостановить JavaScript, пока открыто
+// приложение Яндекса. При возвращении сразу перечитываем статус сервера.
+window.addEventListener("pageshow", refresh);
+window.addEventListener("focus", refresh);
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refresh();
+});
 
 document.getElementById("start").addEventListener("click", async () => {
     statusBox.textContent = "Запускаю авторизацию...";
