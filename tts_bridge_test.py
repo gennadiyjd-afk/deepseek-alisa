@@ -495,6 +495,41 @@ def bridge_say(
         raise HTTPException(502, f"Ошибка отправки: {type(exc).__name__}")
 
 
+@app.post("/api/bridge/stop")
+def bridge_stop(x_bridge_secret: str = Header(default="")):
+    """Stop/pause playback on the one explicitly selected personal station."""
+    if not BRIDGE_SECRET:
+        raise HTTPException(503, "На Render не задана переменная TTS_BRIDGE_SECRET")
+    if not secrets.compare_digest(x_bridge_secret, BRIDGE_SECRET):
+        raise HTTPException(401, "Неверный ключ моста")
+    with _guard:
+        session = _state.get("session")
+        csrf = _state.get("csrf")
+        devices = _state.get("devices") or []
+        if _state["status"] != "ready" or session is None or not csrf:
+            raise HTTPException(409, "Мост не подключён к Яндексу")
+        if len(devices) != 1:
+            raise HTTPException(409, "Личная станция не определена")
+        device_id = str(devices[0]["id"])
+    try:
+        response = session.post(
+            f"{QUASAR_API}/user/devices/{device_id}/actions",
+            json={"actions": [{
+                "type": "devices.capabilities.toggle",
+                "state": {"instance": "pause", "value": True},
+            }]},
+            headers={"x-csrf-token": csrf},
+            timeout=20,
+        )
+        response_json(response, "Остановка воспроизведения")
+        return {"ok": True, "message": "Команда остановки отправлена"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("Ошибка остановки воспроизведения")
+        raise HTTPException(502, f"Ошибка остановки: {type(exc).__name__}")
+
+
 HTML_PAGE = r"""
 <!doctype html>
 <html lang="ru">
