@@ -476,6 +476,7 @@ a { overflow-wrap: anywhere; }
 <button id="start">Подключить Яндекс</button>
 <div id="status">Ожидание запуска</div>
 <div id="link"></div>
+<p style="font-size:14px;color:#555;">После подтверждения входа в Яндексе вернись на эту вкладку. Обновлять страницу не нужно: приложение само проверит подключение и покажет кнопку «Произнести текст».</p>
 <label for="phrase">Текст для произнесения:</label>
 <textarea id="phrase" rows="4" maxlength="500" placeholder="Напиши фразу, которую должна произнести колонка" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
 <button id="say" hidden>Произнести текст</button>
