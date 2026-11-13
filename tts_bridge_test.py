@@ -637,14 +637,16 @@ a { overflow-wrap: anywhere; }
 <label for="phrase">Текст для произнесения:</label>
 <textarea id="phrase" rows="4" maxlength="500" placeholder="Напиши фразу, которую должна произнести колонка" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
 <button id="say" hidden>Произнести текст</button>
-<p>Тестовая команда: «Алиса, я жду»</p>
-<button id="commandButton" hidden>Отправить команду «Алиса, я жду»</button>
+<label for="commandText">Текстовая команда Алисе (до 120 символов):</label>
+<textarea id="commandText" rows="3" maxlength="120" placeholder="Например: Алиса, я жду" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
+<button id="commandButton" hidden>Отправить текстовую команду</button>
 
 <script>
 const statusBox = document.getElementById("status");
 const linkBox = document.getElementById("link");
 const sayButton = document.getElementById("say");
 const phraseInput = document.getElementById("phrase");
+const commandInput = document.getElementById("commandText");
 const commandButton = document.getElementById("commandButton");
 
 async function api(path, method = "GET", body = null) {
@@ -735,11 +737,17 @@ document.getElementById("start").addEventListener("click", async () => {
 });
 
 commandButton.addEventListener("click", async () => {
+    const text = commandInput.value.trim();
+    if (!text) {
+        statusBox.textContent = "Сначала введи текстовую команду.";
+        commandInput.focus();
+        return;
+    }
     commandButton.disabled = true;
-    statusBox.textContent = "Отправляю команду «Алиса, я жду» на личную станцию...";
+    statusBox.textContent = "Отправляю текстовую команду на личную станцию...";
     try {
-        const data = await api("/api/command", "POST", {text: "Алиса, я жду"});
-        statusBox.textContent = data.message + ". Проверим, попадёт ли команда в активный навык.";
+        const data = await api("/api/command", "POST", {text});
+        statusBox.textContent = data.message;
     } catch (error) {
         statusBox.textContent = error.message;
     } finally {
