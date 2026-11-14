@@ -57,18 +57,50 @@ AUTO_WAIT_COMMAND_COOLDOWN = 15
 
 
 def wake_tts_bridge_on_skill_launch():
-    """Пробуждает TTS-мост при запуске навыка, не задерживая приветствие."""
+    """Пробуждает TTS-мост в фоне и повторяет запрос, пока Render запускается."""
     if not TTS_BRIDGE_URL:
         logger.info("TTS bridge wake skipped: bridge URL is not configured")
         return
 
     def run():
-        try:
-            response = requests.get(f"{TTS_BRIDGE_URL}/health", timeout=(5, 45))
-            response.raise_for_status()
-            logger.info("TTS bridge wake check completed: HTTP %s", response.status_code)
-        except Exception:
-            logger.warning("TTS bridge wake request did not complete", exc_info=True)
+        deadline = time.monotonic() + 90
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                response = requests.get(
+                    f"{TTS_BRIDGE_URL}/health",
+                    timeout=(5, 10),
+                )
+                if response.status_code == 200:
+                    logger.info(
+                        "TTS bridge wake completed: HTTP 200 on attempt %s",
+                        attempt,
+                    )
+                    return
+                logger.warning(
+                    "TTS bridge is not ready yet: HTTP %s on attempt %s",
+                    response.status_code,
+                    attempt,
+                )
+                # Повторяем только временные ошибки запуска/шлюза.
+                if response.status_code not in (408, 425, 429) and response.status_code < 500:
+                    return
+            except requests.RequestException as exc:
+                logger.warning(
+                    "TTS bridge wake attempt %s failed: %s",
+                    attempt,
+                    exc,
+                )
+
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(5, remaining))
+
+        logger.error(
+            "TTS bridge did not become ready within 90 seconds (%s attempts)",
+            attempt,
+        )
 
     threading.Thread(
         target=run,
