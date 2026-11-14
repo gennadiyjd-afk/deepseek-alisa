@@ -220,8 +220,8 @@ def send_bridge_continue_command(job_key, job_id):
 def schedule_auto_next_part(job_key, job_id, part_text):
     """Ждёт примерную длительность озвучивания части и запрашивает следующую."""
     # Яндекс не сообщает webhook точный момент окончания воспроизведения.
-    # Поэтому ждём консервативную оценку длительности, а не отправляем команды подряд.
-    estimated_seconds = max(4.0, len(str(part_text or "")) / 12.0 + 2.5)
+    # Используем более короткую оценку, сохраняя небольшой запас перед следующей частью.
+    estimated_seconds = max(3.0, len(str(part_text or "")) / 15.0 + 1.5)
 
     def run():
         time.sleep(estimated_seconds)
