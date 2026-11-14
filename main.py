@@ -56,6 +56,27 @@ AUTO_WAIT_REPEAT_INTERVAL = 10
 AUTO_WAIT_COMMAND_COOLDOWN = 15
 
 
+def wake_tts_bridge_on_skill_launch():
+    """Пробуждает TTS-мост при запуске навыка, не задерживая приветствие."""
+    if not TTS_BRIDGE_URL:
+        logger.info("TTS bridge wake skipped: bridge URL is not configured")
+        return
+
+    def run():
+        try:
+            response = requests.get(f"{TTS_BRIDGE_URL}/health", timeout=(5, 45))
+            response.raise_for_status()
+            logger.info("TTS bridge wake check completed: HTTP %s", response.status_code)
+        except Exception:
+            logger.warning("TTS bridge wake request did not complete", exc_info=True)
+
+    threading.Thread(
+        target=run,
+        daemon=True,
+        name="tts-bridge-wake-on-launch",
+    ).start()
+
+
 def send_bridge_wait_command(job_key, job_id):
     """Передаёт станции команду навыку и не произносит её как обычную фразу."""
     if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
@@ -220,8 +241,8 @@ def send_bridge_continue_command(job_key, job_id):
 def schedule_auto_next_part(job_key, job_id, part_text):
     """Ждёт примерную длительность озвучивания части и запрашивает следующую."""
     # Яндекс не сообщает webhook точный момент окончания воспроизведения.
-    # Используем более короткую оценку, сохраняя небольшой запас перед следующей частью.
-    estimated_seconds = max(3.0, len(str(part_text or "")) / 15.0 + 1.5)
+    # Поэтому ждём консервативную оценку длительности, а не отправляем команды подряд.
+    estimated_seconds = max(4.0, len(str(part_text or "")) / 12.0 + 2.5)
 
     def run():
         time.sleep(estimated_seconds)
@@ -2608,8 +2629,10 @@ async def main(body: dict):
     request_data = body.get("request", {})
     user_text = str(request_data.get("original_utterance") or "").strip()
 
-    # Пустой запуск навыка только приветствует и не затрагивает фоновые задачи.
+    # При запуске навыка будим TTS-мост в фоне, пока Алиса произносит приветствие.
+    # Сам запрос не обращается к колонке и не задерживает ответ навыка.
     if not user_text:
+        wake_tts_bridge_on_skill_launch()
         return make_response(
             body,
             "Привет! Я твой интеллектуальный помощник DeepSeek Алиса. Чем могу помочь?",
