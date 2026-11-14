@@ -8,6 +8,7 @@ import traceback
 from typing import Any
 
 import requests
+from cryptography.fernet import Fernet
 from fastapi import Body, Depends, FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -653,6 +654,32 @@ def redis_ping(_: bool = Depends(require_password)):
             status_code=502,
             detail="Upstash Redis вернул некорректный ответ",
         )
+
+
+@app.get("/api/session/encryption-check")
+def session_encryption_check(_: bool = Depends(require_password)):
+    """Validate the Fernet key with an in-memory encrypt/decrypt self-test."""
+    encryption_key = os.getenv("TTS_SESSION_ENCRYPTION_KEY", "").strip()
+    if not encryption_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Переменная TTS_SESSION_ENCRYPTION_KEY не настроена на Render",
+        )
+
+    try:
+        cipher = Fernet(encryption_key.encode("ascii"))
+        probe = b"tts-session-encryption-self-test"
+        encrypted_probe = cipher.encrypt(probe)
+        if cipher.decrypt(encrypted_probe) != probe:
+            raise ValueError("Fernet self-test did not match")
+    except (ValueError, UnicodeError):
+        log.warning("Fernet encryption key validation failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Ключ шифрования задан неверно или имеет неподходящий формат",
+        )
+
+    return {"ok": True, "status": "encryption_ready"}
 
 
 HTML_PAGE = r"""
