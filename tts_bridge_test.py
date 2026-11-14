@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -8,6 +9,7 @@ import traceback
 from typing import Any
 
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Body, Depends, FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -27,6 +29,9 @@ CLIENT_ID = "c0ebe342af7d48fbbbfcf2d2eedb8f9e"
 CLIENT_SECRET = "ad0a908f0aa341a182a37ecd75bc319e"
 QUASAR_API = "https://iot.quasar.yandex.ru/m"
 PERSONAL_STATION_NAME = "Станция Геннадия"
+
+SESSION_REDIS_KEY = "deepseek-alisa:tts-bridge:production:yandex-session:v1"
+SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
 
 _guard = threading.RLock()
 _state: dict[str, Any] = {
@@ -61,6 +66,193 @@ def response_json(response: requests.Response, label: str):
         raise RuntimeError(f"{label}: HTTP {response.status_code}: {message}")
 
     return data
+
+
+def get_session_cipher() -> Fernet:
+    """Build the Fernet cipher from the private Render environment variable."""
+    encryption_key = os.getenv("TTS_SESSION_ENCRYPTION_KEY", "").strip()
+    if not encryption_key:
+        raise RuntimeError("Ключ шифрования не настроен")
+    try:
+        return Fernet(encryption_key.encode("ascii"))
+    except (ValueError, UnicodeError):
+        raise RuntimeError("Ключ шифрования имеет неверный формат")
+
+
+def redis_session_command(command: list[Any]) -> Any:
+    """Execute one Upstash REST command without exposing credentials or payloads."""
+    redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+    redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+    if not redis_url or not redis_token:
+        raise RuntimeError("Upstash Redis не настроен")
+
+    response = requests.post(
+        redis_url,
+        json=command,
+        headers={"Authorization": f"Bearer {redis_token}"},
+        timeout=(5, 10),
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Upstash Redis вернул HTTP {response.status_code}")
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("Upstash Redis вернул некорректный ответ")
+
+    if not isinstance(data, dict) or "error" in data or "result" not in data:
+        raise RuntimeError("Команда Upstash Redis завершилась ошибкой")
+    return data["result"]
+
+
+def save_yandex_session(session: requests.Session) -> None:
+    """Encrypt and persist only the Yandex cookies needed to rebuild the session."""
+    cookies = []
+    for cookie in session.cookies:
+        cookies.append({
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": cookie.domain,
+            "path": cookie.path,
+            "secure": bool(cookie.secure),
+            "expires": cookie.expires,
+            "rest": dict(cookie._rest or {}),
+            "discard": bool(cookie.discard),
+            "version": int(cookie.version or 0),
+        })
+
+    if not cookies:
+        raise RuntimeError("В сессии Яндекса нет cookies для сохранения")
+
+    payload = json.dumps(
+        {"version": 1, "cookies": cookies},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encrypted_payload = get_session_cipher().encrypt(payload).decode("ascii")
+
+    result = redis_session_command([
+        "SET",
+        SESSION_REDIS_KEY,
+        encrypted_payload,
+        "EX",
+        SESSION_TTL_SECONDS,
+    ])
+    if result != "OK":
+        raise RuntimeError("Upstash Redis не подтвердил сохранение сессии")
+
+
+def load_yandex_session_cookies() -> list[dict[str, Any]] | None:
+    """Read and decrypt the saved cookie bundle; never log its contents."""
+    encrypted_payload = redis_session_command(["GET", SESSION_REDIS_KEY])
+    if encrypted_payload is None:
+        return None
+    if not isinstance(encrypted_payload, str):
+        raise RuntimeError("Сохранённая сессия имеет неожиданный формат")
+
+    try:
+        payload = get_session_cipher().decrypt(encrypted_payload.encode("ascii"))
+        data = json.loads(payload.decode("utf-8"))
+    except (InvalidToken, ValueError, UnicodeError, json.JSONDecodeError):
+        raise RuntimeError("Не удалось расшифровать сохранённую сессию")
+
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != 1
+        or not isinstance(data.get("cookies"), list)
+        or not data["cookies"]
+    ):
+        raise RuntimeError("Сохранённая сессия имеет неподдерживаемый формат")
+    return data["cookies"]
+
+
+def restore_yandex_session() -> bool:
+    """Restore cookies, then validate the Yandex account and exact personal station."""
+    saved_cookies = load_yandex_session_cookies()
+    if saved_cookies is None:
+        log.info("Сохранённая сессия Яндекса в Redis не найдена")
+        return False
+
+    quasar = requests.Session()
+    quasar.headers.update({"User-Agent": USER_AGENT})
+
+    for item in saved_cookies:
+        if not isinstance(item, dict):
+            raise RuntimeError("Сохранённые cookies имеют неожиданный формат")
+        name = item.get("name")
+        value = item.get("value")
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise RuntimeError("Сохранённые cookies имеют неожиданный формат")
+
+        quasar.cookies.set(
+            name,
+            value,
+            domain=item.get("domain") or "",
+            path=item.get("path") or "/",
+            secure=bool(item.get("secure", False)),
+            expires=item.get("expires"),
+            rest=item.get("rest") if isinstance(item.get("rest"), dict) else {},
+            discard=bool(item.get("discard", False)),
+            version=int(item.get("version", 0)),
+        )
+
+    # A fresh CSRF token is obtained from Yandex; it is not stored in Redis.
+    iot_page = quasar.get("https://yandex.ru/iot", timeout=20)
+    iot_page.raise_for_status()
+    csrf_match = re.search(r'"csrfToken2"\s*:\s*"([^"]+)"', iot_page.text)
+    if not csrf_match:
+        raise RuntimeError("Сохранённая авторизация Яндекса больше не действует")
+
+    csrf_token = csrf_match.group(1)
+    quasar.headers.update({"x-csrf-token": csrf_token})
+
+    devices_data = response_json(
+        quasar.get(f"{QUASAR_API}/v3/user/devices", timeout=20),
+        "Проверка сохранённой авторизации",
+    )
+    households = devices_data.get("households", [])
+    if not isinstance(households, list):
+        raise RuntimeError("Яндекс вернул households в неожиданном формате")
+
+    expected_name = " ".join(PERSONAL_STATION_NAME.split()).casefold()
+    personal_speakers = []
+    for household in households:
+        if not isinstance(household, dict):
+            continue
+        household_devices = household.get("all", [])
+        if not isinstance(household_devices, list):
+            continue
+        for device in household_devices:
+            if not isinstance(device, dict):
+                continue
+            normalized_name = " ".join(
+                str(device.get("name") or "").split()
+            ).casefold()
+            if normalized_name != expected_name:
+                continue
+            if not device.get("id") or not device.get("capabilities") or not device.get("quasar_info"):
+                raise RuntimeError("Данные личной станции неполные")
+            personal_speakers.append(device)
+
+    if len(personal_speakers) != 1:
+        raise RuntimeError(
+            "Не удалось однозначно определить личную станцию "
+            f"«{PERSONAL_STATION_NAME}». Найдено: {len(personal_speakers)}"
+        )
+
+    with _guard:
+        _state.update(
+            status="ready",
+            message="Сохранённая авторизация Яндекса восстановлена. Можно пользоваться мостом.",
+            link=None,
+            session=quasar,
+            csrf=csrf_token,
+            devices=personal_speakers,
+            error=None,
+        )
+
+    log.info("Сохранённая авторизация Яндекса успешно восстановлена")
+    return True
 
 
 def yandex_login():
@@ -211,6 +403,11 @@ def yandex_login():
             cookie.value,
             domain=cookie.domain,
             path=cookie.path,
+            secure=cookie.secure,
+            expires=cookie.expires,
+            rest=dict(cookie._rest or {}),
+            discard=cookie.discard,
+            version=cookie.version,
         )
 
     finish = quasar.get(
@@ -334,6 +531,18 @@ def yandex_login():
             devices=personal_speakers,
             error=None,
         )
+
+    # Persistence is best-effort: a Redis outage must not undo a working login.
+    try:
+        save_yandex_session(quasar)
+        log.info("Зашифрованная сессия Яндекса сохранена в Redis")
+    except Exception as exc:
+        log.warning(
+            "Не удалось сохранить сессию Яндекса в Redis: %s",
+            type(exc).__name__,
+        )
+
+
 def login_worker():
     try:
         yandex_login()
@@ -349,6 +558,28 @@ def login_worker():
                 devices=[],
                 error=f"{type(exc).__name__}: {exc}",
             )
+
+
+@app.on_event("startup")
+def restore_saved_session_on_startup():
+    """Try to restore the saved Yandex session before the service accepts requests."""
+    try:
+        restore_yandex_session()
+    except Exception as exc:
+        with _guard:
+            _state.update(
+                status="idle",
+                message="Не удалось восстановить авторизацию. При необходимости подключи Яндекс заново.",
+                link=None,
+                session=None,
+                csrf=None,
+                devices=[],
+                error=None,
+            )
+        log.warning(
+            "Восстановление сессии Яндекса не выполнено: %s",
+            type(exc).__name__,
+        )
 
 
 @app.get("/health")
@@ -603,6 +834,8 @@ def bridge_stop(x_bridge_secret: str = Header(default="")):
     except Exception as exc:
         log.exception("Ошибка остановки воспроизведения")
         raise HTTPException(502, f"Ошибка остановки: {type(exc).__name__}")
+
+
 
 
 HTML_PAGE = r"""
