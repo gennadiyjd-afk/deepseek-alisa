@@ -605,6 +605,56 @@ def bridge_stop(x_bridge_secret: str = Header(default="")):
         raise HTTPException(502, f"Ошибка остановки: {type(exc).__name__}")
 
 
+@app.get("/api/redis/ping")
+def redis_ping(_: bool = Depends(require_password)):
+    """Check Upstash connectivity without reading or changing Redis data."""
+    redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+    redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+
+    if not redis_url or not redis_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Переменные Upstash Redis не настроены на Render",
+        )
+
+    try:
+        response = requests.get(
+            f"{redis_url}/ping",
+            headers={"Authorization": f"Bearer {redis_token}"},
+            timeout=(5, 10),
+        )
+        if response.status_code != 200:
+            log.warning("Upstash Redis PING returned HTTP %s", response.status_code)
+            raise HTTPException(
+                status_code=502,
+                detail="Upstash Redis не подтвердил соединение",
+            )
+
+        data = response.json()
+        if isinstance(data, dict) and data.get("result") == "PONG":
+            return {"ok": True, "status": "connected"}
+
+        log.warning("Upstash Redis PING returned an unexpected response")
+        raise HTTPException(
+            status_code=502,
+            detail="Upstash Redis вернул неожиданный ответ",
+        )
+    except HTTPException:
+        raise
+    except requests.RequestException as exc:
+        log.warning("Upstash Redis PING request failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось связаться с Upstash Redis",
+        )
+    except ValueError:
+        log.warning("Upstash Redis PING response was not valid JSON")
+        raise HTTPException(
+            status_code=502,
+            detail="Upstash Redis вернул некорректный ответ",
+        )
+
+
 HTML_PAGE = r"""
 <!doctype html>
 <html lang="ru">
