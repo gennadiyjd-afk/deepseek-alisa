@@ -1,4 +1,4 @@
 fastapi
 uvicorn
 requests
-requirements
+yandex-ai-studio-sdk
