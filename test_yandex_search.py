@@ -18,7 +18,7 @@ def main():
             auth=API_KEY,
         )
 
-        search = sdk.search_api.web("SEARCsearch = sdk.search_api.web("SEARCH_TYPE_RU").configure(
+        search = sdk.search_api.web("SEARCH_TYPE_RU").configure(
             family_mode="FAMILY_MODE_MODERATE",
             fix_typo_mode="FIX_TYPO_MODE_ON",
             sort_mode="SORT_MODE_BY_RELEVANCE",
