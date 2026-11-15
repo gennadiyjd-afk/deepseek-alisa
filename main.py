@@ -2340,7 +2340,7 @@ async def startup_restore_redis_state():
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
-async def health():
+def health():
     return {"status": "ok", "redis_configured": REDIS_AVAILABLE}
 
 
