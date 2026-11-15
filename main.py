@@ -46,296 +46,6 @@ REDIS_STATE_LOCK = threading.Lock()
 REDIS_AVAILABLE = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
 
 
-# Необязательный мост к личной Яндекс Станции.
-# Для запуска навыка используется Quasar text_action, а не phrase_action.
-TTS_BRIDGE_URL = os.getenv("TTS_BRIDGE_URL", "").rstrip("/")
-TTS_BRIDGE_SECRET = os.getenv("TTS_BRIDGE_SECRET", "")
-AUTO_WAIT_COMMAND = "Алиса, я жду"
-AUTO_WAIT_INITIAL_DELAY = 5
-AUTO_WAIT_REPEAT_INTERVAL = 10
-AUTO_WAIT_COMMAND_COOLDOWN = 15
-
-
-def wake_tts_bridge_on_skill_launch():
-    """Пробуждает TTS-мост в фоне и повторяет запрос, пока Render запускается."""
-    if not TTS_BRIDGE_URL:
-        logger.info("TTS bridge wake skipped: bridge URL is not configured")
-        return
-
-    def run():
-        deadline = time.monotonic() + 90
-        attempt = 0
-        while time.monotonic() < deadline:
-            attempt += 1
-            try:
-                response = requests.get(
-                    f"{TTS_BRIDGE_URL}/health",
-                    timeout=(5, 10),
-                )
-                if response.status_code == 200:
-                    logger.info(
-                        "TTS bridge wake completed: HTTP 200 on attempt %s",
-                        attempt,
-                    )
-                    return
-                logger.warning(
-                    "TTS bridge is not ready yet: HTTP %s on attempt %s",
-                    response.status_code,
-                    attempt,
-                )
-                # Повторяем только временные ошибки запуска/шлюза.
-                if response.status_code not in (408, 425, 429) and response.status_code < 500:
-                    return
-            except requests.RequestException as exc:
-                logger.warning(
-                    "TTS bridge wake attempt %s failed: %s",
-                    attempt,
-                    exc,
-                )
-
-            remaining = deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(min(5, remaining))
-
-        logger.error(
-            "TTS bridge did not become ready within 90 seconds (%s attempts)",
-            attempt,
-        )
-
-    threading.Thread(
-        target=run,
-        daemon=True,
-        name="tts-bridge-wake-on-launch",
-    ).start()
-
-
-def send_bridge_wait_command(job_key, job_id):
-    """Передаёт станции команду навыку и не произносит её как обычную фразу."""
-    if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
-        logger.warning("Automatic wait command skipped: TTS bridge is not configured")
-        return False
-
-    now = time.time()
-    with jobs_lock:
-        current = search_jobs.get(job_key)
-        if (
-            not current
-            or current.get("job_id") != job_id
-            or not current.get("auto_delivery")
-            or current.get("status") not in ("pending", "ready")
-        ):
-            return False
-
-        # Если первый фрагмент уже выдан, повторная автоматическая команда
-        # не должна случайно запросить следующий фрагмент ответа.
-        if current.get("status") == "ready" and int(current.get("part_index", 0)) > 0:
-            return False
-
-        last_sent = float(current.get("auto_wait_last_sent_at", 0) or 0)
-        if now - last_sent < AUTO_WAIT_COMMAND_COOLDOWN:
-            return False
-
-        current["auto_wait_last_sent_at"] = now
-        persist_job_maps()
-
-    try:
-        response = requests.post(
-            f"{TTS_BRIDGE_URL}/api/bridge/command",
-            headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
-            json={"text": AUTO_WAIT_COMMAND},
-            timeout=25,
-        )
-        response.raise_for_status()
-        logger.info("Automatic text_action command sent for job %s", job_id[:8])
-        return True
-    except Exception:
-        logger.exception("Could not send automatic text_action wait command")
-        with jobs_lock:
-            current = search_jobs.get(job_key)
-            if current and current.get("job_id") == job_id:
-                if current.get("auto_wait_last_sent_at") == now:
-                    current["auto_wait_last_sent_at"] = 0
-                    persist_job_maps()
-        return False
-
-
-def monitor_delayed_job(job_key, job_id):
-    """Через 12 секунд запускает проверку навыка и повторяет её, пока задача активна."""
-    def run():
-        time.sleep(AUTO_WAIT_INITIAL_DELAY)
-        while True:
-            with jobs_lock:
-                current = search_jobs.get(job_key)
-                if (
-                    not current
-                    or current.get("job_id") != job_id
-                    or not current.get("auto_delivery")
-                ):
-                    return
-                status = current.get("status")
-                part_index = int(current.get("part_index", 0))
-
-            if status == "ready":
-                if part_index == 0:
-                    send_bridge_wait_command(job_key, job_id)
-                return
-            if status != "pending":
-                return
-
-            send_bridge_wait_command(job_key, job_id)
-            time.sleep(AUTO_WAIT_REPEAT_INTERVAL)
-
-    threading.Thread(
-        target=run,
-        daemon=True,
-        name=f"auto-wait-{job_id[:8]}",
-    ).start()
-
-
-def auto_deliver_ready_job(job_key, job_id):
-    """Когда фоновый ответ готов, вызывает навык через text_action."""
-    with jobs_lock:
-        current = search_jobs.get(job_key)
-        if (
-            not current
-            or current.get("job_id") != job_id
-            or current.get("auto_delivery_thread_started")
-        ):
-            return
-        current["auto_delivery_thread_started"] = True
-        persist_job_maps()
-
-    def run():
-        # Не отправляем команду раньше чем через 12 секунд после начального ответа.
-        with jobs_lock:
-            current = search_jobs.get(job_key)
-            if not current or current.get("job_id") != job_id:
-                return
-            started_at = float(current.get("auto_wait_started_at", time.time()) or time.time())
-        first_command_at = started_at + AUTO_WAIT_INITIAL_DELAY
-        time.sleep(max(0, first_command_at - time.time()))
-
-        # Если в это время уже была отправлена команда ожидания, ждём окончания
-        # короткого интервала защиты от повторного запроса следующей части.
-        for attempt in range(6):
-            with jobs_lock:
-                current = search_jobs.get(job_key)
-                if (
-                    not current
-                    or current.get("job_id") != job_id
-                    or not current.get("auto_delivery")
-                    or current.get("status") != "ready"
-                    or int(current.get("part_index", 0)) > 0
-                ):
-                    return
-            if send_bridge_wait_command(job_key, job_id):
-                return
-            time.sleep(5)
-
-    threading.Thread(
-        target=run,
-        daemon=True,
-        name=f"auto-deliver-{job_id[:8]}",
-    ).start()
-
-
-
-def send_bridge_continue_command(job_key, job_id):
-    """Просит активный навык выдать следующую часть готового ответа."""
-    if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
-        logger.warning("Automatic continuation skipped: TTS bridge is not configured")
-        return False
-    with jobs_lock:
-        current = search_jobs.get(job_key)
-        if (
-            not current
-            or current.get("job_id") != job_id
-            or current.get("status") != "ready"
-            or current.get("auto_reading_paused")
-            or not current.get("auto_reading")
-        ):
-            return False
-    try:
-        response = requests.post(
-            f"{TTS_BRIDGE_URL}/api/bridge/command",
-            headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
-            json={"text": "Алиса, продолжи"},
-            timeout=25,
-        )
-        response.raise_for_status()
-        logger.info("Automatic continuation command sent for job %s", job_id[:8])
-        return True
-    except Exception:
-        logger.exception("Could not send automatic continuation command")
-        return False
-
-
-def schedule_auto_next_part(job_key, job_id, part_text):
-    """Ждёт примерную длительность озвучивания части и запрашивает следующую."""
-    # Яндекс не сообщает webhook точный момент окончания воспроизведения.
-    # Поэтому ждём консервативную оценку длительности, а не отправляем команды подряд.
-    estimated_seconds = max(4.0, len(str(part_text or "")) / 20.0 + 2.5)
-
-    def run():
-        time.sleep(estimated_seconds)
-        with jobs_lock:
-            current = search_jobs.get(job_key)
-            if (
-                not current
-                or current.get("job_id") != job_id
-                or current.get("status") != "ready"
-                or current.get("auto_reading_paused")
-                or not current.get("auto_reading")
-                or current.get("auto_next_thread_started")
-            ):
-                return
-            current["auto_next_thread_started"] = True
-            persist_job_maps()
-        try:
-            send_bridge_continue_command(job_key, job_id)
-        finally:
-            with jobs_lock:
-                current = search_jobs.get(job_key)
-                if current and current.get("job_id") == job_id:
-                    current["auto_next_thread_started"] = False
-                    persist_job_maps()
-
-    threading.Thread(
-        target=run, daemon=True, name=f"auto-next-{job_id[:8]}"
-    ).start()
-
-
-def schedule_final_part_cleanup(job_key, job_id, part_text):
-    """Удаляет задачу только после предполагаемого окончания последней части."""
-    delay = max(4.0, len(str(part_text or "")) / 12.0 + 2.5)
-
-    def run():
-        time.sleep(delay)
-        with jobs_lock:
-            current = search_jobs.get(job_key)
-            if (
-                not current
-                or current.get("job_id") != job_id
-                or not current.get("last_part_playing")
-                or current.get("auto_reading_paused")
-            ):
-                return
-            original_text = current.get("user_text", "")
-            original_history = current.get("history", [])
-            complete_answer = current.get("answer", "")
-            search_jobs.pop(job_key, None)
-            history = original_history[-3:] + [
-                {"role": "user", "content": original_text[:400]},
-                {"role": "assistant", "content": complete_answer[:400]},
-            ]
-            persist_job_maps()
-            current["completed_history"] = history
-
-    threading.Thread(
-        target=run, daemon=True, name=f"auto-finalize-{job_id[:8]}"
-    ).start()
-
-
 def redis_command(command):
     """Executes one Upstash Redis REST command; never logs credentials."""
     if not REDIS_AVAILABLE:
@@ -551,12 +261,14 @@ def pending_job_notice(job):
         persist_job_maps()
         return "Секундочку"
 
+    if job.get("kind") == "search":
+        return "Поиск ещё продолжается."
     return "Ответ ещё готовится."
 
 
 def is_continue_command(text):
     """Распознаёт короткое подтверждение продолжения текущей темы."""
-    command = " ".join(normalize_command(text).replace(",", " ").split())
+    command = normalize_command(text)
     if command in ("да", "продолжай", "продолжи", "продолжить"):
         return True
     return bool(re.match(r"^(?:алиса\s+)?(?:продолжи|продолжай|продолжить)\b", command))
@@ -703,21 +415,20 @@ def is_short_ambiguous_interruption(text):
     return len(command) <= 24 and len(command.split()) <= 2
 
 
-def is_pause_command(text):
-    """Распознаёт команды временной паузы голосового ответа."""
-    command = " ".join(normalize_command(text).replace(",", " ").split())
-    command = re.sub(r"^(?:алиса)\s+", "", command).strip()
-    return command in (
-        "стоп", "пауза", "остановись", "приостанови", "приостановить",
-        "останови ответ", "поставь на паузу", "пауза пожалуйста",
-    )
-
-
 def is_stop_command(text):
-    """Распознаёт окончательный отказ от ответа, не смешивая его с паузой."""
+    """Команды отказа от продолжения текущего многочастного ответа."""
     command = normalize_command(text)
     command = re.sub(r"^(?:алиса)\s+", "", command).strip()
-    return command in ("нет", "не надо", "не нужно", "хватит", "не продолжай", "не продолжать")
+    return command in (
+        "нет",
+        "не надо",
+        "не нужно",
+        "хватит",
+        "стоп",
+        "остановись",
+        "не продолжай",
+        "не продолжать",
+    )
 
 
 def get_social_reply(text):
@@ -883,11 +594,7 @@ def prepare_job_parts(job, answer):
 
 
 def deliver_job_part(body, job_key, job):
-    """Выдаёт часть ответа и автоматически планирует чтение следующей."""
-    schedule_next = False
-    schedule_final = False
-    part_text = ""
-    final_history = None
+    """Возвращает очередную часть и сохраняет задачу до последней части."""
     with jobs_lock:
         current = search_jobs.get(job_key)
         if not current or current.get("job_id") != job.get("job_id"):
@@ -905,37 +612,23 @@ def deliver_job_part(body, job_key, job):
 
         answer = parts[index]
         is_last = index == len(parts) - 1
-        # Вежливо завершаем только длинный ответ, состоящий из нескольких частей.
-        if is_last and len(parts) > 1:
-            answer = answer.rstrip() + " Геннадий, чем ещё могу тебе помочь?"
-        part_text = answer
-        current["part_index"] = index + 1
-        current["auto_reading"] = not is_last
-        current["auto_reading_paused"] = False
-        current["auto_next_thread_started"] = False
-
-        if is_last:
-            current["last_part_playing"] = True
+        if not is_last:
+            answer += " Продолжить?"
+            current["part_index"] = index + 1
+            persist_job_maps()
+        else:
             original_text = current.get("user_text", "")
             original_history = current.get("history", [])
             complete_answer = current.get("answer", "")
-            final_history = original_history[-3:] + [
+            new_history = original_history[-3:] + [
                 {"role": "user", "content": original_text[:400]},
                 {"role": "assistant", "content": complete_answer[:400]},
             ]
+            search_jobs.pop(job_key, None)
             persist_job_maps()
-            schedule_final = True
-        else:
-            current["last_part_playing"] = False
-            persist_job_maps()
-            schedule_next = True
+            return make_response(body, answer, new_history)
 
-    response = make_response(body, answer, final_history) if final_history is not None else make_response(body, answer)
-    if schedule_next:
-        schedule_auto_next_part(job_key, job.get("job_id"), part_text)
-    if schedule_final:
-        schedule_final_part_cleanup(job_key, job.get("job_id"), part_text)
-    return response
+    return make_response(body, answer)
 
 def is_stock_quote_request(text):
     """Распознаёт запросы о биржевых ценах акций."""
@@ -2027,31 +1720,23 @@ def is_complex_question(text):
 
 
 def save_job_result(session_id, job_id, result):
-    """Записывает результат и автоматически вызывает навык, если ожидание уже объявлено."""
-    should_auto_deliver = False
+    """Записывает результат активной или временно прерванной задачи."""
     with jobs_lock:
         current = search_jobs.get(session_id)
         if current and current.get("job_id") == job_id:
             current.update(result)
-            should_auto_deliver = (
-                result.get("status") == "ready"
-                and bool(current.get("auto_delivery"))
-            )
             persist_job_maps()
-        else:
-            interrupted = interrupted_list(session_id)
-            for saved_job in interrupted:
-                if saved_job.get("job_id") == job_id:
-                    saved_job.update(result)
-                    persist_job_maps()
-                    logger.info("Background result saved for an interrupted conversation")
-                    return
-            logger.info("Discarded result of an outdated task")
             return
 
-    if should_auto_deliver:
-        auto_deliver_ready_job(session_id, job_id)
+        interrupted = interrupted_list(session_id)
+        for saved_job in interrupted:
+            if saved_job.get("job_id") == job_id:
+                saved_job.update(result)
+                persist_job_maps()
+                logger.info("Background result saved for an interrupted conversation")
+                return
 
+        logger.info("Discarded result of an outdated task")
 
 def ask_ai(messages, timeout=25, max_tokens=1000):
     """Запрашивает ответ у RouterAPI с одной повторной попыткой при сбое."""
@@ -2664,10 +2349,8 @@ async def main(body: dict):
     request_data = body.get("request", {})
     user_text = str(request_data.get("original_utterance") or "").strip()
 
-    # При запуске навыка будим TTS-мост в фоне, пока Алиса произносит приветствие.
-    # Сам запрос не обращается к колонке и не задерживает ответ навыка.
+    # Пустой запуск навыка только приветствует и не затрагивает фоновые задачи.
     if not user_text:
-        wake_tts_bridge_on_skill_launch()
         return make_response(
             body,
             "Привет! Я твой интеллектуальный помощник DeepSeek Алиса. Чем могу помочь?",
@@ -2773,23 +2456,8 @@ async def main(body: dict):
                     persist_job_maps()
             return make_response(body, "Не удалось получить ответ. Попробуй повторить запрос.")
 
-    # Пауза сохраняет готовый ответ и текущую часть для повторного чтения.
-    if job and job.get("status") == "ready" and is_pause_command(user_text):
-        with jobs_lock:
-            current = search_jobs.get(job_key)
-            if current and current.get("job_id") == job.get("job_id"):
-                parts = current.get("parts") or []
-                index = int(current.get("part_index", 0))
-                if parts and index > 0 and index <= len(parts):
-                    # Индекс уже указывает на следующую часть; возвращаемся к прерванной.
-                    current["part_index"] = index - 1
-                current["last_part_playing"] = False
-                current["auto_reading"] = False
-                current["auto_reading_paused"] = True
-                persist_job_maps()
-        return make_response(body, "Хорошо, поставила на паузу. Скажи «Продолжить», когда будешь готов.")
-
-    # Окончательный отказ удаляет ответ; пауза выше его сохраняет.
+    # Отказ относится только к активному многочастному ответу.
+    # Удаление задачи также не позволит позднему фоновому результату её восстановить.
     if (job or interrupted) and is_stop_command(user_text):
         with jobs_lock:
             current = search_jobs.get(job_key)
@@ -2832,16 +2500,10 @@ async def main(body: dict):
                     logger.info("Conversation task paused and saved before topic switch")
             job = None
 
-    # Готовый ответ выдаём по команде ожидания, а после паузы — по команде продолжения.
+    # Готовый ответ выдаём по команде «Алиса, я жду» / «Я жду» или по имени «Алиса», а следующие части —
+    # по командам «Да», «Продолжи» или «Продолжай».
     if job and job.get("status") == "ready":
         if retrieval_command:
-            if continue_command or repair_continue_command:
-                with jobs_lock:
-                    current = search_jobs.get(job_key)
-                    if current and current.get("job_id") == job.get("job_id"):
-                        current["auto_reading_paused"] = False
-                        current["auto_reading"] = True
-                        persist_job_maps()
             return deliver_job_part(body, job_key, job)
 
         # Короткая посторонняя реплика может быть ошибкой ввода/распознавания.
@@ -2891,11 +2553,7 @@ async def main(body: dict):
                 "job_id": job_id,
                 "kind": "search",
                 "status": "pending",
-                "pending_notice_sent": True,
-                "auto_delivery": True,
-                "auto_reading": True,
-                "auto_wait_started_at": time.time(),
-                "auto_wait_last_sent_at": 0,
+                "pending_notice_sent": False,
                 "answer": "",
                 "parts": [],
                 "part_index": 0,
@@ -2912,7 +2570,6 @@ async def main(body: dict):
             user_text,
             history[-4:],
         )
-        monitor_delayed_job(job_key, job_id)
         logger.info("Search task submitted; returning immediately to Alice")
         return make_response(body, "Сейчас посмотрю.")
 
@@ -2960,7 +2617,6 @@ async def main(body: dict):
                 if current and current.get("job_id") == job_id:
                     current["status"] = "ready"
                     prepare_job_parts(current, answer)
-                    current["auto_reading"] = True
                     persist_job_maps()
                     current_job = dict(current)
                 else:
@@ -2992,20 +2648,8 @@ async def main(body: dict):
             current = search_jobs.get(job_key)
             if current and current.get("job_id") == job_id:
                 current["pending_notice_sent"] = True
-                current["auto_delivery"] = True
-                current["auto_reading"] = True
-                current["auto_wait_started_at"] = time.time()
-                current["auto_wait_last_sent_at"] = 0
-                result_already_ready = current.get("status") == "ready"
-                persist_job_maps()
-            else:
-                result_already_ready = False
-
-        monitor_delayed_job(job_key, job_id)
-        if result_already_ready:
-            auto_deliver_ready_job(job_key, job_id)
         logger.info(
-            "Chat is still running after %.2f seconds; returning control to Alice",
+            "Chat is still running after %.2f seconds; returning control to Marusya",
             wait_timeout,
         )
         return make_response(body, "Секундочку")
