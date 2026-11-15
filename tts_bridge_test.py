@@ -582,7 +582,7 @@ def restore_saved_session_on_startup():
         )
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     """Safe health check: does not access Yandex or send commands to the speaker."""
     return {"status": "ok"}
