@@ -274,7 +274,7 @@ def schedule_auto_next_part(job_key, job_id, part_text):
     """Ждёт примерную длительность озвучивания части и запрашивает следующую."""
     # Яндекс не сообщает webhook точный момент окончания воспроизведения.
     # Поэтому ждём консервативную оценку длительности, а не отправляем команды подряд.
-    estimated_seconds = max(4.0, len(str(part_text or "")) / 17.0 + 2.5)
+    estimated_seconds = max(4.0, len(str(part_text or "")) / 17.0 + 2.0)
 
     def run():
         time.sleep(estimated_seconds)
