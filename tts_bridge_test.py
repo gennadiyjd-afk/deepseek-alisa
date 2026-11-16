@@ -582,7 +582,7 @@ def restore_saved_session_on_startup():
         )
 
 
-@app.api_route("/health", methods=["GET", "HEAD"])
+@app.get("/health")
 def health():
     """Safe health check: does not access Yandex or send commands to the speaker."""
     return {"status": "ok"}
@@ -776,8 +776,8 @@ def command(
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "Введи текст команды")
-    if len(text) > 120:
-        raise HTTPException(400, "Максимальная длина команды — 120 символов")
+    if len(text) > 500:
+        raise HTTPException(400, "Максимальная длина команды — 500 символов")
     return send_voice_command(text)
 
 
@@ -795,8 +795,8 @@ def bridge_command(
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "Пустой текст команды")
-    if len(text) > 120:
-        raise HTTPException(400, "Максимальная длина команды — 120 символов")
+    if len(text) > 500:
+        raise HTTPException(400, "Максимальная длина команды — 500 символов")
     return send_voice_command(text)
 
 
@@ -876,8 +876,8 @@ a { overflow-wrap: anywhere; }
 <label for="phrase">Текст для произнесения:</label>
 <textarea id="phrase" rows="4" maxlength="500" placeholder="Напиши фразу, которую должна произнести колонка" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
 <button id="say" hidden>Произнести текст</button>
-<label for="commandText">Текстовая команда Алисе (до 120 символов):</label>
-<textarea id="commandText" rows="3" maxlength="120" placeholder="Например: Алиса, я жду" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
+<label for="commandText">Текстовая команда Алисе (до 500 символов):</label>
+<textarea id="commandText" rows="3" maxlength="500" placeholder="Например: Алиса, я жду" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
 <button id="commandButton" hidden>Отправить текстовую команду</button>
 
 <script>
