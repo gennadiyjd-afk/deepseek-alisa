@@ -802,8 +802,8 @@ def is_joke_request(text):
     ))
 
 
-def split_answer_into_parts(answer, chunk_size=300):
-    """Делит длинный ответ на законченные голосовые фрагменты."""
+def split_answer_into_parts(answer, chunk_size=750):
+    """Делит ответ по концам предложений, ориентируясь на 750 символов."""
     text = str(answer or "").strip()
     text = re.sub(r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$", "", text, flags=re.IGNORECASE)
     if not text:
@@ -811,7 +811,7 @@ def split_answer_into_parts(answer, chunk_size=300):
     if len(text) <= 380:
         return [text]
 
-    # Сначала делим по предложениям, сохраняя знаки конца предложения.
+    # Выделяем предложения вместе со знаками конца предложения.
     sentences = re.findall(r".*?(?:[.!?…](?=\s|$)|$)", text, flags=re.DOTALL)
     sentences = [part.strip() for part in sentences if part and part.strip()]
     if not sentences:
@@ -820,52 +820,18 @@ def split_answer_into_parts(answer, chunk_size=300):
     parts = []
     current = ""
 
-    def add_long_sentence(sentence):
-        words = sentence.split()
-        piece = ""
-        for word in words:
-            candidate = (piece + " " + word).strip()
-            if len(candidate) > chunk_size and piece:
-                parts.append(piece)
-                piece = word
-            else:
-                piece = candidate
-        if piece:
-            parts.append(piece)
-
     for sentence in sentences:
-        if len(sentence) > chunk_size:
-            if current:
-                parts.append(current.strip())
-                current = ""
-            add_long_sentence(sentence)
-            continue
-
         candidate = (current + " " + sentence).strip()
-        if len(candidate) <= chunk_size:
-            current = candidate
+        if len(candidate) >= chunk_size:
+            # Порог 750 может находиться внутри sentence: включаем всё
+            # предложение, на котором пересекли порог, в текущий фрагмент.
+            parts.append(candidate)
+            current = ""
         else:
-            if current:
-                parts.append(current.strip())
-            current = sentence
+            current = candidate
 
     if current:
-        parts.append(current.strip())
-
-    # Если регулярное выражение не смогло корректно выделить предложения,
-    # гарантируем непустые части и разрезаем только по границе слова.
-    if not parts:
-        words = text.split()
-        current = ""
-        for word in words:
-            candidate = (current + " " + word).strip()
-            if len(candidate) > chunk_size and current:
-                parts.append(current)
-                current = word
-            else:
-                current = candidate
-        if current:
-            parts.append(current)
+        parts.append(current)
 
     return parts or [text]
 
