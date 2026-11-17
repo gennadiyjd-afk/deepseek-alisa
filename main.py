@@ -871,9 +871,9 @@ def deliver_job_part(body, job_key, job):
 
         answer = parts[index]
         is_last = index == len(parts) - 1
-        # Вежливо завершаем только длинный ответ, состоящий из нескольких частей.
-        if is_last and len(parts) > 1:
-            answer = answer.rstrip() + " Геннадий, чем ещё могу тебе помочь?"
+        # Одинаково завершаем последнюю часть длинного ответа и короткий ответ.
+        if is_last and not answer.rstrip().endswith("Чем я ещё могу помочь?"):
+            answer = answer.rstrip() + " Чем я ещё могу помочь?"
         part_text = answer
         current["part_index"] = index + 1
         current["auto_reading"] = not is_last
