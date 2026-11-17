@@ -51,7 +51,7 @@ REDIS_AVAILABLE = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
 TTS_BRIDGE_URL = os.getenv("TTS_BRIDGE_URL", "").rstrip("/")
 TTS_BRIDGE_SECRET = os.getenv("TTS_BRIDGE_SECRET", "")
 AUTO_WAIT_COMMAND = "Алиса, я жду"
-AUTO_WAIT_INITIAL_DELAY = 5
+AUTO_WAIT_INITIAL_DELAY = 7
 AUTO_WAIT_REPEAT_INTERVAL = 10
 AUTO_WAIT_COMMAND_COOLDOWN = 15
 
@@ -160,7 +160,7 @@ def send_bridge_wait_command(job_key, job_id):
 
 
 def monitor_delayed_job(job_key, job_id):
-    """Через 12 секунд запускает проверку навыка и повторяет её, пока задача активна."""
+    """Через 7 секунд запускает проверку навыка и повторяет её, пока задача активна."""
     def run():
         time.sleep(AUTO_WAIT_INITIAL_DELAY)
         while True:
@@ -206,7 +206,7 @@ def auto_deliver_ready_job(job_key, job_id):
         persist_job_maps()
 
     def run():
-        # Не отправляем команду раньше чем через 12 секунд после начального ответа.
+        # Не отправляем команду раньше чем через 7 секунд после начального ответа.
         with jobs_lock:
             current = search_jobs.get(job_key)
             if not current or current.get("job_id") != job_id:
@@ -802,8 +802,8 @@ def is_joke_request(text):
     ))
 
 
-def split_answer_into_parts(answer, chunk_size=500):
-    """Делит ответ по концам предложений, ориентируясь на 500 символов."""
+def split_answer_into_parts(answer, chunk_size=450):
+    """Делит ответ по концам предложений, ориентируясь на 450 символов."""
     text = str(answer or "").strip()
     text = re.sub(r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$", "", text, flags=re.IGNORECASE)
     if not text:
@@ -823,7 +823,7 @@ def split_answer_into_parts(answer, chunk_size=500):
     for sentence in sentences:
         candidate = (current + " " + sentence).strip()
         if len(candidate) >= chunk_size:
-            # Порог 500 может находиться внутри sentence: включаем всё
+            # Порог 450 может находиться внутри sentence: включаем всё
             # предложение, на котором пересекли порог, в текущий фрагмент.
             parts.append(candidate)
             current = ""
