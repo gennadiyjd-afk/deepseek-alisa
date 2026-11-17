@@ -14,6 +14,8 @@ from fastapi import FastAPI
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
+from rutextnorm import normalize_russian
+
 app = FastAPI()
 
 logging.basicConfig(level=logging.INFO)
@@ -803,28 +805,37 @@ def is_joke_request(text):
 
 
 def split_answer_into_parts(answer, chunk_size=450):
-    """Делит ответ по концам предложений, ориентируясь на 450 символов."""
+    """Делит уже нормализованный текст: порог 450 символов + конец предложения."""
     text = str(answer or "").strip()
-    text = re.sub(r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$",
+        "", text, flags=re.IGNORECASE
+    )
     if not text:
         return [""]
-    if len(text) <= 380:
+    if len(text) <= chunk_size:
         return [text]
 
-    # Выделяем предложения вместе со знаками конца предложения.
-    sentences = re.findall(r".*?(?:[.!?…](?=\s|$)|$)", text, flags=re.DOTALL)
-    sentences = [part.strip() for part in sentences if part and part.strip()]
+    # Сначала выделяем законченные предложения, сохраняя знаки препинания.
+    # Точка внутри чисел/сокращений не должна сама по себе завершать фрагмент.
+    sentence_pattern = re.compile(
+        r".*?(?:[.!?…](?=\s|$)|\n+|$)", re.DOTALL
+    )
+    sentences = [
+        item.strip() for item in sentence_pattern.findall(text)
+        if item and item.strip()
+    ]
     if not sentences:
-        sentences = [text]
+        return [text]
 
     parts = []
     current = ""
-
     for sentence in sentences:
-        candidate = (current + " " + sentence).strip()
+        candidate = (current + " " + sentence).strip() if current else sentence
         if len(candidate) >= chunk_size:
-            # Порог 450 может находиться внутри sentence: включаем всё
-            # предложение, на котором пересекли порог, в текущий фрагмент.
+            # 450-й символ может оказаться внутри этого предложения.
+            # Включаем предложение полностью; очень длинное предложение
+            # остаётся одним неделимым фрагментом.
             parts.append(candidate)
             current = ""
         else:
@@ -837,12 +848,22 @@ def split_answer_into_parts(answer, chunk_size=450):
 
 
 def prepare_job_parts(job, answer):
-    """Подготавливает части, если вопрос или сам ответ достаточно объёмный."""
-    answer = str(answer or "").strip()
+    """Хранит оригинал отдельно; нормализует только копию для TTS-фрагментов."""
+    original_answer = str(answer or "")
+    normalized_answer = normalize_russian(original_answer)
     user_text = job.get("user_text", "")
-    should_split = is_complex_question(user_text) or len(answer) > 380
-    parts = split_answer_into_parts(answer) if should_split else [answer]
-    job["answer"] = answer
+    should_split = (
+        is_complex_question(user_text)
+        or len(normalized_answer) > 380
+    )
+    parts = (
+        split_answer_into_parts(normalized_answer, chunk_size=450)
+        if should_split else [normalized_answer]
+    )
+
+    # answer — неизменённый исходный текст DeepSeek для истории/будущего архива.
+    # parts — только нормализованные фрагменты, предназначенные для озвучивания.
+    job["answer"] = original_answer
     job["parts"] = parts
     job["part_index"] = 0
     return parts
