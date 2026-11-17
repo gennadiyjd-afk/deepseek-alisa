@@ -802,8 +802,8 @@ def is_joke_request(text):
     ))
 
 
-def split_answer_into_parts(answer, chunk_size=750):
-    """Делит ответ по концам предложений, ориентируясь на 750 символов."""
+def split_answer_into_parts(answer, chunk_size=500):
+    """Делит ответ по концам предложений, ориентируясь на 500 символов."""
     text = str(answer or "").strip()
     text = re.sub(r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$", "", text, flags=re.IGNORECASE)
     if not text:
@@ -823,7 +823,7 @@ def split_answer_into_parts(answer, chunk_size=750):
     for sentence in sentences:
         candidate = (current + " " + sentence).strip()
         if len(candidate) >= chunk_size:
-            # Порог 750 может находиться внутри sentence: включаем всё
+            # Порог 500 может находиться внутри sentence: включаем всё
             # предложение, на котором пересекли порог, в текущий фрагмент.
             parts.append(candidate)
             current = ""
