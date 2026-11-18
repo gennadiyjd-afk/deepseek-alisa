@@ -804,8 +804,8 @@ def is_joke_request(text):
     ))
 
 
-def split_answer_into_parts(answer, chunk_size=450):
-    """Делит исходный текст: порог 450 символов + конец предложения."""
+def split_answer_into_parts(answer, chunk_size=350):
+    """Делит исходный текст: порог 350 символов + конец предложения."""
     text = str(answer or "").strip()
     text = re.sub(
         r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$",
@@ -859,7 +859,7 @@ def prepare_job_parts(job, answer):
     # Сначала делим ИСХОДНЫЙ текст, чтобы границы и содержание фрагментов
     # не зависели от того, насколько сильно нормализация расширяет текст.
     parts = (
-        split_answer_into_parts(original_answer, chunk_size=450)
+        split_answer_into_parts(original_answer, chunk_size=350)
         if should_split else [original_answer]
     )
 
