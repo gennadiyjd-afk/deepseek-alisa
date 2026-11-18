@@ -75,6 +75,15 @@ def wake_tts_bridge_on_skill_launch():
                     timeout=(5, 10),
                 )
                 if response.status_code == 200:
+                    try:
+                        start_response = requests.post(
+                            f"{TTS_BRIDGE_URL}/api/bridge/session/start",
+                            headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
+                            timeout=8,
+                        )
+                        start_response.raise_for_status()
+                    except Exception:
+                        logger.exception("Could not activate TTS bridge session")
                     logger.info(
                         "TTS bridge wake completed: HTTP 200 on attempt %s",
                         attempt,
@@ -547,7 +556,7 @@ def is_wait_command(text):
 
 
 def pending_job_notice(job):
-    """Не повторяет «Хорошо» при каждом обращении к ещё работающей задаче."""
+    """Не повторяет «Секундочку» при каждом обращении к ещё работающей задаче."""
     if not job.get("pending_notice_sent", False):
         job["pending_notice_sent"] = True
         persist_job_maps()
@@ -705,6 +714,34 @@ def is_short_ambiguous_interruption(text):
     return len(command) <= 24 and len(command.split()) <= 2
 
 
+def is_exit_skill_command(text):
+    """Команды выхода из навыка, которые не должны попадать в DeepSeek."""
+    command = normalize_command(text)
+    command = " ".join(re.sub(r"[^a-zа-я0-9 ]+", " ", command).split())
+    return command in {"хватит", "алиса хватит", "алиса дипсик"}
+
+
+def stop_tts_bridge_on_skill_exit():
+    """Асинхронно блокирует новые bridge-команды и останавливает воспроизведение."""
+    if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
+        return False
+
+    def run():
+        try:
+            response = requests.post(
+                f"{TTS_BRIDGE_URL}/api/bridge/stop",
+                headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
+                timeout=15,
+            )
+            response.raise_for_status()
+            logger.info("TTS bridge cancellation completed on skill exit")
+        except Exception:
+            logger.exception("Could not stop TTS bridge on skill exit")
+
+    threading.Thread(target=run, daemon=True, name="tts-bridge-stop-on-exit").start()
+    return True
+
+
 def is_pause_command(text):
     """Распознаёт команды временной паузы голосового ответа."""
     command = " ".join(normalize_command(text).replace(",", " ").split())
@@ -719,7 +756,7 @@ def is_stop_command(text):
     """Распознаёт окончательный отказ от ответа, не смешивая его с паузой."""
     command = normalize_command(text)
     command = re.sub(r"^(?:алиса)\s+", "", command).strip()
-    return command in ("нет", "не надо", "не нужно", "хватит", "не продолжай", "не продолжать")
+    return command in ("нет", "не надо", "не нужно", "не продолжай", "не продолжать")
 
 
 def get_social_reply(text):
@@ -805,7 +842,7 @@ def is_joke_request(text):
 
 
 def split_answer_into_parts(answer, chunk_size=350):
-    """Делит исходный текст: порог 350 символов + конец предложения."""
+    """Делит исходный текст: порог 450 символов + конец предложения."""
     text = str(answer or "").strip()
     text = re.sub(
         r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$",
@@ -2632,12 +2669,12 @@ def search_and_answer(session_id, job_id, user_text, history):
         return result
 
 
-def make_response(body, answer, history=None):
+def make_response(body, answer, history=None, end_session=False):
     response_data = {
         "version": body["version"],
         "session": body["session"],
         "response": {
-            "end_session": False,
+            "end_session": bool(end_session),
             "text": limit_text(answer),
         },
     }
@@ -2680,6 +2717,20 @@ async def main(body: dict):
     session_id = str(session.get("session_id", "default"))
     user_id = session.get("user", {}).get("user_id")
     job_key = str(user_id or session_id)
+
+    # Выход обрабатываем раньше любых команд продолжения/поиска.
+    if is_exit_skill_command(user_text):
+        with jobs_lock:
+            search_jobs.pop(job_key, None)
+            interrupted_jobs.pop(job_key, None)
+            persist_job_maps()
+        stop_tts_bridge_on_skill_exit()
+        return make_response(
+            body,
+            "Хорошо, выхожу из навыка.",
+            history=[],
+            end_session=True,
+        )
 
     state = body.get("state", {}).get("session", {})
     history = state.get("history", [])
