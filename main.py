@@ -805,7 +805,7 @@ def is_joke_request(text):
 
 
 def split_answer_into_parts(answer, chunk_size=450):
-    """Делит уже нормализованный текст: порог 450 символов + конец предложения."""
+    """Делит исходный текст: порог 450 символов + конец предложения."""
     text = str(answer or "").strip()
     text = re.sub(
         r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$",
@@ -848,23 +848,28 @@ def split_answer_into_parts(answer, chunk_size=450):
 
 
 def prepare_job_parts(job, answer):
-    """Хранит оригинал отдельно; нормализует только копию для TTS-фрагментов."""
-    original_answer = str(answer or "")
-    normalized_answer = normalize_russian(original_answer)
+    """Делит оригинал для озвучивания; нормализованные копии нужны только для расчёта времени."""
+    original_answer = str(answer or "").strip()
     user_text = job.get("user_text", "")
     should_split = (
         is_complex_question(user_text)
-        or len(normalized_answer) > 380
-    )
-    parts = (
-        split_answer_into_parts(normalized_answer, chunk_size=450)
-        if should_split else [normalized_answer]
+        or len(original_answer) > 380
     )
 
-    # answer — неизменённый исходный текст DeepSeek для истории/будущего архива.
-    # parts — только нормализованные фрагменты, предназначенные для озвучивания.
+    # Сначала делим ИСХОДНЫЙ текст, чтобы границы и содержание фрагментов
+    # не зависели от того, насколько сильно нормализация расширяет текст.
+    parts = (
+        split_answer_into_parts(original_answer, chunk_size=450)
+        if should_split else [original_answer]
+    )
+
+    # Отдельная нормализованная копия каждого фрагмента используется только
+    # для оценки длительности. В ответ Алисе она не передаётся.
+    timing_parts = [normalize_russian(part) for part in parts]
+
     job["answer"] = original_answer
     job["parts"] = parts
+    job["timing_parts"] = timing_parts
     job["part_index"] = 0
     return parts
 
@@ -884,6 +889,7 @@ def deliver_job_part(body, job_key, job):
             prepare_job_parts(current, current.get("answer", ""))
 
         parts = current.get("parts") or [current.get("answer", "")]
+        timing_parts = current.get("timing_parts") or []
         index = int(current.get("part_index", 0))
         if index >= len(parts):
             search_jobs.pop(job_key, None)
@@ -895,7 +901,17 @@ def deliver_job_part(body, job_key, job):
         # Одинаково завершаем последнюю часть длинного ответа и короткий ответ.
         if is_last and not answer.rstrip().endswith("Чем я ещё могу помочь?"):
             answer = answer.rstrip() + " Чем я ещё могу помочь?"
-        part_text = answer
+
+        # Для промежуточного фрагмента берём заранее подготовленную
+        # нормализованную копию. Для последнего учитываем и заключительную фразу.
+        if is_last:
+            timing_text = normalize_russian(answer)
+        elif index < len(timing_parts):
+            timing_text = timing_parts[index]
+        else:
+            # Совместимость с задачами, сохранёнными до появления timing_parts.
+            timing_text = normalize_russian(parts[index])
+
         current["part_index"] = index + 1
         current["auto_reading"] = not is_last
         current["auto_reading_paused"] = False
@@ -919,9 +935,9 @@ def deliver_job_part(body, job_key, job):
 
     response = make_response(body, answer, final_history) if final_history is not None else make_response(body, answer)
     if schedule_next:
-        schedule_auto_next_part(job_key, job.get("job_id"), part_text)
+        schedule_auto_next_part(job_key, job.get("job_id"), timing_text)
     if schedule_final:
-        schedule_final_part_cleanup(job_key, job.get("job_id"), part_text)
+        schedule_final_part_cleanup(job_key, job.get("job_id"), timing_text)
     return response
 
 def is_stock_quote_request(text):
