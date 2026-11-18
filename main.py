@@ -547,11 +547,11 @@ def is_wait_command(text):
 
 
 def pending_job_notice(job):
-    """Не повторяет «Секундочку» при каждом обращении к ещё работающей задаче."""
+    """Не повторяет «Хорошо» при каждом обращении к ещё работающей задаче."""
     if not job.get("pending_notice_sent", False):
         job["pending_notice_sent"] = True
         persist_job_maps()
-        return "Секундочку"
+        return "Хорошо"
 
     return "Ответ ещё готовится."
 
@@ -2734,7 +2734,7 @@ async def main(body: dict):
         if job and job.get("status") == "pending":
             with jobs_lock:
                 current = search_jobs.get(job_key)
-                notice = pending_job_notice(current) if current else "Секундочку"
+                notice = pending_job_notice(current) if current else "Хорошо"
             return make_response(body, notice)
         if job and job.get("status") == "ready":
             return deliver_job_part(body, job_key, job)
@@ -2764,7 +2764,7 @@ async def main(body: dict):
         if job and job.get("status") == "pending":
             with jobs_lock:
                 current = search_jobs.get(job_key)
-                notice = pending_job_notice(current) if current else "Секундочку"
+                notice = pending_job_notice(current) if current else "Хорошо"
             return make_response(body, notice)
         if job and job.get("status") == "ready":
             return deliver_job_part(body, job_key, job)
@@ -2816,7 +2816,7 @@ async def main(body: dict):
                         notice = None
                         job = dict(current)
                 else:
-                    notice = "Секундочку"
+                    notice = "Хорошо"
 
             if notice is not None:
                 return make_response(body, notice)
@@ -3011,7 +3011,7 @@ async def main(body: dict):
             "Chat is still running after %.2f seconds; returning control to Alice",
             wait_timeout,
         )
-        return make_response(body, "Секундочку")
+        return make_response(body, "Хорошо")
 
     except Exception:
         logger.exception("Chat request failed")
