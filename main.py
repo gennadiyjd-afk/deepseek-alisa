@@ -724,7 +724,10 @@ def is_exit_skill_command(text):
 def stop_tts_bridge_on_skill_exit():
     """Асинхронно блокирует новые bridge-команды и останавливает воспроизведение."""
     if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
+        logger.warning("DIAG bridge_stop skipped: TTS_BRIDGE_URL or TTS_BRIDGE_SECRET is missing")
         return False
+
+    logger.info("DIAG bridge_stop scheduled: POST /api/bridge/stop")
 
     def run():
         try:
@@ -733,10 +736,11 @@ def stop_tts_bridge_on_skill_exit():
                 headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
                 timeout=15,
             )
+            logger.info("DIAG bridge_stop response: HTTP %s", response.status_code)
             response.raise_for_status()
             logger.info("TTS bridge cancellation completed on skill exit")
         except Exception:
-            logger.exception("Could not stop TTS bridge on skill exit")
+            logger.exception("DIAG bridge_stop failed on skill exit")
 
     threading.Thread(target=run, daemon=True, name="tts-bridge-stop-on-exit").start()
     return True
@@ -2704,6 +2708,19 @@ async def main(body: dict):
     request_data = body.get("request", {})
     user_text = str(request_data.get("original_utterance") or "").strip()
 
+    # Временная диагностика голосовых команд. Не меняет маршрутизацию запросов.
+    if user_text:
+        diag_exit = is_exit_skill_command(user_text)
+        diag_pause = is_pause_command(user_text)
+        diag_stop = is_stop_command(user_text)
+        diag_continue = is_continue_command(user_text)
+        logger.info(
+            "DIAG webhook utterance=%r | exit=%s pause=%s stop=%s continue=%s",
+            user_text, diag_exit, diag_pause, diag_stop, diag_continue,
+        )
+    else:
+        logger.info("DIAG webhook received empty original_utterance (skill launch/wakeup)")
+
     # При запуске навыка будим TTS-мост в фоне, пока Алиса произносит приветствие.
     # Сам запрос не обращается к колонке и не задерживает ответ навыка.
     if not user_text:
@@ -2720,6 +2737,7 @@ async def main(body: dict):
 
     # Выход обрабатываем раньше любых команд продолжения/поиска.
     if is_exit_skill_command(user_text):
+        logger.info("DIAG handler=exit; response end_session=True")
         with jobs_lock:
             search_jobs.pop(job_key, None)
             interrupted_jobs.pop(job_key, None)
@@ -2829,6 +2847,7 @@ async def main(body: dict):
 
     # Пауза сохраняет готовый ответ и текущую часть для повторного чтения.
     if job and job.get("status") == "ready" and is_pause_command(user_text):
+        logger.info("DIAG handler=pause; active_job_status=ready")
         with jobs_lock:
             current = search_jobs.get(job_key)
             if current and current.get("job_id") == job.get("job_id"):
@@ -2845,6 +2864,7 @@ async def main(body: dict):
 
     # Окончательный отказ удаляет ответ; пауза выше его сохраняет.
     if (job or interrupted) and is_stop_command(user_text):
+        logger.info("DIAG handler=stop; active_or_interrupted_job=True")
         with jobs_lock:
             current = search_jobs.get(job_key)
             if current and (not job or current.get("job_id") == job.get("job_id")):
