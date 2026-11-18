@@ -34,6 +34,8 @@ SESSION_REDIS_KEY = "deepseek-alisa:tts-bridge:production:yandex-session:v1"
 SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
 
 _guard = threading.RLock()
+# После выхода блокируем новые автоматические text_action до следующего запуска навыка.
+_bridge_commands_enabled = False
 _state: dict[str, Any] = {
     "status": "idle",
     "message": "Авторизация ещё не запущена",
@@ -732,9 +734,14 @@ def bridge_say(
         raise HTTPException(502, f"Ошибка отправки: {type(exc).__name__}")
 
 
-def send_voice_command(text: str):
-    """Отправляет текст через Quasar text_action (это не phrase_action/TTS)."""
+def send_voice_command(text: str, require_active_bridge: bool = False):
+    """Отправляет Quasar text_action; автоматические команды закрываются при выходе."""
+    # Держим блокировку до завершения HTTP-запроса: stop дождётся уже начатой
+    # команды, затем поставит воспроизведение на паузу. После stop новые команды
+    # не пройдут до следующего session/start.
     with _guard:
+        if require_active_bridge and not _bridge_commands_enabled:
+            raise HTTPException(409, "Команды моста отменены: навык завершён")
         session = _state.get("session")
         csrf = _state.get("csrf")
         devices = _state.get("devices") or []
@@ -743,29 +750,23 @@ def send_voice_command(text: str):
         if len(devices) != 1:
             raise HTTPException(409, "Личная станция не определена")
         device_id = str(devices[0]["id"])
-
-    try:
-        response = session.post(
-            f"{QUASAR_API}/user/devices/{device_id}/actions",
-            json={
-                "actions": [{
+        try:
+            response = session.post(
+                f"{QUASAR_API}/user/devices/{device_id}/actions",
+                json={"actions": [{
                     "type": "devices.capabilities.quasar.server_action",
-                    "state": {
-                        "instance": "text_action",
-                        "value": text,
-                    },
-                }]
-            },
-            headers={"x-csrf-token": csrf},
-            timeout=20,
-        )
-        response_json(response, "Отправка текстовой команды")
-        return {"ok": True, "message": "Текстовая команда отправлена на личную станцию"}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.exception("Ошибка отправки текстовой команды")
-        raise HTTPException(502, f"Ошибка отправки команды: {type(exc).__name__}")
+                    "state": {"instance": "text_action", "value": text},
+                }]},
+                headers={"x-csrf-token": csrf},
+                timeout=20,
+            )
+            response_json(response, "Отправка текстовой команды")
+            return {"ok": True, "message": "Текстовая команда отправлена на личную станцию"}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.exception("Ошибка отправки текстовой команды")
+            raise HTTPException(502, f"Ошибка отправки команды: {type(exc).__name__}")
 
 
 @app.post("/api/command")
@@ -776,8 +777,8 @@ def command(
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "Введи текст команды")
-    if len(text) > 120:
-        raise HTTPException(400, "Максимальная длина команды — 120 символов")
+    if len(text) > 500:
+        raise HTTPException(400, "Максимальная длина команды — 500 символов")
     return send_voice_command(text)
 
 
@@ -795,46 +796,60 @@ def bridge_command(
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "Пустой текст команды")
-    if len(text) > 120:
-        raise HTTPException(400, "Максимальная длина команды — 120 символов")
-    return send_voice_command(text)
+    if len(text) > 500:
+        raise HTTPException(400, "Максимальная длина команды — 500 символов")
+    return send_voice_command(text, require_active_bridge=True)
 
 
 
-@app.post("/api/bridge/stop")
-def bridge_stop(x_bridge_secret: str = Header(default="")):
-    """Stop/pause playback on the one explicitly selected personal station."""
+@app.post("/api/bridge/session/start")
+def bridge_session_start(x_bridge_secret: str = Header(default="")):
+    """Разрешает автоматические команды при новом запуске навыка."""
+    global _bridge_commands_enabled
     if not BRIDGE_SECRET:
         raise HTTPException(503, "На Render не задана переменная TTS_BRIDGE_SECRET")
     if not secrets.compare_digest(x_bridge_secret, BRIDGE_SECRET):
         raise HTTPException(401, "Неверный ключ моста")
     with _guard:
+        _bridge_commands_enabled = True
+    return {"ok": True, "message": "Автоматические команды разрешены"}
+
+
+@app.post("/api/bridge/stop")
+def bridge_stop(x_bridge_secret: str = Header(default="")):
+    """Отменяет будущие автоматические команды и ставит воспроизведение на паузу."""
+    global _bridge_commands_enabled
+    if not BRIDGE_SECRET:
+        raise HTTPException(503, "На Render не задана переменная TTS_BRIDGE_SECRET")
+    if not secrets.compare_digest(x_bridge_secret, BRIDGE_SECRET):
+        raise HTTPException(401, "Неверный ключ моста")
+    with _guard:
+        _bridge_commands_enabled = False
         session = _state.get("session")
         csrf = _state.get("csrf")
         devices = _state.get("devices") or []
         if _state["status"] != "ready" or session is None or not csrf:
-            raise HTTPException(409, "Мост не подключён к Яндексу")
+            return {"ok": True, "message": "Команды заблокированы; мост пока не подключён"}
         if len(devices) != 1:
-            raise HTTPException(409, "Личная станция не определена")
+            return {"ok": True, "message": "Команды заблокированы; личная станция не определена"}
         device_id = str(devices[0]["id"])
-    try:
-        response = session.post(
-            f"{QUASAR_API}/user/devices/{device_id}/actions",
-            json={"actions": [{
-                "type": "devices.capabilities.toggle",
-                "state": {"instance": "pause", "value": True},
-            }]},
-            headers={"x-csrf-token": csrf},
-            timeout=20,
-        )
-        response_json(response, "Остановка воспроизведения")
-        return {"ok": True, "message": "Команда остановки отправлена"}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.exception("Ошибка остановки воспроизведения")
-        raise HTTPException(502, f"Ошибка остановки: {type(exc).__name__}")
-
+        try:
+            response = session.post(
+                f"{QUASAR_API}/user/devices/{device_id}/actions",
+                json={"actions": [{
+                    "type": "devices.capabilities.toggle",
+                    "state": {"instance": "pause", "value": True},
+                }]},
+                headers={"x-csrf-token": csrf},
+                timeout=20,
+            )
+            response_json(response, "Остановка воспроизведения")
+            return {"ok": True, "message": "Команды отменены, воспроизведение остановлено"}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.exception("Ошибка остановки воспроизведения")
+            raise HTTPException(502, f"Ошибка остановки: {type(exc).__name__}")
 
 
 
@@ -876,8 +891,8 @@ a { overflow-wrap: anywhere; }
 <label for="phrase">Текст для произнесения:</label>
 <textarea id="phrase" rows="4" maxlength="500" placeholder="Напиши фразу, которую должна произнести колонка" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
 <button id="say" hidden>Произнести текст</button>
-<label for="commandText">Текстовая команда Алисе (до 120 символов):</label>
-<textarea id="commandText" rows="3" maxlength="120" placeholder="Например: Алиса, я жду" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
+<label for="commandText">Текстовая команда Алисе (до 500 символов):</label>
+<textarea id="commandText" rows="3" maxlength="500" placeholder="Например: Алиса, я жду" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
 <button id="commandButton" hidden>Отправить текстовую команду</button>
 
 <script>
