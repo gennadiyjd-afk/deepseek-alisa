@@ -2853,10 +2853,20 @@ async def main(body: dict):
             end_session=True,
         )
 
-    # Любая реплика, реально дошедшая до вебхука во время чтения,
-    # сначала останавливает мост и фиксирует начало текущего фрагмента.
-    # Команда «Продолжи» ниже затем снова активирует мост перед выдачей.
-    pause_active_job_for_incoming_utterance(job_key, user_text)
+    # Автоматическая команда моста «Алиса, продолжи» приходит в тот же вебхук,
+    # что и реплики пользователя. Её нельзя трактовать как новое прерывание:
+    # иначе мы сохраняем начало уже прочитанного фрагмента, останавливаем мост
+    # и затем повторно выдаём этот же фрагмент по кругу.
+    normalized_bridge_command = " ".join(
+        normalize_command(user_text).replace(",", " ").split()
+    )
+    is_bridge_auto_continue = normalized_bridge_command == "алиса продолжи"
+    if is_bridge_auto_continue:
+        logger.info("Bridge auto-continue recognized; skipping incoming-utterance interruption")
+    else:
+        # Любая другая реплика, реально дошедшая до вебхука во время чтения,
+        # останавливает мост и фиксирует начало текущего фрагмента.
+        pause_active_job_for_incoming_utterance(job_key, user_text)
 
     state = body.get("state", {}).get("session", {})
     history = state.get("history", [])
