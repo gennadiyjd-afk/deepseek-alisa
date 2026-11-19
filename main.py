@@ -34,6 +34,9 @@ search_jobs = {}
 interrupted_jobs = {}
 MAX_CONVERSATION_TOPICS = 2
 jobs_lock = threading.RLock()
+# Serializes bridge continue/stop HTTP calls so a late timer cannot restart
+# playback after a newer webhook interruption has already stopped the bridge.
+bridge_operation_lock = threading.Lock()
 
 # Небольшой серверный кэш снижает число одинаковых запросов к погодным API.
 WEATHER_CACHE = {}
@@ -258,34 +261,40 @@ def auto_deliver_ready_job(job_key, job_id):
 
 
 
-def send_bridge_continue_command(job_key, job_id):
+def send_bridge_continue_command(job_key, job_id, expected_generation=None):
     """Просит активный навык выдать следующую часть готового ответа."""
     if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
         logger.warning("Automatic continuation skipped: TTS bridge is not configured")
         return False
-    with jobs_lock:
-        current = search_jobs.get(job_key)
-        if (
-            not current
-            or current.get("job_id") != job_id
-            or current.get("status") != "ready"
-            or current.get("auto_reading_paused")
-            or not current.get("auto_reading")
-        ):
+    # Lock order matters: acquire the bridge-operation lock first, then recheck
+    # the job generation. A stop that wins this lock invalidates any older timer.
+    with bridge_operation_lock:
+        with jobs_lock:
+            current = search_jobs.get(job_key)
+            if (
+                not current
+                or current.get("job_id") != job_id
+                or current.get("status") != "ready"
+                or current.get("auto_reading_paused")
+                or not current.get("auto_reading")
+                or (expected_generation is not None and
+                    int(current.get("auto_next_generation", 0)) != expected_generation)
+            ):
+                logger.info("Automatic continuation skipped: job state changed before bridge send")
+                return False
+        try:
+            response = requests.post(
+                f"{TTS_BRIDGE_URL}/api/bridge/command",
+                headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
+                json={"text": "Алиса, продолжи"},
+                timeout=25,
+            )
+            response.raise_for_status()
+            logger.info("Automatic continuation command sent for job %s", job_id[:8])
+            return True
+        except Exception:
+            logger.exception("Could not send automatic continuation command")
             return False
-    try:
-        response = requests.post(
-            f"{TTS_BRIDGE_URL}/api/bridge/command",
-            headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
-            json={"text": "Алиса, продолжи"},
-            timeout=25,
-        )
-        response.raise_for_status()
-        logger.info("Automatic continuation command sent for job %s", job_id[:8])
-        return True
-    except Exception:
-        logger.exception("Could not send automatic continuation command")
-        return False
 
 
 def schedule_auto_next_part(job_key, job_id, part_text):
@@ -318,7 +327,7 @@ def schedule_auto_next_part(job_key, job_id, part_text):
             current["auto_next_thread_started"] = True
             persist_job_maps()
         try:
-            send_bridge_continue_command(job_key, job_id)
+            send_bridge_continue_command(job_key, job_id, generation)
         finally:
             with jobs_lock:
                 current = search_jobs.get(job_key)
@@ -761,18 +770,21 @@ def stop_tts_bridge_for_interruption():
     if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
         logger.warning("Bridge interruption stop skipped: bridge is not configured")
         return False
-    try:
-        response = requests.post(
-            f"{TTS_BRIDGE_URL}/api/bridge/stop",
-            headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
-            timeout=20,
-        )
-        response.raise_for_status()
-        logger.info("Bridge stopped for incoming webhook utterance: HTTP %s", response.status_code)
-        return True
-    except Exception:
-        logger.exception("Could not stop bridge for incoming webhook utterance")
-        return False
+    # Serialize stop with automatic continue. If a continue is already in flight,
+    # stop is sent after it; if stop wins, stale timers fail their generation check.
+    with bridge_operation_lock:
+        try:
+            response = requests.post(
+                f"{TTS_BRIDGE_URL}/api/bridge/stop",
+                headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
+                timeout=20,
+            )
+            response.raise_for_status()
+            logger.info("Bridge stopped for incoming webhook utterance: HTTP %s", response.status_code)
+            return True
+        except Exception:
+            logger.exception("Could not stop bridge for incoming webhook utterance")
+            return False
 
 
 def activate_tts_bridge_session():
@@ -2839,21 +2851,26 @@ async def main(body: dict):
     session_id = str(session.get("session_id", "default"))
     user_id = session.get("user", {}).get("user_id")
     job_key = str(user_id or session_id)
+    session_is_new = bool(session.get("new", False))
 
-    # Пустая исходная реплика означает новый запуск навыка: очищаем только
-    # разговорные ответы этого пользователя, но не авторизацию Яндекса/моста.
-    if not user_text:
+    # session.new — штатный признак нового диалога Яндекс.Алисы. Он надёжнее
+    # пустого original_utterance: первый запрос нового сеанса может уже содержать вопрос.
+    if session_is_new or not user_text:
         with jobs_lock:
             search_jobs.pop(job_key, None)
             interrupted_jobs.pop(job_key, None)
             persist_job_maps()
-        logger.info("New skill session: previous answer and topic state cleared for key %s", job_key[:12])
-        wake_tts_bridge_on_skill_launch()
-        return make_response(
-            body,
-            "Привет! Я твой интеллектуальный помощник DeepSeek Алиса. Чем могу помочь?",
-            history=[],
+        logger.info(
+            "New skill session: cleared answer/topic state (session.new=%s, empty_utterance=%s, key=%s)",
+            session_is_new, not bool(user_text), job_key[:12],
         )
+        wake_tts_bridge_on_skill_launch()
+        if not user_text:
+            return make_response(
+                body,
+                "Привет! Я твой интеллектуальный помощник DeepSeek Алиса. Чем могу помочь?",
+                history=[],
+            )
 
     # Выход обрабатываем раньше любых команд продолжения/поиска.
     if is_exit_skill_command(user_text):
@@ -2886,7 +2903,7 @@ async def main(body: dict):
         pause_active_job_for_incoming_utterance(job_key, user_text)
 
     state = body.get("state", {}).get("session", {})
-    history = state.get("history", [])
+    history = [] if session_is_new else state.get("history", [])
     wake_command = is_wake_command(user_text)
     continue_command = is_continue_command(user_text)
     repair_continue_command = is_continuation_repair_request(user_text)
