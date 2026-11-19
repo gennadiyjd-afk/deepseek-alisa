@@ -126,6 +126,13 @@ def send_bridge_wait_command(job_key, job_id):
         logger.warning("Automatic wait command skipped: TTS bridge is not configured")
         return False
 
+    # Новая задача могла появиться после того, как предыдущая реплика
+    # остановила мост. Перед первой командой ожидания обязательно снова
+    # разрешаем автоматические команды моста.
+    if not activate_tts_bridge_session():
+        logger.warning("Automatic wait command skipped: bridge session is inactive")
+        return False
+
     now = time.time()
     with jobs_lock:
         current = search_jobs.get(job_key)
@@ -282,10 +289,16 @@ def send_bridge_continue_command(job_key, job_id):
 
 
 def schedule_auto_next_part(job_key, job_id, part_text):
-    """Ждёт примерную длительность озвучивания части и запрашивает следующую."""
-    # Яндекс не сообщает webhook точный момент окончания воспроизведения.
-    # Поэтому ждём консервативную оценку длительности, а не отправляем команды подряд.
+    """Ждёт примерную длительность части; устаревшие таймеры после паузы игнорируются."""
+    # Сохраняем прежний комфортный интервал 17 + 1,5 секунды.
     estimated_seconds = max(4.0, len(str(part_text or "")) / 17.0 + 1.5)
+    with jobs_lock:
+        current = search_jobs.get(job_key)
+        if not current or current.get("job_id") != job_id:
+            return
+        generation = int(current.get("auto_next_generation", 0)) + 1
+        current["auto_next_generation"] = generation
+        persist_job_maps()
 
     def run():
         time.sleep(estimated_seconds)
@@ -294,11 +307,13 @@ def schedule_auto_next_part(job_key, job_id, part_text):
             if (
                 not current
                 or current.get("job_id") != job_id
+                or int(current.get("auto_next_generation", 0)) != generation
                 or current.get("status") != "ready"
                 or current.get("auto_reading_paused")
                 or not current.get("auto_reading")
                 or current.get("auto_next_thread_started")
             ):
+                logger.info("Stale auto-next timer ignored for job %s", job_id[:8])
                 return
             current["auto_next_thread_started"] = True
             persist_job_maps()
@@ -801,6 +816,7 @@ def pause_active_job_for_incoming_utterance(job_key, user_text):
                 current["resume_part_index"] = resume_index
             current["auto_reading"] = False
             current["auto_reading_paused"] = True
+            current["auto_next_generation"] = int(current.get("auto_next_generation", 0)) + 1
             current["auto_next_thread_started"] = False
             current["last_part_playing"] = False
             persist_job_maps()
@@ -1052,6 +1068,7 @@ def deliver_job_part(body, job_key, job):
         current["part_index"] = index + 1
         current["auto_reading"] = not is_last
         current["auto_reading_paused"] = False
+        current["auto_next_generation"] = int(current.get("auto_next_generation", 0)) + 1
         current["auto_next_thread_started"] = False
 
         if is_last:
@@ -2979,6 +2996,8 @@ async def main(body: dict):
                 current["last_part_playing"] = False
                 current["auto_reading"] = False
                 current["auto_reading_paused"] = True
+                current["auto_next_generation"] = int(current.get("auto_next_generation", 0)) + 1
+                current["auto_next_thread_started"] = False
                 persist_job_maps()
         return make_response(body, "Хорошо, поставила на паузу. Скажи «Продолжить», когда будешь готов.")
 
