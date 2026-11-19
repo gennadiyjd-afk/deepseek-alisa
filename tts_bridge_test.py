@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -8,6 +9,7 @@ import traceback
 from typing import Any
 
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Body, Depends, FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -28,7 +30,12 @@ CLIENT_SECRET = "ad0a908f0aa341a182a37ecd75bc319e"
 QUASAR_API = "https://iot.quasar.yandex.ru/m"
 PERSONAL_STATION_NAME = "Станция Геннадия"
 
+SESSION_REDIS_KEY = "deepseek-alisa:tts-bridge:production:yandex-session:v1"
+SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+
 _guard = threading.RLock()
+# После выхода блокируем новые автоматические text_action до следующего запуска навыка.
+_bridge_commands_enabled = False
 _state: dict[str, Any] = {
     "status": "idle",
     "message": "Авторизация ещё не запущена",
@@ -61,6 +68,193 @@ def response_json(response: requests.Response, label: str):
         raise RuntimeError(f"{label}: HTTP {response.status_code}: {message}")
 
     return data
+
+
+def get_session_cipher() -> Fernet:
+    """Build the Fernet cipher from the private Render environment variable."""
+    encryption_key = os.getenv("TTS_SESSION_ENCRYPTION_KEY", "").strip()
+    if not encryption_key:
+        raise RuntimeError("Ключ шифрования не настроен")
+    try:
+        return Fernet(encryption_key.encode("ascii"))
+    except (ValueError, UnicodeError):
+        raise RuntimeError("Ключ шифрования имеет неверный формат")
+
+
+def redis_session_command(command: list[Any]) -> Any:
+    """Execute one Upstash REST command without exposing credentials or payloads."""
+    redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+    redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+    if not redis_url or not redis_token:
+        raise RuntimeError("Upstash Redis не настроен")
+
+    response = requests.post(
+        redis_url,
+        json=command,
+        headers={"Authorization": f"Bearer {redis_token}"},
+        timeout=(5, 10),
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Upstash Redis вернул HTTP {response.status_code}")
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("Upstash Redis вернул некорректный ответ")
+
+    if not isinstance(data, dict) or "error" in data or "result" not in data:
+        raise RuntimeError("Команда Upstash Redis завершилась ошибкой")
+    return data["result"]
+
+
+def save_yandex_session(session: requests.Session) -> None:
+    """Encrypt and persist only the Yandex cookies needed to rebuild the session."""
+    cookies = []
+    for cookie in session.cookies:
+        cookies.append({
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": cookie.domain,
+            "path": cookie.path,
+            "secure": bool(cookie.secure),
+            "expires": cookie.expires,
+            "rest": dict(cookie._rest or {}),
+            "discard": bool(cookie.discard),
+            "version": int(cookie.version or 0),
+        })
+
+    if not cookies:
+        raise RuntimeError("В сессии Яндекса нет cookies для сохранения")
+
+    payload = json.dumps(
+        {"version": 1, "cookies": cookies},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encrypted_payload = get_session_cipher().encrypt(payload).decode("ascii")
+
+    result = redis_session_command([
+        "SET",
+        SESSION_REDIS_KEY,
+        encrypted_payload,
+        "EX",
+        SESSION_TTL_SECONDS,
+    ])
+    if result != "OK":
+        raise RuntimeError("Upstash Redis не подтвердил сохранение сессии")
+
+
+def load_yandex_session_cookies() -> list[dict[str, Any]] | None:
+    """Read and decrypt the saved cookie bundle; never log its contents."""
+    encrypted_payload = redis_session_command(["GET", SESSION_REDIS_KEY])
+    if encrypted_payload is None:
+        return None
+    if not isinstance(encrypted_payload, str):
+        raise RuntimeError("Сохранённая сессия имеет неожиданный формат")
+
+    try:
+        payload = get_session_cipher().decrypt(encrypted_payload.encode("ascii"))
+        data = json.loads(payload.decode("utf-8"))
+    except (InvalidToken, ValueError, UnicodeError, json.JSONDecodeError):
+        raise RuntimeError("Не удалось расшифровать сохранённую сессию")
+
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != 1
+        or not isinstance(data.get("cookies"), list)
+        or not data["cookies"]
+    ):
+        raise RuntimeError("Сохранённая сессия имеет неподдерживаемый формат")
+    return data["cookies"]
+
+
+def restore_yandex_session() -> bool:
+    """Restore cookies, then validate the Yandex account and exact personal station."""
+    saved_cookies = load_yandex_session_cookies()
+    if saved_cookies is None:
+        log.info("Сохранённая сессия Яндекса в Redis не найдена")
+        return False
+
+    quasar = requests.Session()
+    quasar.headers.update({"User-Agent": USER_AGENT})
+
+    for item in saved_cookies:
+        if not isinstance(item, dict):
+            raise RuntimeError("Сохранённые cookies имеют неожиданный формат")
+        name = item.get("name")
+        value = item.get("value")
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise RuntimeError("Сохранённые cookies имеют неожиданный формат")
+
+        quasar.cookies.set(
+            name,
+            value,
+            domain=item.get("domain") or "",
+            path=item.get("path") or "/",
+            secure=bool(item.get("secure", False)),
+            expires=item.get("expires"),
+            rest=item.get("rest") if isinstance(item.get("rest"), dict) else {},
+            discard=bool(item.get("discard", False)),
+            version=int(item.get("version", 0)),
+        )
+
+    # A fresh CSRF token is obtained from Yandex; it is not stored in Redis.
+    iot_page = quasar.get("https://yandex.ru/iot", timeout=20)
+    iot_page.raise_for_status()
+    csrf_match = re.search(r'"csrfToken2"\s*:\s*"([^"]+)"', iot_page.text)
+    if not csrf_match:
+        raise RuntimeError("Сохранённая авторизация Яндекса больше не действует")
+
+    csrf_token = csrf_match.group(1)
+    quasar.headers.update({"x-csrf-token": csrf_token})
+
+    devices_data = response_json(
+        quasar.get(f"{QUASAR_API}/v3/user/devices", timeout=20),
+        "Проверка сохранённой авторизации",
+    )
+    households = devices_data.get("households", [])
+    if not isinstance(households, list):
+        raise RuntimeError("Яндекс вернул households в неожиданном формате")
+
+    expected_name = " ".join(PERSONAL_STATION_NAME.split()).casefold()
+    personal_speakers = []
+    for household in households:
+        if not isinstance(household, dict):
+            continue
+        household_devices = household.get("all", [])
+        if not isinstance(household_devices, list):
+            continue
+        for device in household_devices:
+            if not isinstance(device, dict):
+                continue
+            normalized_name = " ".join(
+                str(device.get("name") or "").split()
+            ).casefold()
+            if normalized_name != expected_name:
+                continue
+            if not device.get("id") or not device.get("capabilities") or not device.get("quasar_info"):
+                raise RuntimeError("Данные личной станции неполные")
+            personal_speakers.append(device)
+
+    if len(personal_speakers) != 1:
+        raise RuntimeError(
+            "Не удалось однозначно определить личную станцию "
+            f"«{PERSONAL_STATION_NAME}». Найдено: {len(personal_speakers)}"
+        )
+
+    with _guard:
+        _state.update(
+            status="ready",
+            message="Сохранённая авторизация Яндекса восстановлена. Можно пользоваться мостом.",
+            link=None,
+            session=quasar,
+            csrf=csrf_token,
+            devices=personal_speakers,
+            error=None,
+        )
+
+    log.info("Сохранённая авторизация Яндекса успешно восстановлена")
+    return True
 
 
 def yandex_login():
@@ -211,6 +405,11 @@ def yandex_login():
             cookie.value,
             domain=cookie.domain,
             path=cookie.path,
+            secure=cookie.secure,
+            expires=cookie.expires,
+            rest=dict(cookie._rest or {}),
+            discard=cookie.discard,
+            version=cookie.version,
         )
 
     finish = quasar.get(
@@ -334,6 +533,18 @@ def yandex_login():
             devices=personal_speakers,
             error=None,
         )
+
+    # Persistence is best-effort: a Redis outage must not undo a working login.
+    try:
+        save_yandex_session(quasar)
+        log.info("Зашифрованная сессия Яндекса сохранена в Redis")
+    except Exception as exc:
+        log.warning(
+            "Не удалось сохранить сессию Яндекса в Redis: %s",
+            type(exc).__name__,
+        )
+
+
 def login_worker():
     try:
         yandex_login()
@@ -351,7 +562,29 @@ def login_worker():
             )
 
 
-@app.get("/health")
+@app.on_event("startup")
+def restore_saved_session_on_startup():
+    """Try to restore the saved Yandex session before the service accepts requests."""
+    try:
+        restore_yandex_session()
+    except Exception as exc:
+        with _guard:
+            _state.update(
+                status="idle",
+                message="Не удалось восстановить авторизацию. При необходимости подключи Яндекс заново.",
+                link=None,
+                session=None,
+                csrf=None,
+                devices=[],
+                error=None,
+            )
+        log.warning(
+            "Восстановление сессии Яндекса не выполнено: %s",
+            type(exc).__name__,
+        )
+
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     """Safe health check: does not access Yandex or send commands to the speaker."""
     return {"status": "ok"}
@@ -501,9 +734,14 @@ def bridge_say(
         raise HTTPException(502, f"Ошибка отправки: {type(exc).__name__}")
 
 
-def send_voice_command(text: str):
-    """Отправляет текст через Quasar text_action (это не phrase_action/TTS)."""
+def send_voice_command(text: str, require_active_bridge: bool = False):
+    """Отправляет Quasar text_action; автоматические команды закрываются при выходе."""
+    # Держим блокировку до завершения HTTP-запроса: stop дождётся уже начатой
+    # команды, затем поставит воспроизведение на паузу. После stop новые команды
+    # не пройдут до следующего session/start.
     with _guard:
+        if require_active_bridge and not _bridge_commands_enabled:
+            raise HTTPException(409, "Команды моста отменены: навык завершён")
         session = _state.get("session")
         csrf = _state.get("csrf")
         devices = _state.get("devices") or []
@@ -512,29 +750,23 @@ def send_voice_command(text: str):
         if len(devices) != 1:
             raise HTTPException(409, "Личная станция не определена")
         device_id = str(devices[0]["id"])
-
-    try:
-        response = session.post(
-            f"{QUASAR_API}/user/devices/{device_id}/actions",
-            json={
-                "actions": [{
+        try:
+            response = session.post(
+                f"{QUASAR_API}/user/devices/{device_id}/actions",
+                json={"actions": [{
                     "type": "devices.capabilities.quasar.server_action",
-                    "state": {
-                        "instance": "text_action",
-                        "value": text,
-                    },
-                }]
-            },
-            headers={"x-csrf-token": csrf},
-            timeout=20,
-        )
-        response_json(response, "Отправка текстовой команды")
-        return {"ok": True, "message": "Текстовая команда отправлена на личную станцию"}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.exception("Ошибка отправки текстовой команды")
-        raise HTTPException(502, f"Ошибка отправки команды: {type(exc).__name__}")
+                    "state": {"instance": "text_action", "value": text},
+                }]},
+                headers={"x-csrf-token": csrf},
+                timeout=20,
+            )
+            response_json(response, "Отправка текстовой команды")
+            return {"ok": True, "message": "Текстовая команда отправлена на личную станцию"}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.exception("Ошибка отправки текстовой команды")
+            raise HTTPException(502, f"Ошибка отправки команды: {type(exc).__name__}")
 
 
 @app.post("/api/command")
@@ -545,8 +777,8 @@ def command(
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "Введи текст команды")
-    if len(text) > 120:
-        raise HTTPException(400, "Максимальная длина команды — 120 символов")
+    if len(text) > 500:
+        raise HTTPException(400, "Максимальная длина команды — 500 символов")
     return send_voice_command(text)
 
 
@@ -564,45 +796,61 @@ def bridge_command(
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "Пустой текст команды")
-    if len(text) > 120:
-        raise HTTPException(400, "Максимальная длина команды — 120 символов")
-    return send_voice_command(text)
+    if len(text) > 500:
+        raise HTTPException(400, "Максимальная длина команды — 500 символов")
+    return send_voice_command(text, require_active_bridge=True)
 
 
 
-@app.post("/api/bridge/stop")
-def bridge_stop(x_bridge_secret: str = Header(default="")):
-    """Stop/pause playback on the one explicitly selected personal station."""
+@app.post("/api/bridge/session/start")
+def bridge_session_start(x_bridge_secret: str = Header(default="")):
+    """Разрешает автоматические команды при новом запуске навыка."""
+    global _bridge_commands_enabled
     if not BRIDGE_SECRET:
         raise HTTPException(503, "На Render не задана переменная TTS_BRIDGE_SECRET")
     if not secrets.compare_digest(x_bridge_secret, BRIDGE_SECRET):
         raise HTTPException(401, "Неверный ключ моста")
     with _guard:
+        _bridge_commands_enabled = True
+    return {"ok": True, "message": "Автоматические команды разрешены"}
+
+
+@app.post("/api/bridge/stop")
+def bridge_stop(x_bridge_secret: str = Header(default="")):
+    """Отменяет будущие автоматические команды и ставит воспроизведение на паузу."""
+    global _bridge_commands_enabled
+    if not BRIDGE_SECRET:
+        raise HTTPException(503, "На Render не задана переменная TTS_BRIDGE_SECRET")
+    if not secrets.compare_digest(x_bridge_secret, BRIDGE_SECRET):
+        raise HTTPException(401, "Неверный ключ моста")
+    with _guard:
+        _bridge_commands_enabled = False
         session = _state.get("session")
         csrf = _state.get("csrf")
         devices = _state.get("devices") or []
         if _state["status"] != "ready" or session is None or not csrf:
-            raise HTTPException(409, "Мост не подключён к Яндексу")
+            return {"ok": True, "message": "Команды заблокированы; мост пока не подключён"}
         if len(devices) != 1:
-            raise HTTPException(409, "Личная станция не определена")
+            return {"ok": True, "message": "Команды заблокированы; личная станция не определена"}
         device_id = str(devices[0]["id"])
-    try:
-        response = session.post(
-            f"{QUASAR_API}/user/devices/{device_id}/actions",
-            json={"actions": [{
-                "type": "devices.capabilities.toggle",
-                "state": {"instance": "pause", "value": True},
-            }]},
-            headers={"x-csrf-token": csrf},
-            timeout=20,
-        )
-        response_json(response, "Остановка воспроизведения")
-        return {"ok": True, "message": "Команда остановки отправлена"}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.exception("Ошибка остановки воспроизведения")
-        raise HTTPException(502, f"Ошибка остановки: {type(exc).__name__}")
+        try:
+            response = session.post(
+                f"{QUASAR_API}/user/devices/{device_id}/actions",
+                json={"actions": [{
+                    "type": "devices.capabilities.toggle",
+                    "state": {"instance": "pause", "value": True},
+                }]},
+                headers={"x-csrf-token": csrf},
+                timeout=20,
+            )
+            response_json(response, "Остановка воспроизведения")
+            return {"ok": True, "message": "Команды отменены, воспроизведение остановлено"}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.exception("Ошибка остановки воспроизведения")
+            raise HTTPException(502, f"Ошибка остановки: {type(exc).__name__}")
+
 
 
 HTML_PAGE = r"""
@@ -643,8 +891,8 @@ a { overflow-wrap: anywhere; }
 <label for="phrase">Текст для произнесения:</label>
 <textarea id="phrase" rows="4" maxlength="500" placeholder="Напиши фразу, которую должна произнести колонка" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
 <button id="say" hidden>Произнести текст</button>
-<label for="commandText">Текстовая команда Алисе (до 120 символов):</label>
-<textarea id="commandText" rows="3" maxlength="120" placeholder="Например: Алиса, я жду" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
+<label for="commandText">Текстовая команда Алисе (до 500 символов):</label>
+<textarea id="commandText" rows="3" maxlength="500" placeholder="Например: Алиса, я жду" style="box-sizing:border-box;width:100%;padding:12px;font-size:16px;margin:8px 0;"></textarea>
 <button id="commandButton" hidden>Отправить текстовую команду</button>
 
 <script>
