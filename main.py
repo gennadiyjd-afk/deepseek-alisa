@@ -535,10 +535,31 @@ def interrupted_list(job_key):
     return saved
 
 
+def resume_index_for_job(job):
+    """Возвращает номер фрагмента, с которого безопасно возобновить чтение."""
+    if not job:
+        return 0
+    parts = job.get("parts") or []
+    if "resume_part_index" in job:
+        index = int(job.get("resume_part_index", 0))
+    elif "current_part_index" in job:
+        index = int(job.get("current_part_index", 0))
+    else:
+        # Совместимость с заданиями, сохранёнными старой версией:
+        # part_index в ней уже указывал на следующий фрагмент.
+        index = max(0, int(job.get("part_index", 0)) - 1)
+    if parts:
+        return max(0, min(index, len(parts) - 1))
+    return max(0, index)
+
+
 def save_interrupted_job(job_key, job):
-    """Добавляет/обновляет прерванную тему, не допуская дубликатов."""
+    """Добавляет/обновляет прерванную тему, сохраняя безопасный номер фрагмента."""
     if not job:
         return
+    resume_index = resume_index_for_job(job)
+    job["part_index"] = resume_index
+    job["resume_part_index"] = resume_index
     saved = interrupted_list(job_key)
     job_id = job.get("job_id")
     saved[:] = [item for item in saved if item.get("job_id") != job_id]
@@ -853,6 +874,11 @@ def deliver_job_part(body, job_key, job):
         answer = parts[index]
         part_text = answer
         is_last = index == len(parts) - 1
+        current["current_part_index"] = index
+        # Пока следующий фрагмент не запрошен, безопасная позиция —
+        # начало текущего. После получения команды авто-продолжения
+        # позиция будет передвинута на следующий фрагмент.
+        current["resume_part_index"] = index
         current["part_index"] = index + 1
         current["auto_reading"] = not is_last
         current["auto_reading_paused"] = False
@@ -2657,9 +2683,9 @@ async def main(body: dict):
                 if current:
                     search_jobs.pop(job_key, None)
                     parts = current.get("parts") or []
-                    part_index = int(current.get("part_index", 0))
+                    resume_index = resume_index_for_job(current)
                     if current.get("status") == "pending" or (
-                        current.get("status") == "ready" and len(parts) > part_index and len(parts) > 1
+                        current.get("status") == "ready" and len(parts) > resume_index and len(parts) > 1
                     ):
                         save_interrupted_job(job_key, current)
 
@@ -2721,10 +2747,13 @@ async def main(body: dict):
             current = search_jobs.get(job_key)
             if current and current.get("job_id") == job.get("job_id"):
                 parts = current.get("parts") or []
-                index = int(current.get("part_index", 0))
-                if parts and index > 0 and index <= len(parts):
-                    # Индекс уже указывает на следующую часть; возвращаемся к прерванной.
-                    current["part_index"] = index - 1
+                if parts:
+                    # При паузе повторяем текущий фрагмент с начала.
+                    # Если предыдущий фрагмент уже завершён, авто-команда
+                    # продолжения заранее передвинет resume_part_index вперёд.
+                    resume_index = resume_index_for_job(current)
+                    current["part_index"] = resume_index
+                    current["resume_part_index"] = resume_index
                 current["last_part_playing"] = False
                 current["auto_reading"] = False
                 current["auto_reading_paused"] = True
@@ -2781,6 +2810,12 @@ async def main(body: dict):
                 with jobs_lock:
                     current = search_jobs.get(job_key)
                     if current and current.get("job_id") == job.get("job_id"):
+                        was_paused = bool(current.get("auto_reading_paused"))
+                        if not was_paused and current.get("auto_reading"):
+                            # Пришло автоматическое продолжение: предыдущий
+                            # фрагмент завершён, следующая позиция уже в part_index.
+                            completed_next = int(current.get("part_index", 0))
+                            current["resume_part_index"] = completed_next
                         current["auto_reading_paused"] = False
                         current["auto_reading"] = True
                         persist_job_maps()
@@ -2794,8 +2829,8 @@ async def main(body: dict):
                 # Ответ уже готов, но ещё не выдан целиком: сохраняем его независимо
                 # от длины новой реплики и даём обработать новую тему отдельно.
                 parts = current.get("parts") or []
-                part_index = int(current.get("part_index", 0))
-                has_remaining_parts = len(parts) > part_index
+                resume_index = resume_index_for_job(current)
+                has_remaining_parts = len(parts) > resume_index
                 if has_remaining_parts and len(parts) > 1:
                     save_interrupted_job(job_key, current)
                     logger.info("Multi-part answer paused and saved before topic switch")
@@ -2841,6 +2876,8 @@ async def main(body: dict):
                 "answer": "",
                 "parts": [],
                 "part_index": 0,
+                "current_part_index": 0,
+                "resume_part_index": 0,
                 "user_text": user_text,
                 "history": history[-4:],
             }
