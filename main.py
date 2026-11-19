@@ -14,8 +14,6 @@ from fastapi import FastAPI
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
-from rutextnorm import normalize_russian
-
 app = FastAPI()
 
 logging.basicConfig(level=logging.INFO)
@@ -53,71 +51,9 @@ REDIS_AVAILABLE = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
 TTS_BRIDGE_URL = os.getenv("TTS_BRIDGE_URL", "").rstrip("/")
 TTS_BRIDGE_SECRET = os.getenv("TTS_BRIDGE_SECRET", "")
 AUTO_WAIT_COMMAND = "Алиса, я жду"
-AUTO_WAIT_INITIAL_DELAY = 7
+AUTO_WAIT_INITIAL_DELAY = 5
 AUTO_WAIT_REPEAT_INTERVAL = 10
 AUTO_WAIT_COMMAND_COOLDOWN = 15
-
-
-def wake_tts_bridge_on_skill_launch():
-    """Пробуждает TTS-мост в фоне и повторяет запрос, пока Render запускается."""
-    if not TTS_BRIDGE_URL:
-        logger.info("TTS bridge wake skipped: bridge URL is not configured")
-        return
-
-    def run():
-        deadline = time.monotonic() + 90
-        attempt = 0
-        while time.monotonic() < deadline:
-            attempt += 1
-            try:
-                response = requests.get(
-                    f"{TTS_BRIDGE_URL}/health",
-                    timeout=(5, 10),
-                )
-                if response.status_code == 200:
-                    try:
-                        start_response = requests.post(
-                            f"{TTS_BRIDGE_URL}/api/bridge/session/start",
-                            headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
-                            timeout=8,
-                        )
-                        start_response.raise_for_status()
-                    except Exception:
-                        logger.exception("Could not activate TTS bridge session")
-                    logger.info(
-                        "TTS bridge wake completed: HTTP 200 on attempt %s",
-                        attempt,
-                    )
-                    return
-                logger.warning(
-                    "TTS bridge is not ready yet: HTTP %s on attempt %s",
-                    response.status_code,
-                    attempt,
-                )
-                # Повторяем только временные ошибки запуска/шлюза.
-                if response.status_code not in (408, 425, 429) and response.status_code < 500:
-                    return
-            except requests.RequestException as exc:
-                logger.warning(
-                    "TTS bridge wake attempt %s failed: %s",
-                    attempt,
-                    exc,
-                )
-
-            remaining = deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(min(5, remaining))
-
-        logger.error(
-            "TTS bridge did not become ready within 90 seconds (%s attempts)",
-            attempt,
-        )
-
-    threading.Thread(
-        target=run,
-        daemon=True,
-        name="tts-bridge-wake-on-launch",
-    ).start()
 
 
 def send_bridge_wait_command(job_key, job_id):
@@ -171,7 +107,7 @@ def send_bridge_wait_command(job_key, job_id):
 
 
 def monitor_delayed_job(job_key, job_id):
-    """Через 7 секунд запускает проверку навыка и повторяет её, пока задача активна."""
+    """Через 12 секунд запускает проверку навыка и повторяет её, пока задача активна."""
     def run():
         time.sleep(AUTO_WAIT_INITIAL_DELAY)
         while True:
@@ -217,7 +153,7 @@ def auto_deliver_ready_job(job_key, job_id):
         persist_job_maps()
 
     def run():
-        # Не отправляем команду раньше чем через 7 секунд после начального ответа.
+        # Не отправляем команду раньше чем через 12 секунд после начального ответа.
         with jobs_lock:
             current = search_jobs.get(job_key)
             if not current or current.get("job_id") != job_id:
@@ -284,8 +220,8 @@ def send_bridge_continue_command(job_key, job_id):
 def schedule_auto_next_part(job_key, job_id, part_text):
     """Ждёт примерную длительность озвучивания части и запрашивает следующую."""
     # Яндекс не сообщает webhook точный момент окончания воспроизведения.
-    # Поэтому ждём консервативную оценку длительности, а не отправляем команды подряд.
-    estimated_seconds = max(4.0, len(str(part_text or "")) / 17.0 + 1.5)
+    # Используем более короткую оценку, сохраняя небольшой запас перед следующей частью.
+    estimated_seconds = max(3.0, len(str(part_text or "")) / 15.0 + 1.5)
 
     def run():
         time.sleep(estimated_seconds)
@@ -560,7 +496,7 @@ def pending_job_notice(job):
     if not job.get("pending_notice_sent", False):
         job["pending_notice_sent"] = True
         persist_job_maps()
-        return "Хорошо"
+        return "Секундочку"
 
     return "Ответ ещё готовится."
 
@@ -714,38 +650,6 @@ def is_short_ambiguous_interruption(text):
     return len(command) <= 24 and len(command.split()) <= 2
 
 
-def is_exit_skill_command(text):
-    """Команды выхода из навыка, которые не должны попадать в DeepSeek."""
-    command = normalize_command(text)
-    command = " ".join(re.sub(r"[^a-zа-я0-9 ]+", " ", command).split())
-    return command in {"хватит", "алиса хватит", "алиса дипсик"}
-
-
-def stop_tts_bridge_on_skill_exit():
-    """Асинхронно блокирует новые bridge-команды и останавливает воспроизведение."""
-    if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
-        logger.warning("DIAG bridge_stop skipped: TTS_BRIDGE_URL or TTS_BRIDGE_SECRET is missing")
-        return False
-
-    logger.info("DIAG bridge_stop scheduled: POST /api/bridge/stop")
-
-    def run():
-        try:
-            response = requests.post(
-                f"{TTS_BRIDGE_URL}/api/bridge/stop",
-                headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
-                timeout=15,
-            )
-            logger.info("DIAG bridge_stop response: HTTP %s", response.status_code)
-            response.raise_for_status()
-            logger.info("TTS bridge cancellation completed on skill exit")
-        except Exception:
-            logger.exception("DIAG bridge_stop failed on skill exit")
-
-    threading.Thread(target=run, daemon=True, name="tts-bridge-stop-on-exit").start()
-    return True
-
-
 def is_pause_command(text):
     """Распознаёт команды временной паузы голосового ответа."""
     command = " ".join(normalize_command(text).replace(",", " ").split())
@@ -760,7 +664,7 @@ def is_stop_command(text):
     """Распознаёт окончательный отказ от ответа, не смешивая его с паузой."""
     command = normalize_command(text)
     command = re.sub(r"^(?:алиса)\s+", "", command).strip()
-    return command in ("нет", "не надо", "не нужно", "не продолжай", "не продолжать")
+    return command in ("нет", "не надо", "не нужно", "хватит", "не продолжай", "не продолжать")
 
 
 def get_social_reply(text):
@@ -845,72 +749,82 @@ def is_joke_request(text):
     ))
 
 
-def split_answer_into_parts(answer, chunk_size=350):
-    """Делит исходный текст: порог 450 символов + конец предложения."""
+def split_answer_into_parts(answer, chunk_size=300):
+    """Делит длинный ответ на законченные голосовые фрагменты."""
     text = str(answer or "").strip()
-    text = re.sub(
-        r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$",
-        "", text, flags=re.IGNORECASE
-    )
+    text = re.sub(r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$", "", text, flags=re.IGNORECASE)
     if not text:
         return [""]
-    if len(text) <= chunk_size:
+    if len(text) <= 380:
         return [text]
 
-    # Сначала выделяем законченные предложения, сохраняя знаки препинания.
-    # Точка внутри чисел/сокращений не должна сама по себе завершать фрагмент.
-    sentence_pattern = re.compile(
-        r".*?(?:[.!?…](?=\s|$)|\n+|$)", re.DOTALL
-    )
-    sentences = [
-        item.strip() for item in sentence_pattern.findall(text)
-        if item and item.strip()
-    ]
+    # Сначала делим по предложениям, сохраняя знаки конца предложения.
+    sentences = re.findall(r".*?(?:[.!?…](?=\s|$)|$)", text, flags=re.DOTALL)
+    sentences = [part.strip() for part in sentences if part and part.strip()]
     if not sentences:
-        return [text]
+        sentences = [text]
 
     parts = []
     current = ""
+
+    def add_long_sentence(sentence):
+        words = sentence.split()
+        piece = ""
+        for word in words:
+            candidate = (piece + " " + word).strip()
+            if len(candidate) > chunk_size and piece:
+                parts.append(piece)
+                piece = word
+            else:
+                piece = candidate
+        if piece:
+            parts.append(piece)
+
     for sentence in sentences:
-        candidate = (current + " " + sentence).strip() if current else sentence
-        if len(candidate) >= chunk_size:
-            # 450-й символ может оказаться внутри этого предложения.
-            # Включаем предложение полностью; очень длинное предложение
-            # остаётся одним неделимым фрагментом.
-            parts.append(candidate)
-            current = ""
-        else:
+        if len(sentence) > chunk_size:
+            if current:
+                parts.append(current.strip())
+                current = ""
+            add_long_sentence(sentence)
+            continue
+
+        candidate = (current + " " + sentence).strip()
+        if len(candidate) <= chunk_size:
             current = candidate
+        else:
+            if current:
+                parts.append(current.strip())
+            current = sentence
 
     if current:
-        parts.append(current)
+        parts.append(current.strip())
+
+    # Если регулярное выражение не смогло корректно выделить предложения,
+    # гарантируем непустые части и разрезаем только по границе слова.
+    if not parts:
+        words = text.split()
+        current = ""
+        for word in words:
+            candidate = (current + " " + word).strip()
+            if len(candidate) > chunk_size and current:
+                parts.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            parts.append(current)
 
     return parts or [text]
 
 
 def prepare_job_parts(job, answer):
-    """Делит оригинал для озвучивания; нормализованные копии нужны только для расчёта времени."""
-    original_answer = str(answer or "").strip()
+    """Подготавливает части, если вопрос или сам ответ достаточно объёмный."""
+    answer = str(answer or "").strip()
     user_text = job.get("user_text", "")
-    should_split = (
-        is_complex_question(user_text)
-        or len(original_answer) > 380
-    )
-
-    # Сначала делим ИСХОДНЫЙ текст, чтобы границы и содержание фрагментов
-    # не зависели от того, насколько сильно нормализация расширяет текст.
-    parts = (
-        split_answer_into_parts(original_answer, chunk_size=350)
-        if should_split else [original_answer]
-    )
-
-    # Отдельная нормализованная копия каждого фрагмента используется только
-    # для оценки длительности. В ответ Алисе она не передаётся.
-    timing_parts = [normalize_russian(part) for part in parts]
-
-    job["answer"] = original_answer
+    should_split = is_complex_question(user_text) or len(answer) > 380
+    parts = split_answer_into_parts(answer) if should_split else [answer]
+    job["answer"] = answer
     job["parts"] = parts
-    job["timing_parts"] = timing_parts
     job["part_index"] = 0
     return parts
 
@@ -930,7 +844,6 @@ def deliver_job_part(body, job_key, job):
             prepare_job_parts(current, current.get("answer", ""))
 
         parts = current.get("parts") or [current.get("answer", "")]
-        timing_parts = current.get("timing_parts") or []
         index = int(current.get("part_index", 0))
         if index >= len(parts):
             search_jobs.pop(job_key, None)
@@ -938,21 +851,8 @@ def deliver_job_part(body, job_key, job):
             return make_response(body, "На этом всё.")
 
         answer = parts[index]
+        part_text = answer
         is_last = index == len(parts) - 1
-        # Одинаково завершаем последнюю часть длинного ответа и короткий ответ.
-        if is_last and not answer.rstrip().endswith("Чем я ещё могу помочь?"):
-            answer = answer.rstrip() + " Чем я ещё могу помочь?"
-
-        # Для промежуточного фрагмента берём заранее подготовленную
-        # нормализованную копию. Для последнего учитываем и заключительную фразу.
-        if is_last:
-            timing_text = normalize_russian(answer)
-        elif index < len(timing_parts):
-            timing_text = timing_parts[index]
-        else:
-            # Совместимость с задачами, сохранёнными до появления timing_parts.
-            timing_text = normalize_russian(parts[index])
-
         current["part_index"] = index + 1
         current["auto_reading"] = not is_last
         current["auto_reading_paused"] = False
@@ -976,9 +876,9 @@ def deliver_job_part(body, job_key, job):
 
     response = make_response(body, answer, final_history) if final_history is not None else make_response(body, answer)
     if schedule_next:
-        schedule_auto_next_part(job_key, job.get("job_id"), timing_text)
+        schedule_auto_next_part(job_key, job.get("job_id"), part_text)
     if schedule_final:
-        schedule_final_part_cleanup(job_key, job.get("job_id"), timing_text)
+        schedule_final_part_cleanup(job_key, job.get("job_id"), part_text)
     return response
 
 def is_stock_quote_request(text):
@@ -2673,12 +2573,12 @@ def search_and_answer(session_id, job_id, user_text, history):
         return result
 
 
-def make_response(body, answer, history=None, end_session=False):
+def make_response(body, answer, history=None):
     response_data = {
         "version": body["version"],
         "session": body["session"],
         "response": {
-            "end_session": bool(end_session),
+            "end_session": False,
             "text": limit_text(answer),
         },
     }
@@ -2708,23 +2608,8 @@ async def main(body: dict):
     request_data = body.get("request", {})
     user_text = str(request_data.get("original_utterance") or "").strip()
 
-    # Временная диагностика голосовых команд. Не меняет маршрутизацию запросов.
-    if user_text:
-        diag_exit = is_exit_skill_command(user_text)
-        diag_pause = is_pause_command(user_text)
-        diag_stop = is_stop_command(user_text)
-        diag_continue = is_continue_command(user_text)
-        logger.info(
-            "DIAG webhook utterance=%r | exit=%s pause=%s stop=%s continue=%s",
-            user_text, diag_exit, diag_pause, diag_stop, diag_continue,
-        )
-    else:
-        logger.info("DIAG webhook received empty original_utterance (skill launch/wakeup)")
-
-    # При запуске навыка будим TTS-мост в фоне, пока Алиса произносит приветствие.
-    # Сам запрос не обращается к колонке и не задерживает ответ навыка.
+    # Пустой запуск навыка только приветствует и не затрагивает фоновые задачи.
     if not user_text:
-        wake_tts_bridge_on_skill_launch()
         return make_response(
             body,
             "Привет! Я твой интеллектуальный помощник DeepSeek Алиса. Чем могу помочь?",
@@ -2734,21 +2619,6 @@ async def main(body: dict):
     session_id = str(session.get("session_id", "default"))
     user_id = session.get("user", {}).get("user_id")
     job_key = str(user_id or session_id)
-
-    # Выход обрабатываем раньше любых команд продолжения/поиска.
-    if is_exit_skill_command(user_text):
-        logger.info("DIAG handler=exit; response end_session=True")
-        with jobs_lock:
-            search_jobs.pop(job_key, None)
-            interrupted_jobs.pop(job_key, None)
-            persist_job_maps()
-        stop_tts_bridge_on_skill_exit()
-        return make_response(
-            body,
-            "Хорошо, выхожу из навыка.",
-            history=[],
-            end_session=True,
-        )
 
     state = body.get("state", {}).get("session", {})
     history = state.get("history", [])
@@ -2803,7 +2673,7 @@ async def main(body: dict):
         if job and job.get("status") == "pending":
             with jobs_lock:
                 current = search_jobs.get(job_key)
-                notice = pending_job_notice(current) if current else "Хорошо"
+                notice = pending_job_notice(current) if current else "Секундочку"
             return make_response(body, notice)
         if job and job.get("status") == "ready":
             return deliver_job_part(body, job_key, job)
@@ -2833,7 +2703,7 @@ async def main(body: dict):
         if job and job.get("status") == "pending":
             with jobs_lock:
                 current = search_jobs.get(job_key)
-                notice = pending_job_notice(current) if current else "Хорошо"
+                notice = pending_job_notice(current) if current else "Секундочку"
             return make_response(body, notice)
         if job and job.get("status") == "ready":
             return deliver_job_part(body, job_key, job)
@@ -2847,7 +2717,6 @@ async def main(body: dict):
 
     # Пауза сохраняет готовый ответ и текущую часть для повторного чтения.
     if job and job.get("status") == "ready" and is_pause_command(user_text):
-        logger.info("DIAG handler=pause; active_job_status=ready")
         with jobs_lock:
             current = search_jobs.get(job_key)
             if current and current.get("job_id") == job.get("job_id"):
@@ -2864,7 +2733,6 @@ async def main(body: dict):
 
     # Окончательный отказ удаляет ответ; пауза выше его сохраняет.
     if (job or interrupted) and is_stop_command(user_text):
-        logger.info("DIAG handler=stop; active_or_interrupted_job=True")
         with jobs_lock:
             current = search_jobs.get(job_key)
             if current and (not job or current.get("job_id") == job.get("job_id")):
@@ -2887,7 +2755,7 @@ async def main(body: dict):
                         notice = None
                         job = dict(current)
                 else:
-                    notice = "Хорошо"
+                    notice = "Секундочку"
 
             if notice is not None:
                 return make_response(body, notice)
@@ -3082,7 +2950,7 @@ async def main(body: dict):
             "Chat is still running after %.2f seconds; returning control to Alice",
             wait_timeout,
         )
-        return make_response(body, "Хорошо")
+        return make_response(body, "Секундочку")
 
     except Exception:
         logger.exception("Chat request failed")
