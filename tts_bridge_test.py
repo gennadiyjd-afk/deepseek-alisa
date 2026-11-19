@@ -734,13 +734,18 @@ def bridge_say(
         raise HTTPException(502, f"Ошибка отправки: {type(exc).__name__}")
 
 
-def send_voice_command(text: str, require_active_bridge: bool = False):
+def send_voice_command(text: str, require_active_bridge: bool = False, diag_id: str = ""):
     """Отправляет Quasar text_action; автоматические команды закрываются при выходе."""
+    diag_id = str(diag_id or "manual")[:32]
+    log.info("DIAG command[%s] waiting bridge _guard active_required=%s", diag_id, require_active_bridge)
     # Держим блокировку до завершения HTTP-запроса: stop дождётся уже начатой
     # команды, затем поставит воспроизведение на паузу. После stop новые команды
     # не пройдут до следующего session/start.
+    guard_wait_started = time.monotonic()
     with _guard:
+        log.info("DIAG command[%s] acquired _guard wait=%.3fs bridge_enabled=%s", diag_id, time.monotonic() - guard_wait_started, _bridge_commands_enabled)
         if require_active_bridge and not _bridge_commands_enabled:
+            log.info("DIAG command[%s] rejected: bridge disabled", diag_id)
             raise HTTPException(409, "Команды моста отменены: навык завершён")
         session = _state.get("session")
         csrf = _state.get("csrf")
@@ -751,6 +756,7 @@ def send_voice_command(text: str, require_active_bridge: bool = False):
             raise HTTPException(409, "Личная станция не определена")
         device_id = str(devices[0]["id"])
         try:
+            log.info("DIAG command[%s] Quasar text_action POST BEGIN", diag_id)
             response = session.post(
                 f"{QUASAR_API}/user/devices/{device_id}/actions",
                 json={"actions": [{
@@ -760,7 +766,9 @@ def send_voice_command(text: str, require_active_bridge: bool = False):
                 headers={"x-csrf-token": csrf},
                 timeout=20,
             )
+            log.info("DIAG command[%s] Quasar text_action POST END http=%s", diag_id, response.status_code)
             response_json(response, "Отправка текстовой команды")
+            log.info("DIAG command[%s] accepted by Quasar; _guard released on return", diag_id)
             return {"ok": True, "message": "Текстовая команда отправлена на личную станцию"}
         except HTTPException:
             raise
@@ -794,11 +802,13 @@ def bridge_command(
         raise HTTPException(401, "Неверный ключ моста")
 
     text = str(payload.get("text") or "").strip()
+    diag_id = str(payload.get("diag_id") or "")[:32]
     if not text:
         raise HTTPException(400, "Пустой текст команды")
     if len(text) > 500:
         raise HTTPException(400, "Максимальная длина команды — 500 символов")
-    return send_voice_command(text, require_active_bridge=True)
+    log.info("DIAG bridge command[%s] endpoint received", diag_id or "no-id")
+    return send_voice_command(text, require_active_bridge=True, diag_id=diag_id)
 
 
 
@@ -816,14 +826,18 @@ def bridge_session_start(x_bridge_secret: str = Header(default="")):
 
 
 @app.post("/api/bridge/stop")
-def bridge_stop(x_bridge_secret: str = Header(default="")):
+def bridge_stop(x_bridge_secret: str = Header(default=""), x_diag_trace: str = Header(default="")):
     """Отменяет будущие автоматические команды и ставит воспроизведение на паузу."""
+    diag_id = str(x_diag_trace or "no-id")[:32]
+    log.info("DIAG stop[%s] endpoint received; waiting bridge _guard", diag_id)
+    guard_wait_started = time.monotonic()
     global _bridge_commands_enabled
     if not BRIDGE_SECRET:
         raise HTTPException(503, "На Render не задана переменная TTS_BRIDGE_SECRET")
     if not secrets.compare_digest(x_bridge_secret, BRIDGE_SECRET):
         raise HTTPException(401, "Неверный ключ моста")
     with _guard:
+        log.info("DIAG stop[%s] acquired _guard wait=%.3fs; disabling automatic commands", diag_id, time.monotonic() - guard_wait_started)
         _bridge_commands_enabled = False
         session = _state.get("session")
         csrf = _state.get("csrf")
@@ -834,6 +848,7 @@ def bridge_stop(x_bridge_secret: str = Header(default="")):
             return {"ok": True, "message": "Команды заблокированы; личная станция не определена"}
         device_id = str(devices[0]["id"])
         try:
+            log.info("DIAG stop[%s] Quasar pause POST BEGIN", diag_id)
             response = session.post(
                 f"{QUASAR_API}/user/devices/{device_id}/actions",
                 json={"actions": [{
@@ -843,7 +858,9 @@ def bridge_stop(x_bridge_secret: str = Header(default="")):
                 headers={"x-csrf-token": csrf},
                 timeout=20,
             )
+            log.info("DIAG stop[%s] Quasar pause POST END http=%s", diag_id, response.status_code)
             response_json(response, "Остановка воспроизведения")
+            log.info("DIAG stop[%s] pause accepted; bridge commands disabled", diag_id)
             return {"ok": True, "message": "Команды отменены, воспроизведение остановлено"}
         except HTTPException:
             raise

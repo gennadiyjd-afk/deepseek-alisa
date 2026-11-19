@@ -263,37 +263,41 @@ def auto_deliver_ready_job(job_key, job_id):
 
 def send_bridge_continue_command(job_key, job_id, expected_generation=None):
     """Просит активный навык выдать следующую часть готового ответа."""
+    diag_id = uuid.uuid4().hex[:10]
     if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
-        logger.warning("Automatic continuation skipped: TTS bridge is not configured")
+        logger.warning("DIAG continue[%s] skipped: bridge is not configured", diag_id)
         return False
-    # Lock order matters: acquire the bridge-operation lock first, then recheck
-    # the job generation. A stop that wins this lock invalidates any older timer.
+    logger.info("DIAG continue[%s] waiting bridge_operation_lock job=%s generation=%s", diag_id, job_id[:8], expected_generation)
+    lock_wait_started = time.monotonic()
     with bridge_operation_lock:
+        logger.info("DIAG continue[%s] acquired bridge_operation_lock wait=%.3fs", diag_id, time.monotonic() - lock_wait_started)
         with jobs_lock:
             current = search_jobs.get(job_key)
-            if (
-                not current
-                or current.get("job_id") != job_id
-                or current.get("status") != "ready"
-                or current.get("auto_reading_paused")
-                or not current.get("auto_reading")
-                or (expected_generation is not None and
-                    int(current.get("auto_next_generation", 0)) != expected_generation)
-            ):
-                logger.info("Automatic continuation skipped: job state changed before bridge send")
+            valid = bool(
+                current
+                and current.get("job_id") == job_id
+                and current.get("status") == "ready"
+                and not current.get("auto_reading_paused")
+                and current.get("auto_reading")
+                and (expected_generation is None or int(current.get("auto_next_generation", 0)) == expected_generation)
+            )
+            if not valid:
+                logger.info("DIAG continue[%s] rejected by state check job=%s expected_generation=%s", diag_id, job_id[:8], expected_generation)
                 return False
         try:
+            logger.info("DIAG continue[%s] POST bridge command BEGIN job=%s", diag_id, job_id[:8])
             response = requests.post(
                 f"{TTS_BRIDGE_URL}/api/bridge/command",
-                headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
-                json={"text": "Алиса, продолжи"},
+                headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET, "X-Diag-Trace": diag_id},
+                json={"text": "Алиса, продолжи", "diag_id": diag_id},
                 timeout=25,
             )
+            logger.info("DIAG continue[%s] POST bridge command END http=%s", diag_id, response.status_code)
             response.raise_for_status()
             logger.info("Automatic continuation command sent for job %s", job_id[:8])
             return True
         except Exception:
-            logger.exception("Could not send automatic continuation command")
+            logger.exception("DIAG continue[%s] bridge command failed", diag_id)
             return False
 
 
@@ -310,22 +314,35 @@ def schedule_auto_next_part(job_key, job_id, part_text):
         persist_job_maps()
 
     def run():
+        timer_started = time.monotonic()
+        logger.info("DIAG timer[%s] scheduled delay=%.3fs job=%s generation=%s text_len=%s", job_id[:8], estimated_seconds, job_id[:8], generation, len(str(part_text or "")))
         time.sleep(estimated_seconds)
+        logger.info("DIAG timer[%s] FIRED after=%.3fs generation=%s", job_id[:8], time.monotonic() - timer_started, generation)
         with jobs_lock:
             current = search_jobs.get(job_key)
-            if (
-                not current
-                or current.get("job_id") != job_id
-                or int(current.get("auto_next_generation", 0)) != generation
-                or current.get("status") != "ready"
-                or current.get("auto_reading_paused")
-                or not current.get("auto_reading")
-                or current.get("auto_next_thread_started")
-            ):
-                logger.info("Stale auto-next timer ignored for job %s", job_id[:8])
+            valid = bool(
+                current
+                and current.get("job_id") == job_id
+                and int(current.get("auto_next_generation", 0)) == generation
+                and current.get("status") == "ready"
+                and not current.get("auto_reading_paused")
+                and current.get("auto_reading")
+                and not current.get("auto_next_thread_started")
+            )
+            if not valid:
+                state = None if not current else {
+                    "job_match": current.get("job_id") == job_id,
+                    "generation": current.get("auto_next_generation"),
+                    "status": current.get("status"),
+                    "paused": current.get("auto_reading_paused"),
+                    "auto_reading": current.get("auto_reading"),
+                    "thread_started": current.get("auto_next_thread_started"),
+                }
+                logger.info("DIAG timer[%s] CANCELLED state=%s", job_id[:8], state)
                 return
             current["auto_next_thread_started"] = True
             persist_job_maps()
+        logger.info("DIAG timer[%s] state check PASSED; sending continuation", job_id[:8])
         try:
             send_bridge_continue_command(job_key, job_id, generation)
         finally:
@@ -772,13 +789,18 @@ def stop_tts_bridge_for_interruption():
         return False
     # Serialize stop with automatic continue. If a continue is already in flight,
     # stop is sent after it; if stop wins, stale timers fail their generation check.
+    diag_id = uuid.uuid4().hex[:10]
+    logger.info("DIAG stop[%s] waiting bridge_operation_lock", diag_id)
+    lock_wait_started = time.monotonic()
     with bridge_operation_lock:
+        logger.info("DIAG stop[%s] acquired bridge_operation_lock wait=%.3fs; POST bridge stop BEGIN", diag_id, time.monotonic() - lock_wait_started)
         try:
             response = requests.post(
                 f"{TTS_BRIDGE_URL}/api/bridge/stop",
-                headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
+                headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET, "X-Diag-Trace": diag_id},
                 timeout=20,
             )
+            logger.info("DIAG stop[%s] POST bridge stop END http=%s", diag_id, response.status_code)
             response.raise_for_status()
             logger.info("Bridge stopped for incoming webhook utterance: HTTP %s", response.status_code)
             return True
@@ -833,6 +855,13 @@ def pause_active_job_for_incoming_utterance(job_key, user_text):
             current["last_part_playing"] = False
             persist_job_maps()
             should_stop_bridge = True
+            logger.info(
+                "DIAG pause state-set job=%s current_part=%s resume_part=%s generation=%s; incoming utterance received",
+                str(current.get("job_id", ""))[:8],
+                current.get("current_part_index"),
+                current.get("resume_part_index"),
+                current.get("auto_next_generation"),
+            )
             logger.info(
                 "Incoming utterance paused current answer before processing: %r",
                 user_text[:160],
