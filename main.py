@@ -2924,8 +2924,15 @@ async def main(body: dict):
         normalize_command(user_text).replace(",", " ").split()
     )
     is_bridge_auto_continue = normalized_bridge_command == "алиса продолжи"
+    is_wait_command_utterance = is_wait_command(user_text)
     if is_bridge_auto_continue:
         logger.info("Bridge auto-continue recognized; skipping incoming-utterance interruption")
+    elif is_wait_command_utterance:
+        # «Алиса, я жду» — служебная команда моста для получения готового
+        # ответа. Она также может быть произнесена пользователем, поэтому
+        # обрабатывается как retrieval-команда, но не как прерывание текущего
+        # чтения: иначе ниже deliver_job_part повторно выдаст тот же фрагмент.
+        logger.info("Wait/retrieval command recognized; skipping incoming-utterance interruption")
     else:
         # Любая другая реплика, реально дошедшая до вебхука во время чтения,
         # останавливает мост и фиксирует начало текущего фрагмента.
