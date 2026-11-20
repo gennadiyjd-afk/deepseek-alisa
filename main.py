@@ -34,9 +34,6 @@ search_jobs = {}
 interrupted_jobs = {}
 MAX_CONVERSATION_TOPICS = 2
 jobs_lock = threading.RLock()
-# Serializes bridge continue/stop HTTP calls so a late timer cannot restart
-# playback after a newer webhook interruption has already stopped the bridge.
-bridge_operation_lock = threading.Lock()
 
 # Небольшой серверный кэш снижает число одинаковых запросов к погодным API.
 WEATHER_CACHE = {}
@@ -127,13 +124,6 @@ def send_bridge_wait_command(job_key, job_id):
     """Передаёт станции команду навыку и не произносит её как обычную фразу."""
     if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
         logger.warning("Automatic wait command skipped: TTS bridge is not configured")
-        return False
-
-    # Новая задача могла появиться после того, как предыдущая реплика
-    # остановила мост. Перед первой командой ожидания обязательно снова
-    # разрешаем автоматические команды моста.
-    if not activate_tts_bridge_session():
-        logger.warning("Automatic wait command skipped: bridge session is inactive")
         return False
 
     now = time.time()
@@ -261,90 +251,59 @@ def auto_deliver_ready_job(job_key, job_id):
 
 
 
-def send_bridge_continue_command(job_key, job_id, expected_generation=None):
+def send_bridge_continue_command(job_key, job_id):
     """Просит активный навык выдать следующую часть готового ответа."""
-    diag_id = uuid.uuid4().hex[:10]
     if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
-        logger.warning("DIAG continue[%s] skipped: bridge is not configured", diag_id)
+        logger.warning("Automatic continuation skipped: TTS bridge is not configured")
         return False
-    logger.info("DIAG continue[%s] waiting bridge_operation_lock job=%s generation=%s", diag_id, job_id[:8], expected_generation)
-    lock_wait_started = time.monotonic()
-    with bridge_operation_lock:
-        logger.info("DIAG continue[%s] acquired bridge_operation_lock wait=%.3fs", diag_id, time.monotonic() - lock_wait_started)
-        with jobs_lock:
-            current = search_jobs.get(job_key)
-            valid = bool(
-                current
-                and current.get("job_id") == job_id
-                and current.get("status") == "ready"
-                and not current.get("auto_reading_paused")
-                and current.get("auto_reading")
-                and (expected_generation is None or int(current.get("auto_next_generation", 0)) == expected_generation)
-            )
-            if not valid:
-                logger.info("DIAG continue[%s] rejected by state check job=%s expected_generation=%s", diag_id, job_id[:8], expected_generation)
-                return False
-        try:
-            logger.info("DIAG continue[%s] POST bridge command BEGIN job=%s", diag_id, job_id[:8])
-            response = requests.post(
-                f"{TTS_BRIDGE_URL}/api/bridge/command",
-                headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET, "X-Diag-Trace": diag_id},
-                json={"text": "Алиса, продолжи", "diag_id": diag_id},
-                timeout=25,
-            )
-            logger.info("DIAG continue[%s] POST bridge command END http=%s", diag_id, response.status_code)
-            response.raise_for_status()
-            logger.info("Automatic continuation command sent for job %s", job_id[:8])
-            return True
-        except Exception:
-            logger.exception("DIAG continue[%s] bridge command failed", diag_id)
+    with jobs_lock:
+        current = search_jobs.get(job_key)
+        if (
+            not current
+            or current.get("job_id") != job_id
+            or current.get("status") != "ready"
+            or current.get("auto_reading_paused")
+            or not current.get("auto_reading")
+        ):
             return False
+    try:
+        response = requests.post(
+            f"{TTS_BRIDGE_URL}/api/bridge/command",
+            headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
+            json={"text": "Алиса, продолжи"},
+            timeout=25,
+        )
+        response.raise_for_status()
+        logger.info("Automatic continuation command sent for job %s", job_id[:8])
+        return True
+    except Exception:
+        logger.exception("Could not send automatic continuation command")
+        return False
 
 
 def schedule_auto_next_part(job_key, job_id, part_text):
-    """Ждёт примерную длительность части; устаревшие таймеры после паузы игнорируются."""
-    # Сохраняем прежний комфортный интервал 17 + 1,5 секунды.
+    """Ждёт примерную длительность озвучивания части и запрашивает следующую."""
+    # Яндекс не сообщает webhook точный момент окончания воспроизведения.
+    # Поэтому ждём консервативную оценку длительности, а не отправляем команды подряд.
     estimated_seconds = max(4.0, len(str(part_text or "")) / 17.0 + 1.5)
-    with jobs_lock:
-        current = search_jobs.get(job_key)
-        if not current or current.get("job_id") != job_id:
-            return
-        generation = int(current.get("auto_next_generation", 0)) + 1
-        current["auto_next_generation"] = generation
-        persist_job_maps()
 
     def run():
-        timer_started = time.monotonic()
-        logger.info("DIAG timer[%s] scheduled delay=%.3fs job=%s generation=%s text_len=%s", job_id[:8], estimated_seconds, job_id[:8], generation, len(str(part_text or "")))
         time.sleep(estimated_seconds)
-        logger.info("DIAG timer[%s] FIRED after=%.3fs generation=%s", job_id[:8], time.monotonic() - timer_started, generation)
         with jobs_lock:
             current = search_jobs.get(job_key)
-            valid = bool(
-                current
-                and current.get("job_id") == job_id
-                and int(current.get("auto_next_generation", 0)) == generation
-                and current.get("status") == "ready"
-                and not current.get("auto_reading_paused")
-                and current.get("auto_reading")
-                and not current.get("auto_next_thread_started")
-            )
-            if not valid:
-                state = None if not current else {
-                    "job_match": current.get("job_id") == job_id,
-                    "generation": current.get("auto_next_generation"),
-                    "status": current.get("status"),
-                    "paused": current.get("auto_reading_paused"),
-                    "auto_reading": current.get("auto_reading"),
-                    "thread_started": current.get("auto_next_thread_started"),
-                }
-                logger.info("DIAG timer[%s] CANCELLED state=%s", job_id[:8], state)
+            if (
+                not current
+                or current.get("job_id") != job_id
+                or current.get("status") != "ready"
+                or current.get("auto_reading_paused")
+                or not current.get("auto_reading")
+                or current.get("auto_next_thread_started")
+            ):
                 return
             current["auto_next_thread_started"] = True
             persist_job_maps()
-        logger.info("DIAG timer[%s] state check PASSED; sending continuation", job_id[:8])
         try:
-            send_bridge_continue_command(job_key, job_id, generation)
+            send_bridge_continue_command(job_key, job_id)
         finally:
             with jobs_lock:
                 current = search_jobs.get(job_key)
@@ -787,26 +746,18 @@ def stop_tts_bridge_for_interruption():
     if not TTS_BRIDGE_URL or not TTS_BRIDGE_SECRET:
         logger.warning("Bridge interruption stop skipped: bridge is not configured")
         return False
-    # Serialize stop with automatic continue. If a continue is already in flight,
-    # stop is sent after it; if stop wins, stale timers fail their generation check.
-    diag_id = uuid.uuid4().hex[:10]
-    logger.info("DIAG stop[%s] waiting bridge_operation_lock", diag_id)
-    lock_wait_started = time.monotonic()
-    with bridge_operation_lock:
-        logger.info("DIAG stop[%s] acquired bridge_operation_lock wait=%.3fs; POST bridge stop BEGIN", diag_id, time.monotonic() - lock_wait_started)
-        try:
-            response = requests.post(
-                f"{TTS_BRIDGE_URL}/api/bridge/stop",
-                headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET, "X-Diag-Trace": diag_id},
-                timeout=20,
-            )
-            logger.info("DIAG stop[%s] POST bridge stop END http=%s", diag_id, response.status_code)
-            response.raise_for_status()
-            logger.info("Bridge stopped for incoming webhook utterance: HTTP %s", response.status_code)
-            return True
-        except Exception:
-            logger.exception("Could not stop bridge for incoming webhook utterance")
-            return False
+    try:
+        response = requests.post(
+            f"{TTS_BRIDGE_URL}/api/bridge/stop",
+            headers={"X-Bridge-Secret": TTS_BRIDGE_SECRET},
+            timeout=20,
+        )
+        response.raise_for_status()
+        logger.info("Bridge stopped for incoming webhook utterance: HTTP %s", response.status_code)
+        return True
+    except Exception:
+        logger.exception("Could not stop bridge for incoming webhook utterance")
+        return False
 
 
 def activate_tts_bridge_session():
@@ -850,18 +801,10 @@ def pause_active_job_for_incoming_utterance(job_key, user_text):
                 current["resume_part_index"] = resume_index
             current["auto_reading"] = False
             current["auto_reading_paused"] = True
-            current["auto_next_generation"] = int(current.get("auto_next_generation", 0)) + 1
             current["auto_next_thread_started"] = False
             current["last_part_playing"] = False
             persist_job_maps()
             should_stop_bridge = True
-            logger.info(
-                "DIAG pause state-set job=%s current_part=%s resume_part=%s generation=%s; incoming utterance received",
-                str(current.get("job_id", ""))[:8],
-                current.get("current_part_index"),
-                current.get("resume_part_index"),
-                current.get("auto_next_generation"),
-            )
             logger.info(
                 "Incoming utterance paused current answer before processing: %r",
                 user_text[:160],
@@ -1109,7 +1052,6 @@ def deliver_job_part(body, job_key, job):
         current["part_index"] = index + 1
         current["auto_reading"] = not is_last
         current["auto_reading_paused"] = False
-        current["auto_next_generation"] = int(current.get("auto_next_generation", 0)) + 1
         current["auto_next_thread_started"] = False
 
         if is_last:
@@ -2880,26 +2822,21 @@ async def main(body: dict):
     session_id = str(session.get("session_id", "default"))
     user_id = session.get("user", {}).get("user_id")
     job_key = str(user_id or session_id)
-    session_is_new = bool(session.get("new", False))
 
-    # session.new — штатный признак нового диалога Яндекс.Алисы. Он надёжнее
-    # пустого original_utterance: первый запрос нового сеанса может уже содержать вопрос.
-    if session_is_new or not user_text:
+    # Пустая исходная реплика означает новый запуск навыка: очищаем только
+    # разговорные ответы этого пользователя, но не авторизацию Яндекса/моста.
+    if not user_text:
         with jobs_lock:
             search_jobs.pop(job_key, None)
             interrupted_jobs.pop(job_key, None)
             persist_job_maps()
-        logger.info(
-            "New skill session: cleared answer/topic state (session.new=%s, empty_utterance=%s, key=%s)",
-            session_is_new, not bool(user_text), job_key[:12],
-        )
+        logger.info("New skill session: previous answer and topic state cleared for key %s", job_key[:12])
         wake_tts_bridge_on_skill_launch()
-        if not user_text:
-            return make_response(
-                body,
-                "Привет! Я твой интеллектуальный помощник DeepSeek Алиса. Чем могу помочь?",
-                history=[],
-            )
+        return make_response(
+            body,
+            "Привет! Я твой интеллектуальный помощник DeepSeek Алиса. Чем могу помочь?",
+            history=[],
+        )
 
     # Выход обрабатываем раньше любых команд продолжения/поиска.
     if is_exit_skill_command(user_text):
@@ -2916,30 +2853,13 @@ async def main(body: dict):
             end_session=True,
         )
 
-    # Автоматическая команда моста «Алиса, продолжи» приходит в тот же вебхук,
-    # что и реплики пользователя. Её нельзя трактовать как новое прерывание:
-    # иначе мы сохраняем начало уже прочитанного фрагмента, останавливаем мост
-    # и затем повторно выдаём этот же фрагмент по кругу.
-    normalized_bridge_command = " ".join(
-        normalize_command(user_text).replace(",", " ").split()
-    )
-    is_bridge_auto_continue = normalized_bridge_command == "алиса продолжи"
-    is_wait_command_utterance = is_wait_command(user_text)
-    if is_bridge_auto_continue:
-        logger.info("Bridge auto-continue recognized; skipping incoming-utterance interruption")
-    elif is_wait_command_utterance:
-        # «Алиса, я жду» — служебная команда моста для получения готового
-        # ответа. Она также может быть произнесена пользователем, поэтому
-        # обрабатывается как retrieval-команда, но не как прерывание текущего
-        # чтения: иначе ниже deliver_job_part повторно выдаст тот же фрагмент.
-        logger.info("Wait/retrieval command recognized; skipping incoming-utterance interruption")
-    else:
-        # Любая другая реплика, реально дошедшая до вебхука во время чтения,
-        # останавливает мост и фиксирует начало текущего фрагмента.
-        pause_active_job_for_incoming_utterance(job_key, user_text)
+    # Любая реплика, реально дошедшая до вебхука во время чтения,
+    # сначала останавливает мост и фиксирует начало текущего фрагмента.
+    # Команда «Продолжи» ниже затем снова активирует мост перед выдачей.
+    pause_active_job_for_incoming_utterance(job_key, user_text)
 
     state = body.get("state", {}).get("session", {})
-    history = [] if session_is_new else state.get("history", [])
+    history = state.get("history", [])
     wake_command = is_wake_command(user_text)
     continue_command = is_continue_command(user_text)
     repair_continue_command = is_continuation_repair_request(user_text)
@@ -3049,8 +2969,6 @@ async def main(body: dict):
                 current["last_part_playing"] = False
                 current["auto_reading"] = False
                 current["auto_reading_paused"] = True
-                current["auto_next_generation"] = int(current.get("auto_next_generation", 0)) + 1
-                current["auto_next_thread_started"] = False
                 persist_job_maps()
         return make_response(body, "Хорошо, поставила на паузу. Скажи «Продолжить», когда будешь готов.")
 
