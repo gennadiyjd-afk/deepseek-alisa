@@ -2608,8 +2608,52 @@ def _normalize_result_domain(domain, url=""):
     return host
 
 
+def _xml_first_descendant_text(element, names):
+    """Извлекает первое непустое значение из необязательных XML-полей."""
+    wanted = {str(name).lower() for name in names}
+    for node in element.iter():
+        if node is element:
+            continue
+        if _xml_local_name(node.tag) in wanted:
+            value = " ".join("".join(node.itertext()).split())
+            if value:
+                return value
+    return ""
+
+
+def _is_generic_site_page(title, url):
+    """Отбрасывает главные страницы и разделы вместо отдельных публикаций."""
+    title_norm = " ".join(str(title or "").lower().replace("ё", "е").split())
+    generic_title_markers = (
+        "главная страница",
+        "лента новостей",
+        "новости онлайн",
+        "все новости",
+        "последние новости",
+        "главные новости",
+        "новости сегодня",
+    )
+    if any(marker in title_norm for marker in generic_title_markers):
+        return True
+
+    try:
+        path = urlsplit(str(url or "")).path.strip("/")
+    except Exception:
+        path = ""
+    if not path:
+        return True
+
+    # URL раздела обычно состоит из одного сегмента (/news/, /live/,
+    # /economics/ и т.п.). Отдельные публикации имеют дополнительный путь.
+    path_parts = [part for part in path.split("/") if part]
+    if len(path_parts) < 2:
+        return True
+
+    return False
+
+
 def yandex_search_sources(query, required_domain=""):
-    """Выполняет основной поиск через Yandex Search API и возвращает источники."""
+    """Ищет через Yandex Search API, разделяя документы и отбрасывая разделы сайта."""
     if not YANDEX_API_KEY:
         raise RuntimeError("YANDEX_API_KEY is missing")
 
@@ -2624,21 +2668,20 @@ def yandex_search_sources(query, required_domain=""):
         family_mode="FAMILY_MODE_MODERATE",
         fix_typo_mode="FIX_TYPO_MODE_ON",
         sort_mode="SORT_MODE_BY_RELEVANCE",
-        groups_on_page=5,
+        # Берём больше пяти кандидатов: часть может оказаться разделами сайта.
+        groups_on_page=20,
         sort_order="SORT_ORDER_DESC",
-        group_mode="GROUP_MODE_DEEP",
+        group_mode="GROUP_MODE_FLAT",
         docs_in_group=1,
-        max_passages=2,
+        max_passages=5,
         localization="LOCALIZATION_RU",
     )
 
     # Yandex Search API ограничивает длину поисковой строки 400 символами.
     yandex_query = str(query or "").strip()
     if required_domain:
-        # Официальный оператор site: ограничивает выдачу сайтом и его поддоменами.
         site_operator = f"site:{required_domain}"
         if site_operator.lower() not in yandex_query.lower():
-            # Сохраняем оператор целиком в пределах лимита API — 400 символов.
             base_query = yandex_query[: max(1, 399 - len(site_operator))].rstrip()
             yandex_query = f"{base_query} {site_operator}".strip()
     yandex_query = yandex_query[:400]
@@ -2661,6 +2704,9 @@ def yandex_search_sources(query, required_domain=""):
 
     root = ET.fromstring(xml_text)
     sources = []
+    seen_urls = set()
+    rejected_generic = 0
+    rejected_domain = 0
     for doc in root.iter():
         if _xml_local_name(doc.tag) != "doc":
             continue
@@ -2670,35 +2716,62 @@ def yandex_search_sources(query, required_domain=""):
         domain = _xml_direct_text(doc, {"domain"})
         normalized_domain = _normalize_result_domain(domain, url)
 
-        # Дополнительная проверка на нашей стороне: не передаём модели
-        # результаты с посторонних сайтов даже при операторе site:.
+        # Не передаём модели результаты с посторонних сайтов даже при site:.
         if required_domain and not (
             normalized_domain == required_domain
             or normalized_domain.endswith("." + required_domain)
         ):
+            rejected_domain += 1
             continue
-        domain = normalized_domain or domain
 
+        if _is_generic_site_page(title, url):
+            rejected_generic += 1
+            continue
+
+        canonical_url = str(url or "").split("#", 1)[0].rstrip("/").lower()
+        if canonical_url and canonical_url in seen_urls:
+            continue
+        if canonical_url:
+            seen_urls.add(canonical_url)
+
+        # Сохраняем пассажи отдельными фрагментами, чтобы модель не смешивала
+        # их с выдержками из соседних документов.
         passage_parts = []
         for node in doc.iter():
             if _xml_local_name(node.tag) in {"passage", "headline", "description"}:
                 value = " ".join("".join(node.itertext()).split())
                 if value and value not in passage_parts:
                     passage_parts.append(value)
-        content = " ".join(passage_parts).strip()
 
-        if not domain and "://" in url:
-            domain = url.split("//", 1)[1].split("/", 1)[0]
-        if not content:
-            content = title
-
-        sources.append(
-            "Источник: " + title
-            + "\nДомен: " + (domain or "не указан")
-            + "\nДата публикации материала: не указана в поисковой выдаче"
-            + "\nURL: " + (url or "не указан")
-            + "\nФрагмент источника: " + content[:1400]
+        publication_date = _xml_first_descendant_text(
+            doc,
+            {"pubdate", "published", "published_time", "publishedat", "pub_date", "date"},
         )
+        if not publication_date:
+            publication_date = _xml_first_descendant_text(
+                doc, {"modtime", "lastmod", "last_modified"}
+            )
+            if publication_date:
+                publication_date = "не указана; дата изменения документа: " + publication_date
+
+        domain = normalized_domain or domain or "не указан"
+        source_lines = [
+            "ОТДЕЛЬНЫЙ ПОИСКОВЫЙ ДОКУМЕНТ",
+            "Заголовок: " + title,
+            "Домен: " + domain,
+            "Дата публикации: " + (publication_date or "не указана в поисковой выдаче"),
+            "URL: " + (url or "не указан"),
+        ]
+        if passage_parts:
+            source_lines.append("Фрагменты ИМЕННО ЭТОГО документа:")
+            source_lines.extend(
+                f"Фрагмент {index}: {passage[:1200]}"
+                for index, passage in enumerate(passage_parts[:5], start=1)
+            )
+        else:
+            source_lines.append("Содержательная выдержка: в поисковой выдаче отсутствует")
+        sources.append("\n".join(source_lines))
+
         if len(sources) >= 5:
             break
 
@@ -2708,17 +2781,21 @@ def yandex_search_sources(query, required_domain=""):
         if match and match.group(1) not in result_domains:
             result_domains.append(match.group(1))
     logger.info(
-        "Yandex Search API completed in %.2f seconds; results=%s; domains=%s",
+        "Yandex Search API completed in %.2f seconds; article_results=%s; "
+        "domains=%s; rejected_generic_pages=%s; rejected_other_domains=%s",
         time.perf_counter() - started,
         len(sources),
         ",".join(result_domains) or "none",
+        rejected_generic,
+        rejected_domain,
     )
     if not sources:
         if required_domain:
             raise RuntimeError(
-                f"Yandex Search API returned no results from required domain {required_domain}"
+                f"Yandex Search API returned no eligible article pages from {required_domain} "
+                f"(generic pages rejected: {rejected_generic})"
             )
-        raise RuntimeError("Yandex Search API returned no usable documents")
+        raise RuntimeError("Yandex Search API returned no usable article documents")
     return sources
 
 
@@ -2941,6 +3018,11 @@ def search_and_answer(session_id, job_id, user_text, history):
             "так и напиши: «Дата публикации в поисковой выдаче не указана». "
             "Не считай материал сегодняшним только потому, что поиск выполнен сегодня. "
             "Не придумывай подробности, которых нет в переданных фрагментах. "
+            "Каждый блок источника относится только к заголовку и URL внутри этого же блока. "
+            "Никогда не переноси дату, время, факт или выдержку из одного документа в другой. "
+            "Если заголовок и выдержка явно не соответствуют друг другу, не пересказывай "
+            "такой документ как подтверждённую новость и пропусти его. "
+            "Не выдавай общие страницы, ленты, главные страницы и разделы сайта за новости. "
             "Если сведений недостаточно для пяти содержательных пунктов, перечисли только "
             "те материалы, содержание которых подтверждается поисковой выдачей. "
             "Общий объём ответа — ориентировочно 2200–3000 символов. "
