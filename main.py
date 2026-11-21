@@ -27,6 +27,10 @@ API_KEY = os.getenv("ROUTER_API_KEY")
 TAVILY_URL = "https://api.tavily.com/search"
 TAVILY_KEY = os.getenv("TAVILY_API_KEY")
 
+# Yandex Search API is the primary web search provider.
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
+YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "b1g6bcieampgfmvqn8v6")
+
 executor = ThreadPoolExecutor(max_workers=2)
 search_jobs = {}
 # Последний прерванный многочастный ответ сохраняется отдельно,
@@ -2536,6 +2540,163 @@ def complete_answer_if_cut_off(answer, messages):
     return answer
 
 
+
+def _xml_local_name(tag):
+    """Возвращает имя XML-тега без пространства имён."""
+    return str(tag).rsplit("}", 1)[-1].lower()
+
+
+def _xml_direct_text(element, names):
+    """Ищет текст одного из непосредственных дочерних XML-элементов."""
+    wanted = set(names)
+    for child in list(element):
+        if _xml_local_name(child.tag) in wanted:
+            value = " ".join("".join(child.itertext()).split())
+            if value:
+                return value
+    return ""
+
+
+def yandex_search_sources(query):
+    """Выполняет основной поиск через Yandex Search API и возвращает источники."""
+    if not YANDEX_API_KEY:
+        raise RuntimeError("YANDEX_API_KEY is missing")
+
+    # Импорт внутри функции: отсутствие SDK не должно мешать запуску FastAPI.
+    from yandex_ai_studio_sdk import AIStudio
+
+    sdk = AIStudio(
+        folder_id=YANDEX_FOLDER_ID,
+        auth=YANDEX_API_KEY,
+    )
+    search = sdk.search_api.web("SEARCH_TYPE_RU").configure(
+        family_mode="FAMILY_MODE_MODERATE",
+        fix_typo_mode="FIX_TYPO_MODE_ON",
+        sort_mode="SORT_MODE_BY_RELEVANCE",
+        groups_on_page=5,
+        sort_order="SORT_ORDER_DESC",
+        group_mode="GROUP_MODE_DEEP",
+        docs_in_group=1,
+        max_passages=2,
+        localization="LOCALIZATION_RU",
+    )
+
+    # Yandex Search API ограничивает длину поисковой строки 400 символами.
+    yandex_query = str(query or "").strip()[:400]
+    if not yandex_query:
+        raise RuntimeError("Empty Yandex search query")
+
+    started = time.perf_counter()
+    raw_result = search.run(
+        yandex_query,
+        format="xml",
+        page=0,
+        timeout=25,
+    )
+    if isinstance(raw_result, bytes):
+        xml_text = raw_result.decode("utf-8", errors="replace")
+    else:
+        xml_text = str(raw_result)
+
+    root = ET.fromstring(xml_text)
+    sources = []
+    for doc in root.iter():
+        if _xml_local_name(doc.tag) != "doc":
+            continue
+
+        title = _xml_direct_text(doc, {"title"}) or "Без названия"
+        url = _xml_direct_text(doc, {"url", "docurl", "link"})
+        domain = _xml_direct_text(doc, {"domain"})
+
+        passage_parts = []
+        for node in doc.iter():
+            if _xml_local_name(node.tag) in {"passage", "headline", "description"}:
+                value = " ".join("".join(node.itertext()).split())
+                if value and value not in passage_parts:
+                    passage_parts.append(value)
+        content = " ".join(passage_parts).strip()
+
+        if not domain and "://" in url:
+            domain = url.split("//", 1)[1].split("/", 1)[0]
+        if not content:
+            content = title
+
+        sources.append(
+            "Источник: " + title
+            + "\nДомен: " + (domain or "не указан")
+            + "\nДата публикации материала: не указана в поисковой выдаче"
+            + "\nURL: " + (url or "не указан")
+            + "\nФрагмент источника: " + content[:1400]
+        )
+        if len(sources) >= 5:
+            break
+
+    logger.info(
+        "Yandex Search API completed in %.2f seconds; results=%s",
+        time.perf_counter() - started,
+        len(sources),
+    )
+    if not sources:
+        raise RuntimeError("Yandex Search API returned no usable documents")
+    return sources
+
+
+def tavily_search_sources(query, search_topic, is_finance):
+    """Резервный поиск через Tavily; вызывается только при сбое Яндекса."""
+    if not TAVILY_KEY:
+        raise RuntimeError("TAVILY_API_KEY is missing; Yandex Search API also failed")
+
+    search_payload = {
+        "query": query,
+        "search_depth": "advanced" if is_finance else "fast",
+        "max_results": 5,
+        "topic": search_topic,
+        "include_published_date": True,
+    }
+    if not is_finance:
+        search_payload["days"] = 7
+
+    started = time.perf_counter()
+    response = requests.post(
+        TAVILY_URL,
+        headers={
+            "Authorization": f"Bearer {TAVILY_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=search_payload,
+        timeout=20,
+    )
+    if not response.ok:
+        logger.error("Tavily error response: %s", response.text[:1000])
+    response.raise_for_status()
+
+    data = response.json()
+    results = data.get("results", [])
+    if not results:
+        raise RuntimeError("Tavily returned no search results")
+
+    sources = []
+    for item in results[:5]:
+        title = str(item.get("title", "Без названия"))
+        published_date = str(item.get("published_date") or "дата не указана")
+        url = str(item.get("url", ""))
+        content = str(item.get("content", ""))
+        sources.append(
+            "Источник: " + title
+            + "\nДомен: " + (url.split("/")[2] if "://" in url else "не указан")
+            + "\nДата публикации материала: " + published_date
+            + "\nURL: " + url
+            + "\nФрагмент источника: " + content[:1400]
+        )
+
+    logger.info(
+        "Tavily fallback search completed in %.2f seconds; results=%s",
+        time.perf_counter() - started,
+        len(sources),
+    )
+    return sources
+
+
 def search_and_answer(session_id, job_id, user_text, history):
     try:
         logger.info("Background search started")
@@ -2569,9 +2730,6 @@ def search_and_answer(session_id, job_id, user_text, history):
             })
             logger.info("Dedicated stock quote lookup completed")
             return {"status": "ready", "answer": answer}
-
-        if not TAVILY_KEY:
-            raise RuntimeError("TAVILY_API_KEY is missing")
 
         today = datetime.now().astimezone().strftime("%d.%m.%Y")
         lower_text = user_text.lower()
@@ -2649,62 +2807,23 @@ def search_and_answer(session_id, job_id, user_text, history):
                 f"и последние события на {today}"
             )
 
-        search_payload = {
-            "query": search_query,
-            # Для финансовых данных сохраняем advanced-поиск;
-            # для остальных запросов используем быстрый режим.
-            "search_depth": "advanced" if is_finance else "fast",
-            "max_results": 5,
-            "topic": search_topic,
-            "include_published_date": True,
-        }
-        if not is_finance:
-            search_payload["days"] = 7
-
-        tavily_started = time.perf_counter()
-        response = requests.post(
-            TAVILY_URL,
-            headers={
-                "Authorization": f"Bearer {TAVILY_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=search_payload,
-            timeout=20,
-        )
-
-        if not response.ok:
-            logger.error(
-                "Tavily error response: %s",
-                response.text[:1000]
+        # Сначала Яндекс. Tavily используется только как резерв при ошибке
+        # Яндекса или пустой/непригодной поисковой выдаче.
+        try:
+            sources = yandex_search_sources(search_query)
+            logger.info("Primary search provider: Yandex Search API")
+        except Exception as yandex_error:
+            logger.warning(
+                "Yandex Search API failed; switching to Tavily fallback: %s: %s",
+                type(yandex_error).__name__,
+                str(yandex_error)[:500],
             )
-
-        response.raise_for_status()
-        logger.info(
-            "Tavily search completed in %.2f seconds",
-            time.perf_counter() - tavily_started,
-        )
-        data = response.json()
-        results = data.get("results", [])
-
-        if not results:
-            raise RuntimeError("No search results")
-
-        sources = []
-        for item in results[:5]:
-            title = str(item.get("title", "Без названия"))
-            published_date = str(
-                item.get("published_date") or "дата не указана"
+            sources = tavily_search_sources(
+                search_query,
+                search_topic,
+                is_finance,
             )
-            url = str(item.get("url", ""))
-
-            content = str(item.get("content", ""))
-            sources.append(
-                "Источник: " + title
-                + "\nДомен: " + (url.split("/")[2] if "://" in url else "не указан")
-                + "\nДата публикации материала: " + published_date
-                + "\nURL: " + url
-                + "\nФрагмент источника: " + content[:1400]
-            )
+            logger.info("Fallback search provider: Tavily")
 
         detailed_search = is_complex_question(user_text)
         search_length_instruction = (
