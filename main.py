@@ -7,6 +7,7 @@ import logging
 import threading
 import re
 import xml.etree.ElementTree as ET
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -2557,7 +2558,42 @@ def _xml_direct_text(element, names):
     return ""
 
 
-def yandex_search_sources(query):
+def extract_requested_search_domain(user_text):
+    """Извлекает домен из явного требования искать на конкретном сайте."""
+    text = str(user_text or "")
+    match = re.search(
+        r"\b(?:с|со|на|из)\s+(?:сайта|сайте|сайту|ресурса|ресурсе|портала|портале|домена|домене)\s+"
+        r"(?:https?://)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    domain = match.group(1).lower().strip(".")
+    # Не принимаем случайно захваченные расширения файлов и заведомо
+    # некорректные значения; домен должен содержать хотя бы одну точку.
+    if not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
+        return ""
+    return domain
+
+
+def _normalize_result_domain(domain, url=""):
+    """Возвращает hostname без www и завершающей точки."""
+    candidate = str(domain or "").strip().lower()
+    if candidate and "://" not in candidate:
+        candidate = "https://" + candidate
+    if not candidate and url:
+        candidate = str(url).strip()
+    try:
+        host = (urlsplit(candidate).hostname or "").lower().rstrip(".")
+    except Exception:
+        host = ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def yandex_search_sources(query, required_domain=""):
     """Выполняет основной поиск через Yandex Search API и возвращает источники."""
     if not YANDEX_API_KEY:
         raise RuntimeError("YANDEX_API_KEY is missing")
@@ -2582,9 +2618,19 @@ def yandex_search_sources(query):
     )
 
     # Yandex Search API ограничивает длину поисковой строки 400 символами.
-    yandex_query = str(query or "").strip()[:400]
+    yandex_query = str(query or "").strip()
+    if required_domain:
+        # Официальный оператор site: ограничивает выдачу сайтом и его поддоменами.
+        site_operator = f"site:{required_domain}"
+        if site_operator.lower() not in yandex_query.lower():
+            # Сохраняем оператор целиком в пределах лимита API — 400 символов.
+            base_query = yandex_query[: max(1, 399 - len(site_operator))].rstrip()
+            yandex_query = f"{base_query} {site_operator}".strip()
+    yandex_query = yandex_query[:400]
     if not yandex_query:
         raise RuntimeError("Empty Yandex search query")
+    if required_domain:
+        logger.info("Yandex Search domain restriction requested: %s", required_domain)
 
     started = time.perf_counter()
     raw_result = search.run(
@@ -2607,6 +2653,16 @@ def yandex_search_sources(query):
         title = _xml_direct_text(doc, {"title"}) or "Без названия"
         url = _xml_direct_text(doc, {"url", "docurl", "link"})
         domain = _xml_direct_text(doc, {"domain"})
+        normalized_domain = _normalize_result_domain(domain, url)
+
+        # Дополнительная проверка на нашей стороне: не передаём модели
+        # результаты с посторонних сайтов даже при операторе site:.
+        if required_domain and not (
+            normalized_domain == required_domain
+            or normalized_domain.endswith("." + required_domain)
+        ):
+            continue
+        domain = normalized_domain or domain
 
         passage_parts = []
         for node in doc.iter():
@@ -2631,12 +2687,22 @@ def yandex_search_sources(query):
         if len(sources) >= 5:
             break
 
+    result_domains = []
+    for source in sources:
+        match = re.search(r"\nДомен: ([^\n]+)", source)
+        if match and match.group(1) not in result_domains:
+            result_domains.append(match.group(1))
     logger.info(
-        "Yandex Search API completed in %.2f seconds; results=%s",
+        "Yandex Search API completed in %.2f seconds; results=%s; domains=%s",
         time.perf_counter() - started,
         len(sources),
+        ",".join(result_domains) or "none",
     )
     if not sources:
+        if required_domain:
+            raise RuntimeError(
+                f"Yandex Search API returned no results from required domain {required_domain}"
+            )
         raise RuntimeError("Yandex Search API returned no usable documents")
     return sources
 
@@ -2807,17 +2873,35 @@ def search_and_answer(session_id, job_id, user_text, history):
                 f"и последние события на {today}"
             )
 
+        # Явно указанный сайт становится жёстким ограничением поиска.
+        # В таком режиме не переключаемся на общий резервный поиск Tavily,
+        # чтобы не подменить результаты материалами с других доменов.
+        required_domain = extract_requested_search_domain(user_text)
+        if required_domain:
+            logger.info("User requested source domain: %s", required_domain)
+
         # Сначала Яндекс. Tavily используется только как резерв при ошибке
-        # Яндекса или пустой/непригодной поисковой выдаче.
+        # Яндекса или пустой/непригодной поисковой выдаче общего поиска.
         try:
-            sources = yandex_search_sources(search_query)
+            sources = yandex_search_sources(search_query, required_domain)
             logger.info("Primary search provider: Yandex Search API")
         except Exception as yandex_error:
             logger.warning(
-                "Yandex Search API failed; switching to Tavily fallback: %s: %s",
+                "Yandex Search API failed%s: %s: %s",
+                f" for required domain {required_domain}" if required_domain else "",
                 type(yandex_error).__name__,
                 str(yandex_error)[:500],
             )
+            if required_domain:
+                answer = (
+                    f"Не удалось получить подтверждённые результаты поиска "
+                    f"с сайта {required_domain}. Я не буду подменять их материалами "
+                    f"с других сайтов. Попробуй повторить запрос немного позже."
+                )
+                result = {"status": "ready", "answer": answer}
+                save_job_result(session_id, job_id, result)
+                logger.info("Restricted-site search finished without cross-domain fallback")
+                return result
             sources = tavily_search_sources(
                 search_query,
                 search_topic,
