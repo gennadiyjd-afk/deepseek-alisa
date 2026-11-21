@@ -1013,12 +1013,12 @@ def _quasar_websocket_connect(session: requests.Session, updates_url: str):
 
 @app.get("/api/diagnostic/quasar-updates")
 def diagnostic_quasar_updates(
-    seconds: int = 25,
+    seconds: int = 300,
     _: bool = Depends(require_password),
 ):
-    """Listen briefly to Quasar cloud update events; this route sends no device actions."""
-    if seconds < 5 or seconds > 25:
-        raise HTTPException(400, "Параметр seconds должен быть от 5 до 25")
+    """Listen to Quasar cloud update events for up to five minutes; read-only."""
+    if seconds < 5 or seconds > 300:
+        raise HTTPException(400, "Параметр seconds должен быть от 5 до 300")
 
     with _guard:
         session = _state.get("session")
@@ -1138,8 +1138,9 @@ def diagnostic_quasar_updates(
         "station_updates": matching_updates,
         "note": (
             "Подключение только читает облачные события Quasar и закрывается после окна наблюдения. "
+            "По умолчанию окно составляет 300 секунд; его можно сократить параметром seconds (5–300). "
             "Команды станции не отправляются; произвольный текст, имена, ID, URL и секреты скрыты. "
-            "Чтобы поймать изменение, произнеси команду или запусти ответ во время окна наблюдения."
+            "Запусти ответ Дипсика в любой момент в течение окна наблюдения."
         ),
     }
 
