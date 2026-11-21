@@ -1084,7 +1084,7 @@ def prepare_job_parts(job, answer):
     original_answer = str(answer or "").strip()
     user_text = job.get("user_text", "")
     normalized_request = normalize_command(user_text)
-    news_list_request = (
+    news_list_request = is_latest_news_request(user_text) or (
         any(marker in normalized_request for marker in ("новост", "публикац", "стат", "материал"))
         and any(marker in normalized_request for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой"))
     )
@@ -2371,6 +2371,23 @@ def is_detailed_search_request(text):
     )
 
 
+def is_latest_news_request(text):
+    """Распознаёт короткие запросы последних новостей для единого формата списка."""
+    normalized = normalize_command(text).replace("ё", "е")
+    has_news_topic = any(
+        marker in normalized
+        for marker in ("новост", "публикац", "стат", "материал")
+    )
+    has_recency = any(
+        marker in normalized
+        for marker in (
+            "последн", "свеж", "актуальн", "сегодня", "сейчас",
+            "за сутки", "за день", "за неделю", "за последние",
+        )
+    )
+    return has_news_topic and has_recency
+
+
 def save_job_result(session_id, job_id, result):
     """Записывает результат и автоматически вызывает навык, если ожидание уже объявлено."""
     should_auto_deliver = False
@@ -2722,7 +2739,7 @@ def extract_requested_search_domain(user_text):
     publisher_aliases = (
         (r"интерфакс(?:а|е|ом)?", "interfax.ru"),
         (r"рбк", "rbc.ru"),
-        (r"лента(?:\.ру)?", "lenta.ru"),
+        (r"лент(?:а|е)(?:\.ру)?", "lenta.ru"),
         (r"тасс", "tass.ru"),
         (r"риа\s+новости", "ria.ru"),
         (r"коммерсант(?:а|е|ом)?", "kommersant.ru"),
@@ -3177,13 +3194,19 @@ def search_and_answer(session_id, job_id, user_text, history):
             )
             logger.info("Fallback search provider: Tavily")
 
-        detailed_search = is_detailed_search_request(user_text)
-        news_list_request = detailed_search and any(
-            marker in normalize_command(user_text)
-            for marker in ("новост", "публикац", "стат", "материал")
-        ) and any(
-            marker in normalize_command(user_text)
-            for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой")
+        # Короткие команды «найди последние новости...» тоже используют
+        # единый формат публикаций: заголовок отдельно, затем содержание и дата.
+        # Обычные поисковые вопросы без признака новостного запроса не затрагиваются.
+        latest_news_request = is_latest_news_request(user_text)
+        detailed_search = is_detailed_search_request(user_text) or latest_news_request
+        news_list_request = latest_news_request or (
+            detailed_search and any(
+                marker in normalize_command(user_text)
+                for marker in ("новост", "публикац", "стат", "материал")
+            ) and any(
+                marker in normalize_command(user_text)
+                for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой")
+            )
         )
         search_length_instruction = (
             "Поскольку пользователь просит перечислить несколько новостей или публикаций, "
