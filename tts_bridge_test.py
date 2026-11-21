@@ -1,12 +1,18 @@
+import base64
+import hashlib
 import json
 import logging
 import os
 import re
 import secrets
+import socket
+import ssl
+import struct
 import threading
 import time
 import traceback
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from cryptography.fernet import Fernet, InvalidToken
@@ -868,6 +874,274 @@ def bridge_stop(x_bridge_secret: str = Header(default=""), x_diag_trace: str = H
             log.exception("Ошибка остановки воспроизведения")
             raise HTTPException(502, f"Ошибка остановки: {type(exc).__name__}")
 
+
+
+def _ws_read_exact(sock: ssl.SSLSocket, size: int, pending: bytearray) -> bytes:
+    """Read exactly size bytes, consuming any bytes left after the HTTP upgrade."""
+    if size < 0 or size > 1_048_576:
+        raise RuntimeError("Недопустимый размер WebSocket-кадра")
+    result = bytearray()
+    if pending:
+        take = min(size, len(pending))
+        result.extend(pending[:take])
+        del pending[:take]
+    while len(result) < size:
+        chunk = sock.recv(size - len(result))
+        if not chunk:
+            raise RuntimeError("WebSocket-соединение закрыто сервером")
+        result.extend(chunk)
+    return bytes(result)
+
+
+def _ws_send_control(sock: ssl.SSLSocket, opcode: int, payload: bytes = b"") -> None:
+    """Send a masked client control frame (RFC 6455)."""
+    if len(payload) > 125:
+        raise RuntimeError("Слишком большой WebSocket control frame")
+    mask = os.urandom(4)
+    masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+    sock.sendall(bytes((0x80 | opcode, 0x80 | len(payload))) + mask + masked)
+
+
+def _ws_receive_text(sock: ssl.SSLSocket, pending: bytearray) -> str | None:
+    """Receive one complete text message; answer ping frames and ignore pong frames."""
+    fragments = bytearray()
+    fragmented_opcode = None
+    while True:
+        first, second = _ws_read_exact(sock, 2, pending)
+        fin = bool(first & 0x80)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", _ws_read_exact(sock, 2, pending))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", _ws_read_exact(sock, 8, pending))[0]
+        if length > 1_048_576:
+            raise RuntimeError("WebSocket-сообщение превышает диагностический лимит")
+        mask = _ws_read_exact(sock, 4, pending) if masked else b""
+        payload = _ws_read_exact(sock, length, pending) if length else b""
+        if masked:
+            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+
+        if opcode == 0x8:  # close
+            return None
+        if opcode == 0x9:  # ping
+            _ws_send_control(sock, 0xA, payload)
+            continue
+        if opcode == 0xA:  # pong
+            continue
+        if opcode == 0x0:  # continuation
+            if fragmented_opcode is None:
+                continue
+            fragments.extend(payload)
+            if fin:
+                if fragmented_opcode != 0x1:
+                    return None
+                return fragments.decode("utf-8", errors="replace")
+            continue
+        if opcode in (0x1, 0x2):
+            if fin:
+                return payload.decode("utf-8", errors="replace") if opcode == 0x1 else None
+            fragmented_opcode = opcode
+            fragments = bytearray(payload)
+            continue
+
+
+def _quasar_websocket_connect(session: requests.Session, updates_url: str):
+    """Open Quasar's read-only updates WebSocket using the existing Yandex cookies."""
+    parsed = urlparse(updates_url)
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme != "wss" or not (hostname == "iot.quasar.yandex.ru" or hostname.endswith(".yandex.ru")):
+        raise RuntimeError("Quasar вернул неожиданный адрес WebSocket")
+    port = parsed.port or 443
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    prepared = session.prepare_request(requests.Request("GET", updates_url))
+    cookie_header = prepared.headers.get("Cookie", "")
+    csrf = session.headers.get("x-csrf-token", "")
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    host_header = hostname if port == 443 else f"{hostname}:{port}"
+
+    raw_sock = socket.create_connection((hostname, port), timeout=8)
+    tls_sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=hostname)
+    try:
+        request_headers = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host_header}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+            "Origin: https://yandex.ru",
+            f"User-Agent: {USER_AGENT}",
+        ]
+        if cookie_header:
+            request_headers.append(f"Cookie: {cookie_header}")
+        if csrf:
+            request_headers.append(f"x-csrf-token: {csrf}")
+        tls_sock.sendall(("\r\n".join(request_headers) + "\r\n\r\n").encode("utf-8"))
+
+        response_buffer = bytearray()
+        while b"\r\n\r\n" not in response_buffer:
+            chunk = tls_sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("Quasar закрыл WebSocket handshake")
+            response_buffer.extend(chunk)
+            if len(response_buffer) > 16384:
+                raise RuntimeError("Слишком большой ответ WebSocket handshake")
+        header_bytes, remainder = bytes(response_buffer).split(b"\r\n\r\n", 1)
+        header_lines = header_bytes.decode("iso-8859-1").split("\r\n")
+        if not header_lines or " 101 " not in f" {header_lines[0]} ":
+            raise RuntimeError("Quasar не подтвердил WebSocket upgrade")
+        response_headers = {}
+        for line in header_lines[1:]:
+            if ":" in line:
+                name, value = line.split(":", 1)
+                response_headers[name.strip().lower()] = value.strip()
+        expected_accept = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        ).decode("ascii")
+        if response_headers.get("sec-websocket-accept") != expected_accept:
+            raise RuntimeError("Некорректное подтверждение WebSocket от Quasar")
+        return tls_sock, bytearray(remainder)
+    except Exception:
+        tls_sock.close()
+        raise
+
+
+@app.get("/api/diagnostic/quasar-updates")
+def diagnostic_quasar_updates(
+    seconds: int = 25,
+    _: bool = Depends(require_password),
+):
+    """Listen briefly to Quasar cloud update events; this route sends no device actions."""
+    if seconds < 5 or seconds > 25:
+        raise HTTPException(400, "Параметр seconds должен быть от 5 до 25")
+
+    with _guard:
+        session = _state.get("session")
+        devices = _state.get("devices") or []
+        if _state.get("status") != "ready" or session is None:
+            raise HTTPException(409, "Сначала восстанови подключение к Яндексу")
+        if len(devices) != 1:
+            raise HTTPException(409, "Личная станция не определена")
+        target_device_id = str(devices[0].get("id") or "")
+    if not target_device_id:
+        raise HTTPException(409, "У личной станции отсутствует идентификатор")
+
+    try:
+        devices_response = session.get(f"{QUASAR_API}/v3/user/devices", timeout=(5, 12))
+        devices_data = response_json(devices_response, "Получение адреса облачных обновлений")
+        if not isinstance(devices_data, dict) or devices_data.get("status") != "ok":
+            raise RuntimeError("Quasar не подтвердил получение списка устройств")
+        updates_url = devices_data.get("updates_url")
+        if not isinstance(updates_url, str) or not updates_url:
+            raise RuntimeError("В ответе Quasar отсутствует updates_url")
+        ws, pending = _quasar_websocket_connect(session, updates_url)
+    except Exception as exc:
+        log.warning("Quasar updates diagnostic connect failed: %s", type(exc).__name__)
+        raise HTTPException(502, f"Не удалось подключиться к облачным обновлениям: {type(exc).__name__}")
+
+    # Only short machine-like enum values are exposed; arbitrary text, names, IDs,
+    # URLs, commands and credentials are suppressed.
+    safe_enum_keys = {"type", "instance", "property_type", "condition", "status", "operation"}
+    sensitive_key_parts = ("id", "token", "cookie", "secret", "auth", "name", "text", "title", "url", "uri")
+
+    def project(value, key="", depth=0):
+        if depth > 8:
+            return "[глубина ограничена]"
+        if isinstance(value, dict):
+            result = {}
+            for raw_key, child in list(value.items())[:80]:
+                child_key = str(raw_key)
+                normalized = child_key.casefold().replace("-", "_")
+                if normalized == "id" or normalized.endswith("_id") or any(part in normalized for part in sensitive_key_parts):
+                    result[child_key] = "[скрыто]"
+                else:
+                    result[child_key] = project(child, child_key, depth + 1)
+            return result
+        if isinstance(value, list):
+            return [project(child, key, depth + 1) for child in value[:30]]
+        if isinstance(value, bool) or isinstance(value, (int, float)) or value is None:
+            return value
+        if isinstance(value, str):
+            if key.casefold() in safe_enum_keys and re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", value):
+                return value
+            return {"string_length": len(value)}
+        return f"[{type(value).__name__}]"
+
+    operation_counts = {}
+    matching_updates = []
+    update_messages = 0
+    deadline = time.monotonic() + seconds
+    timed_out = False
+    try:
+        while time.monotonic() < deadline:
+            remaining = max(0.2, deadline - time.monotonic())
+            ws.settimeout(remaining)
+            try:
+                raw_message = _ws_receive_text(ws, pending)
+            except socket.timeout:
+                timed_out = True
+                break
+            if raw_message is None:
+                break
+            try:
+                outer = json.loads(raw_message)
+            except Exception:
+                continue
+            if not isinstance(outer, dict):
+                continue
+            operation = str(outer.get("operation") or "unknown")
+            operation_counts[operation] = operation_counts.get(operation, 0) + 1
+            if operation != "update_states":
+                continue
+            update_messages += 1
+            message = outer.get("message")
+            try:
+                inner = json.loads(message) if isinstance(message, str) else message
+            except Exception:
+                continue
+            if not isinstance(inner, dict):
+                continue
+            updated_devices = inner.get("updated_devices")
+            if not isinstance(updated_devices, list):
+                continue
+            for updated in updated_devices:
+                if not isinstance(updated, dict) or str(updated.get("id") or "") != target_device_id:
+                    continue
+                if len(matching_updates) < 20:
+                    matching_updates.append(project(updated))
+    except Exception as exc:
+        log.warning("Quasar updates diagnostic read failed: %s", type(exc).__name__)
+        raise HTTPException(502, f"Ошибка чтения облачных событий: {type(exc).__name__}")
+    finally:
+        try:
+            _ws_send_control(ws, 0x8)
+        except Exception:
+            pass
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "websocket_connected": True,
+        "listen_seconds": seconds,
+        "timed_out_without_more_events": timed_out,
+        "operation_counts": operation_counts,
+        "update_states_messages": update_messages,
+        "matching_station_updates": len(matching_updates),
+        "station_updates": matching_updates,
+        "note": (
+            "Подключение только читает облачные события Quasar и закрывается после окна наблюдения. "
+            "Команды станции не отправляются; произвольный текст, имена, ID, URL и секреты скрыты. "
+            "Чтобы поймать изменение, произнеси команду или запусти ответ во время окна наблюдения."
+        ),
+    }
 
 
 @app.get("/api/diagnostic/quasar-device")
