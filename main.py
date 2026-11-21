@@ -306,10 +306,12 @@ def send_bridge_continue_command(job_key, job_id, expected_generation=None):
             return False
 
 
-def schedule_auto_next_part(job_key, job_id, part_text):
-    """Ждёт примерную длительность части; устаревшие таймеры после паузы игнорируются."""
+def schedule_auto_next_part(job_key, job_id, part_text, pause_after_seconds=0.0):
+    """Ждёт расчётную длительность чтения и дополнительную паузу; старые таймеры игнорируются."""
     # Расчёт времени чтения: 19 символов в секунду + 0,5 секунды запаса.
+    # Для заголовка новости дополнительно выдерживаем 1 секунду после чтения.
     estimated_seconds = max(4.0, len(str(part_text or "")) / 19.0 + 0.5)
+    estimated_seconds += max(0.0, float(pause_after_seconds or 0.0))
     with jobs_lock:
         current = search_jobs.get(job_key)
         if not current or current.get("job_id") != job_id:
@@ -1092,24 +1094,60 @@ def prepare_job_parts(job, answer):
         or len(original_answer) > 380
     )
 
-    # Сначала делим ИСХОДНЫЙ текст, сохраняя границы отдельных новостей.
-    # Обычные ответы и проверенная логика озвучивания остаются без изменений.
-    parts = (
-        split_answer_into_parts(
-            original_answer,
-            chunk_size=350,
-            preserve_news_boundaries=news_list_request,
-        )
-        if should_split else [original_answer]
-    )
+    headline_part_indexes = set()
+    parts = [original_answer]
+    if news_list_request:
+        # Новый формат ответа: заголовок и содержание — отдельные абзацы,
+        # между ними пустая строка. Заголовок становится самостоятельной
+        # голосовой частью, после которой мост выдерживает паузу 1 секунду.
+        paragraphs = [
+            item.strip() for item in re.split(r"\n\s*\n", original_answer)
+            if item and item.strip()
+        ]
+        if (
+            len(paragraphs) >= 2
+            and len(paragraphs) % 2 == 0
+            and all(len(paragraphs[i]) <= 220 for i in range(0, len(paragraphs), 2))
+        ):
+            news_parts = []
+            for paragraph_index in range(0, len(paragraphs), 2):
+                headline = paragraphs[paragraph_index]
+                summary = paragraphs[paragraph_index + 1]
+                headline_part_indexes.add(len(news_parts))
+                news_parts.append(headline)
+                news_parts.extend(
+                    split_answer_into_parts(summary, chunk_size=350)
+                )
+            if news_parts:
+                parts = news_parts
+            else:
+                parts = split_answer_into_parts(
+                    original_answer, chunk_size=350, preserve_news_boundaries=True
+                )
+        else:
+            # Совместимость с ответами старого формата, где были речевые
+            # метки «Первая новость» и т. п.
+            parts = split_answer_into_parts(
+                original_answer, chunk_size=350, preserve_news_boundaries=True
+            )
+    elif should_split:
+        parts = split_answer_into_parts(original_answer, chunk_size=350)
 
     # Отдельная нормализованная копия каждого фрагмента используется только
     # для оценки длительности. В ответ Алисе она не передаётся.
     timing_parts = [normalize_russian(part) for part in parts]
 
+    # После каждого отдельного заголовка новости выдерживаем ровно 1 секунду.
+    # Для остальных частей остаётся расчёт 19 символов/с + 0,5 с.
+    part_delays = [None] * len(parts)
+    for index in headline_part_indexes:
+        if index < len(part_delays) - 1:
+            part_delays[index] = 1.0
+
     job["answer"] = original_answer
     job["parts"] = parts
     job["timing_parts"] = timing_parts
+    job["part_delays"] = part_delays
     job["part_index"] = 0
     return parts
 
@@ -1119,6 +1157,7 @@ def deliver_job_part(body, job_key, job):
     schedule_next = False
     schedule_final = False
     part_text = ""
+    delay_after_part = None
     final_history = None
     with jobs_lock:
         current = search_jobs.get(job_key)
@@ -1137,6 +1176,9 @@ def deliver_job_part(body, job_key, job):
             return make_response(body, "На этом всё.")
 
         answer = parts[index]
+        part_delays = current.get("part_delays") or []
+        if index < len(part_delays):
+            delay_after_part = part_delays[index]
         current["current_part_index"] = index
         # До запроса следующего фрагмента возвращаемся к началу текущего.
         current["resume_part_index"] = index
@@ -1180,7 +1222,10 @@ def deliver_job_part(body, job_key, job):
     response = make_response(body, answer, final_history) if final_history is not None else make_response(body, answer)
     if schedule_next:
         activate_tts_bridge_session()
-        schedule_auto_next_part(job_key, job.get("job_id"), timing_text)
+        schedule_auto_next_part(
+            job_key, job.get("job_id"), timing_text,
+            pause_after_seconds=delay_after_part or 0.0,
+        )
     if schedule_final:
         schedule_final_part_cleanup(job_key, job.get("job_id"), timing_text)
     return response
@@ -3106,13 +3151,15 @@ def search_and_answer(session_id, job_id, user_text, history):
         search_length_instruction = (
             "Поскольку пользователь просит перечислить несколько новостей или публикаций, "
             "подготовь список максимум из пяти найденных материалов. Не добавляй вступление. "
-            "Каждую публикацию начинай с новой строки и отдельной речевой метки: "
-            "«Первая новость.», «Вторая новость.», «Третья новость.», "
-            "«Четвёртая новость.» или «Пятая новость.», затем назови заголовок. "
-            "Каждую новость оформляй отдельным абзацем; между соседними новостями "
-            "обязательно оставляй пустую строку. Никогда не объединяй две публикации "
-            "в одном абзаце. Для каждого материала укажи заголовок, затем содержательное "
+            "Не нумеруй новости и не произноси вводные метки вроде «Первая новость». "
+            "Для каждой публикации сначала выведи только её заголовок отдельным абзацем. "
+            "Следующим абзацем дай краткое содержание; между заголовком и содержанием "
+            "оставь пустую строку. Между блоками разных публикаций также оставляй "
+            "пустую строку. Никогда не объединяй две публикации в одном блоке. "
+            "Для каждого материала укажи заголовок, затем содержательное "
             "краткое изложение примерно на 300–500 символов (обычно 2–4 предложения). "
+            "Дату публикации включай в конец абзаца с содержанием, не выноси её "
+            "в отдельный абзац или отдельный пункт. "
             "Начинай пересказ с главного события, обозначенного в заголовке. "
             "Биографические сведения, "
             "историю вопроса и другие подробности включай только как поясняющий контекст, "
