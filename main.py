@@ -2576,8 +2576,11 @@ def _xml_direct_text(element, names):
 def extract_requested_search_domain(user_text):
     """Извлекает домен из явного требования искать на конкретном сайте."""
     text = str(user_text or "")
+    # Принимаем как полную формулировку «с сайта lenta.ru», так и короткую
+    # голосовую форму «с lenta.ru» / «на lenta.ru».
     match = re.search(
-        r"\b(?:с|со|на|из)\s+(?:сайта|сайте|сайту|ресурса|ресурсе|портала|портале|домена|домене)\s+"
+        r"\b(?:с|со|на|из)\s+"
+        r"(?:(?:сайта|сайте|сайту|ресурса|ресурсе|портала|портале|домена|домене)\s+)?"
         r"(?:https?://)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)",
         text,
         flags=re.IGNORECASE,
@@ -2645,8 +2648,18 @@ def _is_generic_site_page(title, url):
 
     # URL раздела обычно состоит из одного сегмента (/news/, /live/,
     # /economics/ и т.п.). Отдельные публикации имеют дополнительный путь.
-    path_parts = [part for part in path.split("/") if part]
+    path_parts = [part.lower() for part in path.split("/") if part]
     if len(path_parts) < 2:
+        return True
+
+    # Типовые адреса рубрик и тематических подборок (например, Lenta.ru/rubrics/society/)
+    # не являются отдельными новостными публикациями.
+    listing_prefixes = {
+        "rubric", "rubrics", "topic", "topics", "tag", "tags",
+        "category", "categories", "section", "sections", "author", "authors",
+        "search", "archive",
+    }
+    if path_parts[0] in listing_prefixes:
         return True
 
     return False
@@ -2691,86 +2704,101 @@ def yandex_search_sources(query, required_domain=""):
         logger.info("Yandex Search domain restriction requested: %s", required_domain)
 
     started = time.perf_counter()
-    raw_result = search.run(
-        yandex_query,
-        format="xml",
-        page=0,
-        timeout=25,
-    )
-    if isinstance(raw_result, bytes):
-        xml_text = raw_result.decode("utf-8", errors="replace")
-    else:
-        xml_text = str(raw_result)
-
-    root = ET.fromstring(xml_text)
     sources = []
     seen_urls = set()
     rejected_generic = 0
     rejected_domain = 0
-    for doc in root.iter():
-        if _xml_local_name(doc.tag) != "doc":
-            continue
+    pages_scanned = 0
 
-        title = _xml_direct_text(doc, {"title"}) or "Без названия"
-        url = _xml_direct_text(doc, {"url", "docurl", "link"})
-        domain = _xml_direct_text(doc, {"domain"})
-        normalized_domain = _normalize_result_domain(domain, url)
-
-        # Не передаём модели результаты с посторонних сайтов даже при site:.
-        if required_domain and not (
-            normalized_domain == required_domain
-            or normalized_domain.endswith("." + required_domain)
-        ):
-            rejected_domain += 1
-            continue
-
-        if _is_generic_site_page(title, url):
-            rejected_generic += 1
-            continue
-
-        canonical_url = str(url or "").split("#", 1)[0].rstrip("/").lower()
-        if canonical_url and canonical_url in seen_urls:
-            continue
-        if canonical_url:
-            seen_urls.add(canonical_url)
-
-        # Сохраняем пассажи отдельными фрагментами, чтобы модель не смешивала
-        # их с выдержками из соседних документов.
-        passage_parts = []
-        for node in doc.iter():
-            if _xml_local_name(node.tag) in {"passage", "headline", "description"}:
-                value = " ".join("".join(node.itertext()).split())
-                if value and value not in passage_parts:
-                    passage_parts.append(value)
-
-        publication_date = _xml_first_descendant_text(
-            doc,
-            {"pubdate", "published", "published_time", "publishedat", "pub_date", "date"},
+    # Для запроса с конкретным сайтом при нехватке отдельных статей
+    # проверяем следующую страницу выдачи. В обычном поиске оставляем один
+    # запрос, чтобы не увеличивать задержку и стоимость без необходимости.
+    max_pages = 2 if required_domain else 1
+    for page_number in range(max_pages):
+        raw_result = search.run(
+            yandex_query,
+            format="xml",
+            page=page_number,
+            timeout=25,
         )
-        if not publication_date:
-            publication_date = _xml_first_descendant_text(
-                doc, {"modtime", "lastmod", "last_modified"}
-            )
-            if publication_date:
-                publication_date = "не указана; дата изменения документа: " + publication_date
-
-        domain = normalized_domain or domain or "не указан"
-        source_lines = [
-            "ОТДЕЛЬНЫЙ ПОИСКОВЫЙ ДОКУМЕНТ",
-            "Заголовок: " + title,
-            "Домен: " + domain,
-            "Дата публикации: " + (publication_date or "не указана в поисковой выдаче"),
-            "URL: " + (url or "не указан"),
-        ]
-        if passage_parts:
-            source_lines.append("Фрагменты ИМЕННО ЭТОГО документа:")
-            source_lines.extend(
-                f"Фрагмент {index}: {passage[:1200]}"
-                for index, passage in enumerate(passage_parts[:5], start=1)
-            )
+        if isinstance(raw_result, bytes):
+            xml_text = raw_result.decode("utf-8", errors="replace")
         else:
-            source_lines.append("Содержательная выдержка: в поисковой выдаче отсутствует")
-        sources.append("\n".join(source_lines))
+            xml_text = str(raw_result)
+
+        root = ET.fromstring(xml_text)
+        page_docs = [
+            node for node in root.iter()
+            if _xml_local_name(node.tag) == "doc"
+        ]
+        pages_scanned += 1
+        if not page_docs:
+            break
+
+        for doc in page_docs:
+            title = _xml_direct_text(doc, {"title"}) or "Без названия"
+            url = _xml_direct_text(doc, {"url", "docurl", "link"})
+            domain = _xml_direct_text(doc, {"domain"})
+            normalized_domain = _normalize_result_domain(domain, url)
+
+            # Не передаём модели результаты с посторонних сайтов даже при site:.
+            if required_domain and not (
+                normalized_domain == required_domain
+                or normalized_domain.endswith("." + required_domain)
+            ):
+                rejected_domain += 1
+                continue
+
+            if _is_generic_site_page(title, url):
+                rejected_generic += 1
+                continue
+
+            canonical_url = str(url or "").split("#", 1)[0].rstrip("/").lower()
+            if canonical_url and canonical_url in seen_urls:
+                continue
+            if canonical_url:
+                seen_urls.add(canonical_url)
+
+            # Сохраняем пассажи отдельными фрагментами, чтобы модель не смешивала
+            # их с выдержками из соседних документов.
+            passage_parts = []
+            for node in doc.iter():
+                if _xml_local_name(node.tag) in {"passage", "headline", "description"}:
+                    value = " ".join("".join(node.itertext()).split())
+                    if value and value not in passage_parts:
+                        passage_parts.append(value)
+
+            publication_date = _xml_first_descendant_text(
+                doc,
+                {"pubdate", "published", "published_time", "publishedat", "pub_date", "date"},
+            )
+            if not publication_date:
+                publication_date = _xml_first_descendant_text(
+                    doc, {"modtime", "lastmod", "last_modified"}
+                )
+                if publication_date:
+                    publication_date = "не указана; дата изменения документа: " + publication_date
+
+            domain = normalized_domain or domain or "не указан"
+            source_lines = [
+                "ОТДЕЛЬНЫЙ ПОИСКОВЫЙ ДОКУМЕНТ",
+                "Заголовок: " + title,
+                "Домен: " + domain,
+                "Дата публикации: " + (publication_date or "не указана в поисковой выдаче"),
+                "URL: " + (url or "не указан"),
+            ]
+            if passage_parts:
+                source_lines.append("Фрагменты ИМЕННО ЭТОГО документа:")
+                source_lines.extend(
+                    f"Фрагмент {index}: {passage[:1200]}"
+                    for index, passage in enumerate(passage_parts[:5], start=1)
+                )
+            else:
+                source_lines.append("Содержательная выдержка: в поисковой выдаче отсутствует")
+            sources.append("\n".join(source_lines))
+
+            if len(sources) >= 5:
+                break
 
         if len(sources) >= 5:
             break
@@ -2781,10 +2809,11 @@ def yandex_search_sources(query, required_domain=""):
         if match and match.group(1) not in result_domains:
             result_domains.append(match.group(1))
     logger.info(
-        "Yandex Search API completed in %.2f seconds; article_results=%s; "
+        "Yandex Search API completed in %.2f seconds; article_results=%s; pages=%s; "
         "domains=%s; rejected_generic_pages=%s; rejected_other_domains=%s",
         time.perf_counter() - started,
         len(sources),
+        pages_scanned,
         ",".join(result_domains) or "none",
         rejected_generic,
         rejected_domain,
@@ -3013,7 +3042,12 @@ def search_and_answer(session_id, job_id, user_text, history):
             "Поскольку пользователь просит перечислить несколько новостей или публикаций, "
             "подготовь список максимум из пяти найденных материалов. Для каждого материала "
             "укажи отдельным пунктом заголовок, затем содержательное краткое изложение "
-            "примерно на 300–500 символов (обычно 2–4 предложения) и дату публикации "
+            "примерно на 300–500 символов (обычно 2–4 предложения). Начинай пересказ "
+            "с главного события, обозначенного в заголовке. Биографические сведения, "
+            "историю вопроса и другие подробности включай только как поясняющий контекст, "
+            "не подменяя ими само событие. Если найденные фрагменты не раскрывают событие "
+            "из заголовка, честно укажи, что подробностей недостаточно, либо пропусти "
+            "публикацию. Затем укажи дату публикации "
             "только если она прямо присутствует в сведениях источника. Если дата не указана, "
             "так и напиши: «Дата публикации в поисковой выдаче не указана». "
             "Не считай материал сегодняшним только потому, что поиск выполнен сегодня. "
