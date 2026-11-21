@@ -911,6 +911,9 @@ def diagnostic_quasar_device(_: bool = Depends(require_password)):
     section_structure = {}
     safe_values = []
     excluded_key_fragments = ("token", "cookie", "secret", "auth", "name", "text", "title")
+    # Only these two exact status fields may be returned as text. All other
+    # string values remain hidden, including strings nested under these objects.
+    safe_text_paths = {"state", "status_info.status"}
 
     def inspect_value(value, path, depth=0):
         if depth > 12:
@@ -935,6 +938,11 @@ def diagnostic_quasar_device(_: bool = Depends(require_password)):
         if isinstance(value, (int, float)) or value is None:
             safe_values.append({"path": path, "type": type(value).__name__, "value": value})
             return value
+        if isinstance(value, str) and path in safe_text_paths:
+            # Limit length and remove control characters before exposing the
+            # two explicitly approved status strings.
+            cleaned = "".join(ch for ch in value if ch.isprintable())
+            return cleaned[:160]
         return "[текст скрыт]"
 
     for section in inspected_sections:
@@ -950,9 +958,10 @@ def diagnostic_quasar_device(_: bool = Depends(require_password)):
         "sections": section_structure,
         "safe_values": safe_values[:200],
         "note": (
-            "Показана вложенная структура только state, status_info и quasar_info. "
-            "Текстовые значения, идентификаторы, cookies и токены скрыты; "
-            "команды станции не отправляются."
+            "Показана вложенная структура state, status_info и quasar_info. "
+            "Открытым текстом возвращаются только state и status_info.status "
+            "(не более 160 символов каждый); остальные текстовые значения, "
+            "идентификаторы, cookies и токены скрыты. Команды станции не отправляются."
         ),
     }
 
