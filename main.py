@@ -615,19 +615,18 @@ def is_continue_command(text):
 
 
 def is_topic_return_command(text):
-    """Распознаёт просьбу вернуться к ранее начатой теме."""
-    # Яндекс может передать обращение «Алиса» вместе с запятой.
-    command = normalize_command(text).replace(",", " ")
-    command = " ".join(command.split())
-    return bool(re.match(
-        r"^(?:алиса\s+)?(?:(?:пожалуйста)\s+)?(?:вернись|вернуться|возвратись)\s+(?:(?:пожалуйста)\s+)?(?:к|ко)\b",
-        command,
-    )) or bool(re.match(
-        r"^(?:алиса\s+)?(?:продолжи|продолжай|продолжить)\s+(?:тему|рассказ|ответ|вопрос)\b",
-        command,
-    ))
-
-
+    """Распознаёт только пять согласованных форм возврата к прежней теме."""
+    command = " ".join(normalize_command(text).replace(",", " ").split())
+    command = re.sub(r"^алиса\s+", "", command).strip()
+    fixed_phrases = {
+        "вернись к прежней теме",
+        "вернись к предыдущей теме",
+        "продолжи переднюю тему",
+        "продолжи предыдущую тему",
+    }
+    if command in fixed_phrases:
+        return True
+    return bool(re.fullmatch(r"вернись к теме\s+.+", command))
 def interrupted_list(job_key):
     """Возвращает список сохранённых тем и мигрирует старый формат при необходимости."""
     saved = interrupted_jobs.get(job_key)
@@ -897,15 +896,16 @@ def stop_tts_bridge_on_skill_exit():
 
 
 def is_pause_command(text):
-    """Распознаёт команды временной паузы голосового ответа."""
+    """Распознаёт только пять согласованных команд временной паузы."""
     command = " ".join(normalize_command(text).replace(",", " ").split())
-    command = re.sub(r"^(?:алиса)\s+", "", command).strip()
+    command = re.sub(r"^алиса\s+", "", command).strip()
     return command in (
-        "стоп", "пауза", "остановись", "приостанови", "приостановить",
-        "останови ответ", "поставь на паузу", "пауза пожалуйста",
+        "пауза",
+        "останови ответ",
+        "задержи ответ",
+        "секунду",
+        "минутку",
     )
-
-
 def is_stop_command(text):
     """Распознаёт окончательный отказ от ответа, не смешивая его с паузой."""
     command = normalize_command(text)
