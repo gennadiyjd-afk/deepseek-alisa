@@ -1326,6 +1326,7 @@ def needs_search(text):
     return (
         "найди в интернете" in text
         or "посмотри в интернете" in text
+        or is_latest_news_request(text)
         or is_stock_quote_request(text)
         or is_currency_rate_request(text)
         or is_weather_request(text)
