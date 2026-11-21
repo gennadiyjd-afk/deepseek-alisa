@@ -905,42 +905,54 @@ def diagnostic_quasar_device(_: bool = Depends(require_password)):
             f"Не удалось прочитать устройство Quasar: {type(exc).__name__}",
         )
 
-    allowed_names = {
-        "playerstate", "playing", "progress", "duration", "haspause",
-        "hasplay", "pause", "playback", "mediastate", "media_state", "volume",
-    }
-    found = []
+    # Inspect only the three potentially relevant containers. Return their
+    # nested key structure and safe primitive values, never arbitrary text.
+    inspected_sections = ("state", "status_info", "quasar_info")
+    section_structure = {}
+    safe_values = []
+    excluded_key_fragments = ("token", "cookie", "secret", "auth", "name", "text", "title")
 
-    def collect_fields(value, path=""):
+    def inspect_value(value, path, depth=0):
+        if depth > 12:
+            return {"_truncated": True}
         if isinstance(value, dict):
-            for key, child in value.items():
+            result = {}
+            for key, child in list(value.items())[:100]:
                 key_text = str(key)
                 child_path = f"{path}.{key_text}" if path else key_text
-                normalized = key_text.replace("-", "_").casefold()
-                if normalized in allowed_names:
-                    if isinstance(child, (bool, int, float)) or child is None:
-                        found.append({
-                            "path": child_path,
-                            "type": type(child).__name__,
-                            "value": child,
-                        })
-                    elif isinstance(child, (dict, list)):
-                        collect_fields(child, child_path)
-                else:
-                    collect_fields(child, child_path)
-        elif isinstance(value, list):
-            for index, child in enumerate(value[:50]):
-                collect_fields(child, f"{path}[{index}]")
+                normalized = key_text.casefold().replace("-", "_")
+                if normalized == "id" or normalized.endswith("_id") or any(fragment in normalized for fragment in excluded_key_fragments):
+                    result[key_text] = "[скрыто]"
+                    continue
+                result[key_text] = inspect_value(child, child_path, depth + 1)
+            return result
+        if isinstance(value, list):
+            return [inspect_value(child, f"{path}[{index}]", depth + 1)
+                    for index, child in enumerate(value[:30])]
+        if isinstance(value, bool):
+            safe_values.append({"path": path, "type": "bool", "value": value})
+            return value
+        if isinstance(value, (int, float)) or value is None:
+            safe_values.append({"path": path, "type": type(value).__name__, "value": value})
+            return value
+        return "[текст скрыт]"
 
-    collect_fields(data)
+    for section in inspected_sections:
+        if isinstance(data, dict) and section in data:
+            section_structure[section] = inspect_value(data[section], section)
+        else:
+            section_structure[section] = "[отсутствует]"
+
     return {
         "ok": True,
         "http_status": response.status_code,
         "root_keys": list(data.keys())[:100] if isinstance(data, dict) else [],
-        "playback_fields": found[:100],
+        "sections": section_structure,
+        "safe_values": safe_values[:200],
         "note": (
-            "Возвращены только имена полей и безопасные числовые/логические "
-            "значения; текстовые данные устройства, cookies и токены не выдаются."
+            "Показана вложенная структура только state, status_info и quasar_info. "
+            "Текстовые значения, идентификаторы, cookies и токены скрыты; "
+            "команды станции не отправляются."
         ),
     }
 
