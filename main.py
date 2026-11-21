@@ -1097,39 +1097,76 @@ def prepare_job_parts(job, answer):
     headline_part_indexes = set()
     parts = [original_answer]
     if news_list_request:
-        # Новый формат ответа: заголовок и содержание — отдельные абзацы,
-        # между ними пустая строка. Заголовок становится самостоятельной
-        # голосовой частью, после которой мост выдерживает паузу 1 секунду.
-        paragraphs = [
-            item.strip() for item in re.split(r"\n\s*\n", original_answer)
-            if item and item.strip()
-        ]
-        if (
-            len(paragraphs) >= 2
-            and len(paragraphs) % 2 == 0
-            and all(len(paragraphs[i]) <= 220 for i in range(0, len(paragraphs), 2))
-        ):
-            news_parts = []
-            for paragraph_index in range(0, len(paragraphs), 2):
-                headline = paragraphs[paragraph_index]
-                summary = paragraphs[paragraph_index + 1]
+        # Надёжный формат для новостных списков: DeepSeek ставит явные
+        # служебные метки перед заголовком и содержанием каждой публикации.
+        # Метки удаляются здесь и никогда не передаются Алисе или в озвучку.
+        marker_pattern = re.compile(
+            r"(?im)^\s*\[\[(NEWS_HEADLINE|NEWS_SUMMARY)\]\]\s*"
+        )
+        markers = list(marker_pattern.finditer(original_answer))
+        news_parts = []
+        clean_articles = []
+        marked_format_valid = bool(markers) and len(markers) % 2 == 0
+        if marked_format_valid:
+            for marker_index in range(0, len(markers), 2):
+                headline_marker = markers[marker_index]
+                summary_marker = markers[marker_index + 1]
+                if (
+                    headline_marker.group(1).upper() != "NEWS_HEADLINE"
+                    or summary_marker.group(1).upper() != "NEWS_SUMMARY"
+                ):
+                    marked_format_valid = False
+                    break
+                next_marker_start = (
+                    markers[marker_index + 2].start()
+                    if marker_index + 2 < len(markers)
+                    else len(original_answer)
+                )
+                headline = original_answer[headline_marker.end():summary_marker.start()].strip()
+                summary = original_answer[summary_marker.end():next_marker_start].strip()
+                if not headline or not summary or len(headline) > 220:
+                    marked_format_valid = False
+                    break
                 headline_part_indexes.add(len(news_parts))
                 news_parts.append(headline)
-                news_parts.extend(
-                    split_answer_into_parts(summary, chunk_size=350)
-                )
-            if news_parts:
-                parts = news_parts
+                news_parts.extend(split_answer_into_parts(summary, chunk_size=350))
+                clean_articles.append(headline + "\n" + summary)
+
+        if marked_format_valid and news_parts:
+            parts = news_parts
+            # Сохраняем чистый текст без служебных маркеров для истории диалога.
+            original_answer = "\n\n".join(clean_articles)
+        else:
+            # Даже при нарушении формата не допускаем попадания служебных
+            # маркеров в голосовой ответ или историю диалога.
+            original_answer = marker_pattern.sub("", original_answer).strip()
+            # Совместимость с прежним форматом: отдельные абзацы
+            # «заголовок / содержание» или нумерованные новости.
+            paragraphs = [
+                item.strip() for item in re.split(r"\n\s*\n", original_answer)
+                if item and item.strip()
+            ]
+            if (
+                len(paragraphs) >= 2
+                and len(paragraphs) % 2 == 0
+                and all(len(paragraphs[i]) <= 220 for i in range(0, len(paragraphs), 2))
+            ):
+                for paragraph_index in range(0, len(paragraphs), 2):
+                    headline = paragraphs[paragraph_index]
+                    summary = paragraphs[paragraph_index + 1]
+                    headline_part_indexes.add(len(news_parts))
+                    news_parts.append(headline)
+                    news_parts.extend(split_answer_into_parts(summary, chunk_size=350))
+                if news_parts:
+                    parts = news_parts
+                else:
+                    parts = split_answer_into_parts(
+                        original_answer, chunk_size=350, preserve_news_boundaries=True
+                    )
             else:
                 parts = split_answer_into_parts(
                     original_answer, chunk_size=350, preserve_news_boundaries=True
                 )
-        else:
-            # Совместимость с ответами старого формата, где были речевые
-            # метки «Первая новость» и т. п.
-            parts = split_answer_into_parts(
-                original_answer, chunk_size=350, preserve_news_boundaries=True
-            )
     elif should_split:
         parts = split_answer_into_parts(original_answer, chunk_size=350)
 
@@ -3151,11 +3188,17 @@ def search_and_answer(session_id, job_id, user_text, history):
         search_length_instruction = (
             "Поскольку пользователь просит перечислить несколько новостей или публикаций, "
             "подготовь список максимум из пяти найденных материалов. Не добавляй вступление. "
-            "Не нумеруй новости и не произноси вводные метки вроде «Первая новость». "
-            "Для каждой публикации сначала выведи только её заголовок отдельным абзацем. "
-            "Следующим абзацем дай краткое содержание; между заголовком и содержанием "
-            "оставь пустую строку. Между блоками разных публикаций также оставляй "
-            "пустую строку. Никогда не объединяй две публикации в одном блоке. "
+            "Не нумеруй новости и не добавляй вводные слова вроде «Первая новость». "
+            "Каждую публикацию обязательно оформи строго двумя частями с отдельными "
+            "служебными метками на отдельных строках. Сначала напиши строку "
+            "[[NEWS_HEADLINE]], на следующей строке только заголовок. Затем напиши "
+            "строку [[NEWS_SUMMARY]], на следующей строке краткое содержание вместе "
+            "с датой публикации в самом конце. После этого сразу начинай следующую "
+            "публикацию с новой строки [[NEWS_HEADLINE]]. Повтори эту структуру "
+            "для каждой найденной новости. Не добавляй пустые вступления, заключения "
+            "или текст вне этих блоков. Эти служебные метки нужны программе для "
+            "разделения фрагментов и не являются частью ответа пользователю. "
+            "Никогда не объединяй заголовок с содержанием в одном блоке. "
             "Для каждого материала укажи заголовок, затем содержательное "
             "краткое изложение примерно на 300–500 символов (обычно 2–4 предложения). "
             "Дату публикации включай в конец абзаца с содержанием, не выноси её "
