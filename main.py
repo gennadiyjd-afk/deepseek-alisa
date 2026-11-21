@@ -304,7 +304,7 @@ def send_bridge_continue_command(job_key, job_id, expected_generation=None):
 def schedule_auto_next_part(job_key, job_id, part_text):
     """Ждёт примерную длительность части; устаревшие таймеры после паузы игнорируются."""
     # Сохраняем прежний комфортный интервал 17 + 1,5 секунды.
-    estimated_seconds = max(4.0, len(str(part_text or "")) / 17.0 + 1.5)
+    estimated_seconds = max(4.0, len(str(part_text or "")) / 18.0 + 1.0)
     with jobs_lock:
         current = search_jobs.get(job_key)
         if not current or current.get("job_id") != job_id:
