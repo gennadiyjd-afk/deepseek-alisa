@@ -308,7 +308,7 @@ def send_bridge_continue_command(job_key, job_id, expected_generation=None):
 
 def schedule_auto_next_part(job_key, job_id, part_text):
     """Ждёт примерную длительность части; устаревшие таймеры после паузы игнорируются."""
-    # Сохраняем прежний комфортный интервал 17 + 1,5 секунды.
+    # Расчёт времени чтения: 19 символов в секунду + 0,5 секунды запаса.
     estimated_seconds = max(4.0, len(str(part_text or "")) / 19.0 + 0.5)
     with jobs_lock:
         current = search_jobs.get(job_key)
@@ -1000,8 +1000,8 @@ def is_joke_request(text):
     ))
 
 
-def split_answer_into_parts(answer, chunk_size=350):
-    """Делит исходный текст: порог 450 символов + конец предложения."""
+def split_answer_into_parts(answer, chunk_size=350, preserve_news_boundaries=False):
+    """Делит текст по предложениям и не склеивает соседние новостные публикации."""
     text = str(answer or "").strip()
     text = re.sub(
         r"\s*(?:Продолжить\?|Продолжение следует\.?)[.!?]*\s*$",
@@ -1009,6 +1009,40 @@ def split_answer_into_parts(answer, chunk_size=350):
     )
     if not text:
         return [""]
+
+    # Для списков новостей начало каждой публикации становится жёсткой
+    # границей голосового фрагмента. Дальше длинная публикация делится
+    # обычным способом, не затрагивая соседнюю новость.
+    if preserve_news_boundaries:
+        heading_pattern = re.compile(
+            r"(?im)^(?=\s*(?:"
+            r"(?:первая\s+новость|вторая\s+новость|третья\s+новость|"
+            r"четв[её]ртая\s+новость|пятая\s+новость|новость\s*[1-5])\b"
+            r"|[1-5][.)]\s+"
+            r"))"
+        )
+        headings = list(heading_pattern.finditer(text))
+        if len(headings) >= 2:
+            sections = []
+            if text[:headings[0].start()].strip():
+                sections.append(text[:headings[0].start()].strip())
+            sections.extend(
+                text[headings[i].start():headings[i + 1].start()].strip()
+                for i in range(len(headings) - 1)
+            )
+            sections.append(text[headings[-1].start():].strip())
+            separated_parts = []
+            for section in sections:
+                if section:
+                    separated_parts.extend(
+                        split_answer_into_parts(
+                            section,
+                            chunk_size=chunk_size,
+                            preserve_news_boundaries=False,
+                        )
+                    )
+            return separated_parts or [text]
+
     if len(text) <= chunk_size:
         return [text]
 
@@ -1029,7 +1063,7 @@ def split_answer_into_parts(answer, chunk_size=350):
     for sentence in sentences:
         candidate = (current + " " + sentence).strip() if current else sentence
         if len(candidate) >= chunk_size:
-            # 450-й символ может оказаться внутри этого предложения.
+            # 350-й символ может оказаться внутри этого предложения.
             # Включаем предложение полностью; очень длинное предложение
             # остаётся одним неделимым фрагментом.
             parts.append(candidate)
@@ -1047,15 +1081,25 @@ def prepare_job_parts(job, answer):
     """Делит оригинал для озвучивания; нормализованные копии нужны только для расчёта времени."""
     original_answer = str(answer or "").strip()
     user_text = job.get("user_text", "")
+    normalized_request = normalize_command(user_text)
+    news_list_request = (
+        any(marker in normalized_request for marker in ("новост", "публикац", "стат", "материал"))
+        and any(marker in normalized_request for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой"))
+    )
     should_split = (
-        is_complex_question(user_text)
+        news_list_request
+        or is_complex_question(user_text)
         or len(original_answer) > 380
     )
 
-    # Сначала делим ИСХОДНЫЙ текст, чтобы границы и содержание фрагментов
-    # не зависели от того, насколько сильно нормализация расширяет текст.
+    # Сначала делим ИСХОДНЫЙ текст, сохраняя границы отдельных новостей.
+    # Обычные ответы и проверенная логика озвучивания остаются без изменений.
     parts = (
-        split_answer_into_parts(original_answer, chunk_size=350)
+        split_answer_into_parts(
+            original_answer,
+            chunk_size=350,
+            preserve_news_boundaries=news_list_request,
+        )
         if should_split else [original_answer]
     )
 
@@ -2576,8 +2620,9 @@ def _xml_direct_text(element, names):
 def extract_requested_search_domain(user_text):
     """Извлекает домен из явного требования искать на конкретном сайте."""
     text = str(user_text or "")
-    # Принимаем как полную формулировку «с сайта lenta.ru», так и короткую
-    # голосовую форму «с lenta.ru» / «на lenta.ru».
+
+    # Сначала распознаём домен, если пользователь назвал его напрямую:
+    # «с lenta.ru», «с сайта lenta.ru», «на interfax.ru».
     match = re.search(
         r"\b(?:с|со|на|из)\s+"
         r"(?:(?:сайта|сайте|сайту|ресурса|ресурсе|портала|портале|домена|домене)\s+)?"
@@ -2585,14 +2630,34 @@ def extract_requested_search_domain(user_text):
         text,
         flags=re.IGNORECASE,
     )
-    if not match:
-        return ""
-    domain = match.group(1).lower().strip(".")
-    # Не принимаем случайно захваченные расширения файлов и заведомо
-    # некорректные значения; домен должен содержать хотя бы одну точку.
-    if not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
-        return ""
-    return domain
+    if match:
+        domain = match.group(1).lower().strip(".")
+        if re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
+            return domain
+
+    # Часто в голосовом запросе пользователь называет издание, а не домен.
+    # Добавляем домены только для однозначно узнаваемых названий СМИ.
+    publisher_aliases = (
+        (r"интерфакс(?:а|е|ом)?", "interfax.ru"),
+        (r"рбк", "rbc.ru"),
+        (r"лента(?:\.ру)?", "lenta.ru"),
+        (r"тасс", "tass.ru"),
+        (r"риа\s+новости", "ria.ru"),
+        (r"коммерсант(?:а|е|ом)?", "kommersant.ru"),
+        (r"известия", "iz.ru"),
+        (r"ведомости", "vedomosti.ru"),
+        (r"газета\.ру", "gazeta.ru"),
+        (r"аргументы\s+и\s+факты", "aif.ru"),
+    )
+    source_prefix = (
+        r"\b(?:с|со|на|из)\s+"
+        r"(?:(?:сайта|сайте|сайту|ресурса|ресурсе|портала|портале|издания)\s+)?"
+    )
+    for alias_pattern, domain in publisher_aliases:
+        if re.search(source_prefix + r"(?:" + alias_pattern + r")\b", text, flags=re.IGNORECASE):
+            return domain
+
+    return ""
 
 
 def _normalize_result_domain(domain, url=""):
@@ -3040,10 +3105,16 @@ def search_and_answer(session_id, job_id, user_text, history):
         )
         search_length_instruction = (
             "Поскольку пользователь просит перечислить несколько новостей или публикаций, "
-            "подготовь список максимум из пяти найденных материалов. Для каждого материала "
-            "укажи отдельным пунктом заголовок, затем содержательное краткое изложение "
-            "примерно на 300–500 символов (обычно 2–4 предложения). Начинай пересказ "
-            "с главного события, обозначенного в заголовке. Биографические сведения, "
+            "подготовь список максимум из пяти найденных материалов. Не добавляй вступление. "
+            "Каждую публикацию начинай с новой строки и отдельной речевой метки: "
+            "«Первая новость.», «Вторая новость.», «Третья новость.», "
+            "«Четвёртая новость.» или «Пятая новость.», затем назови заголовок. "
+            "Каждую новость оформляй отдельным абзацем; между соседними новостями "
+            "обязательно оставляй пустую строку. Никогда не объединяй две публикации "
+            "в одном абзаце. Для каждого материала укажи заголовок, затем содержательное "
+            "краткое изложение примерно на 300–500 символов (обычно 2–4 предложения). "
+            "Начинай пересказ с главного события, обозначенного в заголовке. "
+            "Биографические сведения, "
             "историю вопроса и другие подробности включай только как поясняющий контекст, "
             "не подменяя ими само событие. Если найденные фрагменты не раскрывают событие "
             "из заголовка, честно укажи, что подробностей недостаточно, либо пропусти "
