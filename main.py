@@ -2230,6 +2230,21 @@ def is_complex_question(text):
     return False
 
 
+def is_detailed_search_request(text):
+    """Выбирает развёрнутый формат для поисковых запросов со списком материалов."""
+    normalized = normalize_command(text).replace("ё", "е")
+    list_markers = (
+        "перечисли", "список", "по каждой публикации", "по каждой новости",
+        "каждую публикацию", "каждую новость", "заголовок", "краткое содержание",
+        "содержание каждой", "сводку по каждой",
+    )
+    asks_for_multiple = bool(re.search(r"\b(?:две|три|четыре|пять|несколько|все)\b", normalized))
+    has_list_request = any(marker in normalized for marker in list_markers)
+    return is_complex_question(text) or (has_list_request and asks_for_multiple) or (
+        "заголовок" in normalized and "содержание" in normalized
+    )
+
+
 def save_job_result(session_id, job_id, result):
     """Записывает результат и автоматически вызывает навык, если ожидание уже объявлено."""
     should_auto_deliver = False
@@ -2909,8 +2924,29 @@ def search_and_answer(session_id, job_id, user_text, history):
             )
             logger.info("Fallback search provider: Tavily")
 
-        detailed_search = is_complex_question(user_text)
+        detailed_search = is_detailed_search_request(user_text)
+        news_list_request = detailed_search and any(
+            marker in normalize_command(user_text)
+            for marker in ("новост", "публикац", "стат", "материал")
+        ) and any(
+            marker in normalize_command(user_text)
+            for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой")
+        )
         search_length_instruction = (
+            "Поскольку пользователь просит перечислить несколько новостей или публикаций, "
+            "подготовь список максимум из пяти найденных материалов. Для каждого материала "
+            "укажи отдельным пунктом заголовок, затем содержательное краткое изложение "
+            "примерно на 300–500 символов (обычно 2–4 предложения) и дату публикации "
+            "только если она прямо присутствует в сведениях источника. Если дата не указана, "
+            "так и напиши: «Дата публикации в поисковой выдаче не указана». "
+            "Не считай материал сегодняшним только потому, что поиск выполнен сегодня. "
+            "Не придумывай подробности, которых нет в переданных фрагментах. "
+            "Если сведений недостаточно для пяти содержательных пунктов, перечисли только "
+            "те материалы, содержание которых подтверждается поисковой выдачей. "
+            "Общий объём ответа — ориентировочно 2200–3000 символов. "
+            "Закончи последнюю мысль полным предложением. Не задавай вопрос о продолжении: "
+            "программа сама разделит ответ на голосовые части. "
+            if news_list_request else
             "Поскольку запрос требует подробного ответа, подготовь развернутое "
             "изложение примерно на 1600–2200 символов, логично разделённое на абзацы. "
             "Обязательно закончи последнюю мысль полным предложением. "
@@ -2959,6 +2995,10 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "Если актуальная цена не найдена, прямо сообщи об этом. "
                     "Если биржа закрыта, укажи последнюю доступную цену закрытия. "
                     "Обязательно сверяй даты публикаций с сегодняшней датой. "
+                    "Дата выполнения поиска не является датой публикации. "
+                    "Если в переданных сведениях дата публикации не указана, "
+                    "прямо сообщи, что дата не указана; никогда не приписывай "
+                    "такому материалу сегодняшнюю дату. "
                     "Не называй событие сегодняшним, если оно произошло "
                     "раньше. Не выдавай старые новости за новые. "
                     "Если публикация старше нескольких дней, "
@@ -3130,6 +3170,12 @@ async def main(body: dict):
     is_wait_command_utterance = is_wait_command(user_text)
     if is_bridge_auto_continue:
         logger.info("Bridge auto-continue recognized; skipping incoming-utterance interruption")
+    elif is_continue_command(user_text):
+        # Явное «Продолжи» — команда возобновления, а не новая реплика.
+        # Не сохраняем здесь индекс текущего фрагмента как точку паузы:
+        # обработчик ниже сам выберет следующий фрагмент, если чтение не было
+        # поставлено на ручную паузу.
+        logger.info("User continuation command recognized; skipping incoming-utterance interruption")
     elif is_wait_command_utterance:
         # «Алиса, я жду» — служебная команда моста для получения готового
         # ответа. Она также может быть произнесена пользователем, поэтому
@@ -3310,8 +3356,14 @@ async def main(body: dict):
                     if current and current.get("job_id") == job.get("job_id"):
                         was_paused = bool(current.get("auto_reading_paused"))
                         if not was_paused and current.get("auto_reading"):
-                            # Авто-команда означает, что предыдущий фрагмент завершён.
+                            # Команда пришла после штатного завершения фрагмента:
+                            # part_index уже указывает на следующий фрагмент.
                             current["resume_part_index"] = int(current.get("part_index", 0))
+                            current["current_part_index"] = int(current.get("part_index", 0))
+                            logger.info(
+                                "DIAG user continue advances to next part=%s",
+                                current.get("resume_part_index"),
+                            )
                         current["auto_reading_paused"] = False
                         current["auto_reading"] = True
                         persist_job_maps()
