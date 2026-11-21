@@ -870,6 +870,82 @@ def bridge_stop(x_bridge_secret: str = Header(default=""), x_diag_trace: str = H
 
 
 
+@app.get("/api/diagnostic/quasar-device")
+def diagnostic_quasar_device(_: bool = Depends(require_password)):
+    """
+    Read-only diagnostic: fetch the personal device object from Quasar and
+    expose only playback-related primitive fields. No speaker actions are sent.
+    """
+    with _guard:
+        session = _state.get("session")
+        devices = _state.get("devices") or []
+        if _state.get("status") != "ready" or session is None:
+            raise HTTPException(409, "Сначала восстанови подключение к Яндексу")
+        if len(devices) != 1:
+            raise HTTPException(409, "Личная станция не определена")
+        device = dict(devices[0])
+
+    item_type = str(device.get("item_type") or "").strip()
+    device_id = str(device.get("id") or "").strip()
+    if not re.fullmatch(r"[a-zA-Z_]+", item_type) or not device_id:
+        raise HTTPException(
+            502,
+            "В данных личной станции нет item_type или id для диагностического GET",
+        )
+
+    # Read-only Quasar device GET; this does not invoke /actions.
+    url = f"{QUASAR_API}/user/{item_type}s/{device_id}"
+    try:
+        response = session.get(url, timeout=(5, 15))
+        data = response_json(response, "Чтение состояния устройства")
+    except Exception as exc:
+        log.warning("Quasar device diagnostic GET failed: %s", type(exc).__name__)
+        raise HTTPException(
+            502,
+            f"Не удалось прочитать устройство Quasar: {type(exc).__name__}",
+        )
+
+    allowed_names = {
+        "playerstate", "playing", "progress", "duration", "haspause",
+        "hasplay", "pause", "playback", "mediastate", "media_state", "volume",
+    }
+    found = []
+
+    def collect_fields(value, path=""):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key)
+                child_path = f"{path}.{key_text}" if path else key_text
+                normalized = key_text.replace("-", "_").casefold()
+                if normalized in allowed_names:
+                    if isinstance(child, (bool, int, float)) or child is None:
+                        found.append({
+                            "path": child_path,
+                            "type": type(child).__name__,
+                            "value": child,
+                        })
+                    elif isinstance(child, (dict, list)):
+                        collect_fields(child, child_path)
+                else:
+                    collect_fields(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value[:50]):
+                collect_fields(child, f"{path}[{index}]")
+
+    collect_fields(data)
+    return {
+        "ok": True,
+        "http_status": response.status_code,
+        "root_keys": list(data.keys())[:100] if isinstance(data, dict) else [],
+        "playback_fields": found[:100],
+        "note": (
+            "Возвращены только имена полей и безопасные числовые/логические "
+            "значения; текстовые данные устройства, cookies и токены не выдаются."
+        ),
+    }
+
+
+
 HTML_PAGE = r"""
 <!doctype html>
 <html lang="ru">
