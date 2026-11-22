@@ -309,8 +309,13 @@ def send_bridge_continue_command(job_key, job_id, expected_generation=None):
 def schedule_auto_next_part(job_key, job_id, part_text, pause_after_seconds=0.0):
     """Ждёт расчётную длительность чтения и дополнительную паузу; старые таймеры игнорируются."""
     # Расчёт времени чтения: 19 символов в секунду + 0,5 секунды запаса.
-    # Для заголовка новости дополнительно выдерживаем 1 секунду после чтения.
-    estimated_seconds = max(4.0, len(str(part_text or "")) / 19.0 + 0.5)
+    # Для короткого заголовка не применяем общий минимум 4 секунды:
+    # выдерживаем расчётное время его озвучивания и только 0,1 секунды паузы.
+    reading_seconds = len(str(part_text or "")) / 19.0 + 0.5
+    if pause_after_seconds > 0:
+        estimated_seconds = max(0.5, reading_seconds)
+    else:
+        estimated_seconds = max(4.0, reading_seconds)
     estimated_seconds += max(0.0, float(pause_after_seconds or 0.0))
     with jobs_lock:
         current = search_jobs.get(job_key)
@@ -1174,12 +1179,12 @@ def prepare_job_parts(job, answer):
     # для оценки длительности. В ответ Алисе она не передаётся.
     timing_parts = [normalize_russian(part) for part in parts]
 
-    # После каждого отдельного заголовка новости выдерживаем ровно 1 секунду.
-    # Для остальных частей остаётся расчёт 19 символов/с + 0,5 с.
+    # После каждого отдельного заголовка новости выдерживаем 0,1 секунды.
+    # Время самого заголовка учитывается отдельно, без общего минимума 4 секунды.
     part_delays = [None] * len(parts)
     for index in headline_part_indexes:
         if index < len(part_delays) - 1:
-            part_delays[index] = 1.0
+            part_delays[index] = 0.1
 
     job["answer"] = original_answer
     job["parts"] = parts
@@ -2740,7 +2745,9 @@ def extract_requested_search_domain(user_text):
     publisher_aliases = (
         (r"интерфакс(?:а|е|ом)?", "interfax.ru"),
         (r"рбк", "rbc.ru"),
-        (r"лент(?:а|е)(?:\.ру)?", "lenta.ru"),
+        # Все распространённые падежные формы названия «Лента»:
+        # «с сайта Ленты», «на Ленте», «из Ленты», «с Лентой».
+        (r"лент(?:а|ы|е|у|ой|ою)(?:\.ру)?", "lenta.ru"),
         (r"тасс", "tass.ru"),
         (r"риа\s+новости", "ria.ru"),
         (r"коммерсант(?:а|е|ом)?", "kommersant.ru"),
@@ -2845,9 +2852,14 @@ def yandex_search_sources(query, required_domain=""):
     search = sdk.search_api.web("SEARCH_TYPE_RU").configure(
         family_mode="FAMILY_MODE_MODERATE",
         fix_typo_mode="FIX_TYPO_MODE_ON",
-        sort_mode="SORT_MODE_BY_RELEVANCE",
-        # Берём больше пяти кандидатов: часть может оказаться разделами сайта.
-        groups_on_page=20,
+        # Для конкретного новостного сайта важнее свежесть, чем релевантность.
+        # Yandex Search API сортирует BY_TIME по времени изменения документа.
+        sort_mode=(
+            "SORT_MODE_BY_TIME" if required_domain else "SORT_MODE_BY_RELEVANCE"
+        ),
+        # Для поиска по сайту берём широкую страницу кандидатов: после
+        # фильтрации разделов и дублей должно остаться до десяти публикаций.
+        groups_on_page=50 if required_domain else 20,
         sort_order="SORT_ORDER_DESC",
         group_mode="GROUP_MODE_FLAT",
         docs_in_group=1,
@@ -2962,10 +2974,10 @@ def yandex_search_sources(query, required_domain=""):
                 source_lines.append("Содержательная выдержка: в поисковой выдаче отсутствует")
             sources.append("\n".join(source_lines))
 
-            if len(sources) >= 5:
+            if len(sources) >= (10 if required_domain else 5):
                 break
 
-        if len(sources) >= 5:
+        if len(sources) >= (10 if required_domain else 5):
             break
 
     result_domains = []
@@ -3211,7 +3223,10 @@ def search_and_answer(session_id, job_id, user_text, history):
         )
         search_length_instruction = (
             "Поскольку пользователь просит перечислить несколько новостей или публикаций, "
-            "подготовь список максимум из пяти найденных материалов. Не добавляй вступление. "
+            "подготовь список максимум из десяти найденных материалов. Для явно указанного "
+            "сайта постарайся дать десять отдельных публикаций, если они есть в выдаче; "
+            "не заполняй список разделами сайта или неподтверждёнными материалами. "
+            "Не добавляй вступление. "
             "Не нумеруй новости и не добавляй вводные слова вроде «Первая новость». "
             "Каждую публикацию обязательно оформи строго двумя частями с отдельными "
             "служебными метками на отдельных строках. Сначала напиши строку "
@@ -3244,9 +3259,12 @@ def search_and_answer(session_id, job_id, user_text, history):
             "Если заголовок и выдержка явно не соответствуют друг другу, не пересказывай "
             "такой документ как подтверждённую новость и пропусти его. "
             "Не выдавай общие страницы, ленты, главные страницы и разделы сайта за новости. "
-            "Если сведений недостаточно для пяти содержательных пунктов, перечисли только "
+            "Если сведений недостаточно для десяти содержательных пунктов, перечисли только "
             "те материалы, содержание которых подтверждается поисковой выдачей. "
-            "Общий объём ответа — ориентировочно 2200–3000 символов. "
+            "Для запроса с конкретным сайтом располагай материалы от наиболее свежих "
+            "к более старым по времени изменения документа, если отдельное время "
+            "публикации не предоставлено. Не переставляй материалы произвольно. "
+            "Общий объём ответа — ориентировочно 3500–5000 символов. "
             "Закончи последнюю мысль полным предложением. Не задавай вопрос о продолжении: "
             "программа сама разделит ответ на голосовые части. "
             if news_list_request else
