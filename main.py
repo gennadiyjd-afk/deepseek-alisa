@@ -2865,14 +2865,14 @@ class _TelegramPublicChannelParser(HTMLParser):
 
 
 def is_telegram_channel_request(text):
-    """Распознаёт явный запрос к согласованному Telegram-каналу."""
+    """Распознаёт запрос именно к каналу «Раньше всех. Ну почти.»."""
     normalized = normalize_command(text).replace("ё", "е")
-    if "bbbreaking" in normalized or "раньше всех" in normalized:
-        return True
-    return bool(re.search(
-        r"\b(?:в|из|с)\s+(?:телеграм{1,2}(?:е|а|у|ом)?|telegram)(?:[- ]канал(?:е|а|у|ом)?)?\b",
-        normalized,
-    )) or bool(re.search(r"\bтелеграм{1,2}[- ]канал(?:е|а|у|ом)?\b", normalized))
+    # Общие слова «Телеграм» или «телеграм-канал» сами по себе
+    # не должны переключать поиск на этот конкретный источник.
+    return (
+        "bbbreaking" in normalized
+        or "раньше всех" in normalized
+    )
 
 
 def telegram_channel_search_sources(limit=20):
@@ -3388,12 +3388,17 @@ def search_and_answer(session_id, job_id, user_text, history):
             logger.info("Fallback search provider: Tavily")
 
         detailed_search = is_detailed_search_request(user_text)
-        news_list_request = detailed_search and any(
-            marker in normalize_command(user_text)
-            for marker in ("новост", "публикац", "стат", "материал")
-        ) and any(
-            marker in normalize_command(user_text)
-            for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой")
+        # Любой явный запрос к согласованному Telegram-каналу — это
+        # отдельная лента последних публикаций, даже если пользователь
+        # не произнёс слова «список» или «перечисли».
+        news_list_request = telegram_channel_request or (
+            detailed_search and any(
+                marker in normalize_command(user_text)
+                for marker in ("новост", "публикац", "стат", "материал")
+            ) and any(
+                marker in normalize_command(user_text)
+                for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой")
+            )
         )
         search_length_instruction = (
             "Поскольку пользователь просит перечислить несколько новостей или публикаций, "
@@ -3503,8 +3508,15 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "Учитывай все найденные материалы, а не только первые. "
                     + (
                         "Источники взяты из публичного Telegram-канала «Раньше всех. Ну почти.». "
-                        "Считай каждую публикацию отдельной единицей информации, не смешивай "
-                        "сведения из разных сообщений и не повторяй одно событие дважды. "
+                        "Пользователь запросил новостную ленту: выдай до десяти последних "
+                        "самостоятельных новостей из переданных публикаций, начиная с самой свежей. "
+                        "Если доступно не меньше десяти содержательных новостей, выдай десять. "
+                        "Каждую новость оформи отдельной парой блоков NEWS_HEADLINE и NEWS_SUMMARY. "
+                        "Содержание каждой новости — примерно 200–300 символов. "
+                        "Не объединяй разные публикации и не повторяй одно событие дважды. "
+                        "Если несколько сообщений посвящены одному событию, оставь наиболее "
+                        "свежую и содержательную публикацию. Пропускай рекламу, служебные "
+                        "сообщения и публикации, из которых нельзя выделить новостное событие. "
                         "Сохраняй хронологию от новых публикаций к более ранним. "
                         "Не произноси время публикации и не называй его временем самого события. "
                         if telegram_channel_request else ""
