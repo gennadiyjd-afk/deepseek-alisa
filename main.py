@@ -1003,7 +1003,7 @@ def is_joke_request(text):
     ))
 
 
-def split_answer_into_parts(answer, chunk_size=350, preserve_news_boundaries=False):
+def split_answer_into_parts(answer, chunk_size=350, preserve_news_boundaries=False, hard_limit=False):
     """Делит текст по предложениям и не склеивает соседние новостные публикации."""
     text = str(answer or "").strip()
     text = re.sub(
@@ -1042,6 +1042,7 @@ def split_answer_into_parts(answer, chunk_size=350, preserve_news_boundaries=Fal
                             section,
                             chunk_size=chunk_size,
                             preserve_news_boundaries=False,
+                            hard_limit=hard_limit,
                         )
                     )
             return separated_parts or [text]
@@ -1061,18 +1062,55 @@ def split_answer_into_parts(answer, chunk_size=350, preserve_news_boundaries=Fal
     if not sentences:
         return [text]
 
+    # Для Telegram нельзя оставлять очень длинное предложение единым блоком:
+    # навык озвучивает его целиком и Алиса может оборвать ответ по лимиту.
+    # В этом режиме сохраняем предложения, но при необходимости делим их
+    # по границам слов, не превышая размер голосового фрагмента.
+    if hard_limit:
+        bounded_sentences = []
+        for sentence in sentences:
+            if len(sentence) <= chunk_size:
+                bounded_sentences.append(sentence)
+                continue
+            words = re.findall(r"\S+", sentence)
+            current_piece = ""
+            for word in words:
+                candidate = (current_piece + " " + word).strip() if current_piece else word
+                if len(candidate) > chunk_size and current_piece:
+                    bounded_sentences.append(current_piece)
+                    current_piece = word
+                elif len(candidate) > chunk_size:
+                    # Защита от аномально длинного токена без пробелов.
+                    for offset in range(0, len(word), chunk_size):
+                        bounded_sentences.append(word[offset:offset + chunk_size])
+                    current_piece = ""
+                else:
+                    current_piece = candidate
+            if current_piece:
+                bounded_sentences.append(current_piece)
+        sentences = bounded_sentences
+
     parts = []
     current = ""
     for sentence in sentences:
         candidate = (current + " " + sentence).strip() if current else sentence
-        if len(candidate) >= chunk_size:
-            # 350-й символ может оказаться внутри этого предложения.
-            # Включаем предложение полностью; очень длинное предложение
-            # остаётся одним неделимым фрагментом.
-            parts.append(candidate)
-            current = ""
+        if hard_limit:
+            if len(candidate) > chunk_size and current:
+                parts.append(current)
+                current = sentence
+            elif len(candidate) > chunk_size:
+                # Защита: все предложения уже ограничены выше.
+                parts.append(sentence[:chunk_size])
+                current = sentence[chunk_size:]
+            else:
+                current = candidate
         else:
-            current = candidate
+            # Для остальных ответов сохраняем прежнее поведение без изменений.
+            if len(candidate) >= chunk_size:
+                parts.append(candidate)
+                current = ""
+            else:
+                current = candidate
 
     if current:
         parts.append(current)
@@ -1092,6 +1130,7 @@ def prepare_job_parts(job, answer):
     should_split = (
         news_list_request
         or is_complex_question(user_text)
+        or is_telegram_channel_request(user_text)
         or len(original_answer) > 380
     )
 
@@ -1130,7 +1169,7 @@ def prepare_job_parts(job, answer):
                     break
                 headline_part_indexes.add(len(news_parts))
                 news_parts.append(headline)
-                news_parts.extend(split_answer_into_parts(summary, chunk_size=350))
+                news_parts.extend(split_answer_into_parts(summary, chunk_size=350, hard_limit=is_telegram_channel_request(user_text)))
                 clean_articles.append(headline + "\n" + summary)
 
         if marked_format_valid and news_parts:
@@ -1157,19 +1196,25 @@ def prepare_job_parts(job, answer):
                     summary = paragraphs[paragraph_index + 1]
                     headline_part_indexes.add(len(news_parts))
                     news_parts.append(headline)
-                    news_parts.extend(split_answer_into_parts(summary, chunk_size=350))
+                    news_parts.extend(split_answer_into_parts(summary, chunk_size=350, hard_limit=is_telegram_channel_request(user_text)))
                 if news_parts:
                     parts = news_parts
                 else:
                     parts = split_answer_into_parts(
-                        original_answer, chunk_size=350, preserve_news_boundaries=True
+                        original_answer, chunk_size=350, preserve_news_boundaries=True,
+                        hard_limit=is_telegram_channel_request(user_text),
                     )
             else:
                 parts = split_answer_into_parts(
-                    original_answer, chunk_size=350, preserve_news_boundaries=True
+                    original_answer, chunk_size=350, preserve_news_boundaries=True,
+                    hard_limit=is_telegram_channel_request(user_text),
                 )
     elif should_split:
-        parts = split_answer_into_parts(original_answer, chunk_size=350)
+        parts = split_answer_into_parts(
+            original_answer,
+            chunk_size=350,
+            hard_limit=is_telegram_channel_request(user_text),
+        )
 
     # Отдельная нормализованная копия каждого фрагмента используется только
     # для оценки длительности. В ответ Алисе она не передаётся.
