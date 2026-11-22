@@ -1123,23 +1123,22 @@ def prepare_job_parts(job, answer):
     original_answer = str(answer or "").strip()
     user_text = job.get("user_text", "")
     normalized_request = normalize_command(user_text)
-    news_list_request = (
+    telegram_news_request = is_telegram_channel_request(user_text)
+    news_list_request = telegram_news_request or (
         any(marker in normalized_request for marker in ("новост", "публикац", "стат", "материал"))
         and any(marker in normalized_request for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой"))
     )
     should_split = (
         news_list_request
         or is_complex_question(user_text)
-        or is_telegram_channel_request(user_text)
         or len(original_answer) > 380
     )
 
     headline_part_indexes = set()
     parts = [original_answer]
     if news_list_request:
-        # Надёжный формат для новостных списков: DeepSeek ставит явные
-        # служебные метки перед заголовком и содержанием каждой публикации.
-        # Метки удаляются здесь и никогда не передаются Алисе или в озвучку.
+        # Служебные метки используются только для разбора ответа.
+        # Для Telegram заголовки полностью исключаются из озвучивания.
         marker_pattern = re.compile(
             r"(?im)^\s*\[\[(NEWS_HEADLINE|NEWS_SUMMARY)\]\]\s*"
         )
@@ -1167,21 +1166,30 @@ def prepare_job_parts(job, answer):
                 if not headline or not summary or len(headline) > 220:
                     marked_format_valid = False
                     break
-                headline_part_indexes.add(len(news_parts))
-                news_parts.append(headline)
-                news_parts.extend(split_answer_into_parts(summary, chunk_size=350, hard_limit=is_telegram_channel_request(user_text)))
-                clean_articles.append(headline + "\n" + summary)
+
+                if not telegram_news_request:
+                    headline_part_indexes.add(len(news_parts))
+                    news_parts.append(headline)
+                news_parts.extend(
+                    split_answer_into_parts(
+                        summary,
+                        chunk_size=350,
+                        hard_limit=telegram_news_request,
+                    )
+                )
+                clean_articles.append(summary if telegram_news_request else headline + "\n" + summary)
 
         if marked_format_valid and news_parts:
             parts = news_parts
-            # Сохраняем чистый текст без служебных маркеров для истории диалога.
+            # Сохраняем чистый текст без служебных меток и без заголовков Telegram.
             original_answer = "\n\n".join(clean_articles)
         else:
-            # Даже при нарушении формата не допускаем попадания служебных
-            # маркеров в голосовой ответ или историю диалога.
+            # Удаляем любые оставшиеся служебные метки до передачи текста Алисе.
             original_answer = marker_pattern.sub("", original_answer).strip()
-            # Совместимость с прежним форматом: отдельные абзацы
-            # «заголовок / содержание» или нумерованные новости.
+            original_answer = re.sub(
+                r"\[\[/?NEWS_[A-Z_]+\]\]", "", original_answer, flags=re.IGNORECASE
+            ).strip()
+            # Совместимость с прежним форматом: отдельные абзацы «заголовок / содержание».
             paragraphs = [
                 item.strip() for item in re.split(r"\n\s*\n", original_answer)
                 if item and item.strip()
@@ -1194,34 +1202,48 @@ def prepare_job_parts(job, answer):
                 for paragraph_index in range(0, len(paragraphs), 2):
                     headline = paragraphs[paragraph_index]
                     summary = paragraphs[paragraph_index + 1]
-                    headline_part_indexes.add(len(news_parts))
-                    news_parts.append(headline)
-                    news_parts.extend(split_answer_into_parts(summary, chunk_size=350, hard_limit=is_telegram_channel_request(user_text)))
+                    if not telegram_news_request:
+                        headline_part_indexes.add(len(news_parts))
+                        news_parts.append(headline)
+                    news_parts.extend(
+                        split_answer_into_parts(
+                            summary,
+                            chunk_size=350,
+                            hard_limit=telegram_news_request,
+                        )
+                    )
                 if news_parts:
                     parts = news_parts
-                else:
-                    parts = split_answer_into_parts(
-                        original_answer, chunk_size=350, preserve_news_boundaries=True,
-                        hard_limit=is_telegram_channel_request(user_text),
-                    )
+                    if telegram_news_request:
+                        original_answer = "\n\n".join(paragraphs[i] for i in range(1, len(paragraphs), 2))
             else:
                 parts = split_answer_into_parts(
-                    original_answer, chunk_size=350, preserve_news_boundaries=True,
-                    hard_limit=is_telegram_channel_request(user_text),
+                    original_answer,
+                    chunk_size=350,
+                    preserve_news_boundaries=True,
+                    hard_limit=telegram_news_request,
                 )
     elif should_split:
         parts = split_answer_into_parts(
             original_answer,
             chunk_size=350,
-            hard_limit=is_telegram_channel_request(user_text),
+            hard_limit=telegram_news_request,
         )
+
+    # Последняя страховка: служебные маркеры никогда не должны попасть в TTS.
+    if telegram_news_request:
+        parts = [
+            re.sub(r"\[\[/?NEWS_[A-Z_]+\]\]", "", str(part), flags=re.IGNORECASE).strip()
+            for part in parts
+        ]
+        parts = [part for part in parts if part]
 
     # Отдельная нормализованная копия каждого фрагмента используется только
     # для оценки длительности. В ответ Алисе она не передаётся.
     timing_parts = [normalize_russian(part) for part in parts]
 
-    # После каждого отдельного заголовка новости выдерживаем ровно 1 секунду.
-    # Для остальных частей остаётся расчёт 19 символов/с + 0,5 с.
+    # После заголовков новостей с сайтов выдерживаем ровно 1 секунду.
+    # Для Telegram заголовков нет, поэтому используется обычный расчёт интервала.
     part_delays = [None] * len(parts)
     for index in headline_part_indexes:
         if index < len(part_delays) - 1:
