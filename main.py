@@ -7,9 +7,6 @@ import logging
 import threading
 import re
 import xml.etree.ElementTree as ET
-from html.parser import HTMLParser
-from html import unescape
-from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
@@ -311,14 +308,10 @@ def send_bridge_continue_command(job_key, job_id, expected_generation=None):
 
 def schedule_auto_next_part(job_key, job_id, part_text, pause_after_seconds=0.0):
     """Ждёт расчётную длительность чтения и дополнительную паузу; старые таймеры игнорируются."""
-    # Для заголовка новости выдерживаем заданную паузу после его озвучивания.
-    # Обычные фрагменты рассчитываются по прежней формуле.
-    reading_seconds = len(str(part_text or "")) / 19.0 + 0.5
-    if pause_after_seconds > 0:
-        # Сначала даём Алисе договорить заголовок, затем выдерживаем паузу.
-        estimated_seconds = max(0.5, reading_seconds) + max(0.0, float(pause_after_seconds))
-    else:
-        estimated_seconds = max(4.0, reading_seconds)
+    # Расчёт времени чтения: 19 символов в секунду + 0,5 секунды запаса.
+    # Для заголовка новости дополнительно выдерживаем 1 секунду после чтения.
+    estimated_seconds = max(4.0, len(str(part_text or "")) / 19.0 + 0.5)
+    estimated_seconds += max(0.0, float(pause_after_seconds or 0.0))
     with jobs_lock:
         current = search_jobs.get(job_key)
         if not current or current.get("job_id") != job_id:
@@ -1091,7 +1084,7 @@ def prepare_job_parts(job, answer):
     original_answer = str(answer or "").strip()
     user_text = job.get("user_text", "")
     normalized_request = normalize_command(user_text)
-    news_list_request = is_latest_news_request(user_text) or (
+    news_list_request = (
         any(marker in normalized_request for marker in ("новост", "публикац", "стат", "материал"))
         and any(marker in normalized_request for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой"))
     )
@@ -1181,7 +1174,8 @@ def prepare_job_parts(job, answer):
     # для оценки длительности. В ответ Алисе она не передаётся.
     timing_parts = [normalize_russian(part) for part in parts]
 
-    # После каждого заголовка новости выдерживаем 1 секунду перед содержанием.
+    # После каждого отдельного заголовка новости выдерживаем ровно 1 секунду.
+    # Для остальных частей остаётся расчёт 19 символов/с + 0,5 с.
     part_delays = [None] * len(parts)
     for index in headline_part_indexes:
         if index < len(part_delays) - 1:
@@ -1332,7 +1326,6 @@ def needs_search(text):
     return (
         "найди в интернете" in text
         or "посмотри в интернете" in text
-        or is_latest_news_request(text)
         or is_stock_quote_request(text)
         or is_currency_rate_request(text)
         or is_weather_request(text)
@@ -2378,23 +2371,6 @@ def is_detailed_search_request(text):
     )
 
 
-def is_latest_news_request(text):
-    """Распознаёт короткие запросы последних новостей для единого формата списка."""
-    normalized = normalize_command(text).replace("ё", "е")
-    has_news_topic = any(
-        marker in normalized
-        for marker in ("новост", "публикац", "стат", "материал")
-    )
-    has_recency = any(
-        marker in normalized
-        for marker in (
-            "последн", "свеж", "актуальн", "сегодня", "сейчас",
-            "за сутки", "за день", "за неделю", "за последние",
-        )
-    )
-    return has_news_topic and has_recency
-
-
 def save_job_result(session_id, job_id, result):
     """Записывает результат и автоматически вызывает навык, если ожидание уже объявлено."""
     should_auto_deliver = False
@@ -2746,9 +2722,7 @@ def extract_requested_search_domain(user_text):
     publisher_aliases = (
         (r"интерфакс(?:а|е|ом)?", "interfax.ru"),
         (r"рбк", "rbc.ru"),
-        # Все распространённые падежные формы названия «Лента»:
-        # «с сайта Ленты», «на Ленте», «из Ленты», «с Лентой».
-        (r"лент(?:а|ы|е|у|ой|ою)(?:\.ру)?", "lenta.ru"),
+        (r"лента(?:\.ру)?", "lenta.ru"),
         (r"тасс", "tass.ru"),
         (r"риа\s+новости", "ria.ru"),
         (r"коммерсант(?:а|е|ом)?", "kommersant.ru"),
@@ -2838,183 +2812,6 @@ def _is_generic_site_page(title, url):
     return False
 
 
-
-class _LentaArticleTextParser(HTMLParser):
-    """Извлекает абзацы из основной части статьи Lenta.ru без сторонних блоков."""
-    BODY_MARKERS = ("topic-body", "article-body", "topic-paragraph", "article__body")
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.stack = []
-        self.current_paragraph = None
-        self.paragraphs = []
-        self.meta_description = ""
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        classes = set(str(attrs.get("class", "")).lower().split())
-        tag_name = tag.lower()
-        if tag_name not in {"meta", "link", "img", "br", "hr", "input", "source", "area", "base", "embed", "param", "track", "wbr"}:
-            self.stack.append((tag_name, classes))
-        if tag_name == "meta":
-            key = str(attrs.get("property") or attrs.get("name") or "").lower()
-            if key in {"og:description", "description", "twitter:description"}:
-                value = " ".join(str(attrs.get("content") or "").split())
-                if value and len(value) > len(self.meta_description):
-                    self.meta_description = value
-        if tag.lower() == "p":
-            self.current_paragraph = {"inside_body": any(
-                any(marker in class_name for marker in self.BODY_MARKERS)
-                for _, level_classes in self.stack for class_name in level_classes
-            ), "parts": []}
-
-    def handle_endtag(self, tag):
-        if tag.lower() == "p" and self.current_paragraph is not None:
-            text = " ".join(" ".join(self.current_paragraph["parts"]).split())
-            if text and self.current_paragraph["inside_body"]:
-                self.paragraphs.append(text)
-            self.current_paragraph = None
-        for index in range(len(self.stack) - 1, -1, -1):
-            if self.stack[index][0] == tag.lower():
-                del self.stack[index:]
-                break
-
-    def handle_data(self, data):
-        if self.current_paragraph is not None and data.strip():
-            self.current_paragraph["parts"].append(data.strip())
-
-
-def _strip_rss_html(value):
-    value = unescape(str(value or ""))
-    value = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
-    value = re.sub(r"(?s)<[^>]+>", " ", value)
-    return " ".join(value.split())
-
-
-def _fetch_lenta_article(url):
-    """Загружает отдельную статью и возвращает текст её основного содержимого."""
-    try:
-        response = requests.get(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; DeepSeekAlisaNews/1.0)",
-                "Accept": "text/html,application/xhtml+xml",
-                "Accept-Language": "ru-RU,ru;q=0.9",
-            },
-            timeout=(5, 10),
-        )
-        response.raise_for_status()
-        parser = _LentaArticleTextParser()
-        parser.feed(response.text)
-        body = "\n".join(parser.paragraphs)
-        if len(body) < 250:
-            body = parser.meta_description
-        return body[:5000]
-    except Exception as exc:
-        logger.warning("Lenta article fetch failed for %s: %s", url, str(exc)[:250])
-        return ""
-
-
-def lenta_rss_search_sources(limit=10):
-    """Берёт последние отдельные публикации напрямую из официального RSS Lenta.ru."""
-    feed_url = "https://lenta.ru/rss"
-    started = time.perf_counter()
-    response = requests.get(
-        feed_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; DeepSeekAlisaNews/1.0)",
-            "Accept": "application/rss+xml, application/xml, text/xml, */*",
-        },
-        timeout=(5, 15),
-    )
-    response.raise_for_status()
-    root = ET.fromstring(response.content)
-
-    items = [node for node in root.iter() if _xml_local_name(node.tag) == "item"]
-    entries = []
-    seen_urls = set()
-    for item in items:
-        title = _xml_direct_text(item, {"title"})
-        url = _xml_direct_text(item, {"link"}) or _xml_direct_text(item, {"guid"})
-        if not title or not url:
-            continue
-        host = _normalize_result_domain("", url)
-        if host != "lenta.ru" and not host.endswith(".lenta.ru"):
-            continue
-        if _is_generic_site_page(title, url):
-            continue
-        canonical_url = url.split("#", 1)[0].rstrip("/").lower()
-        if canonical_url in seen_urls:
-            continue
-        seen_urls.add(canonical_url)
-
-        raw_date = _xml_direct_text(item, {"pubdate", "published", "date", "updated"})
-        timestamp = 0.0
-        normalized_date = raw_date or ""
-        if raw_date:
-            try:
-                parsed = parsedate_to_datetime(raw_date)
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                timestamp = parsed.timestamp()
-                normalized_date = parsed.astimezone().strftime("%d.%m.%Y, %H:%M")
-            except Exception:
-                try:
-                    parsed = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-                    timestamp = parsed.timestamp()
-                    normalized_date = parsed.astimezone().strftime("%d.%m.%Y, %H:%M")
-                except Exception:
-                    pass
-
-        description = _xml_direct_text(item, {"description", "encoded", "content"})
-        description = _strip_rss_html(description)
-        entries.append({
-            "title": title,
-            "url": url,
-            "date": normalized_date or "не указана в RSS",
-            "timestamp": timestamp,
-            "description": description,
-        })
-
-    # Если даты доступны, сортируем строго по времени публикации; иначе
-    # сохраняем исходный порядок RSS, который обычно уже newest-first.
-    if entries and any(entry["timestamp"] for entry in entries):
-        entries.sort(key=lambda entry: entry["timestamp"], reverse=True)
-    entries = entries[:max(1, int(limit))]
-    if not entries:
-        raise RuntimeError("Lenta RSS returned no eligible article entries")
-
-    # Загружаем тексты параллельно, чтобы десять статей не увеличивали ожидание
-    # на сумму десяти сетевых таймаутов.
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        article_texts = list(pool.map(
-            _fetch_lenta_article,
-            [entry["url"] for entry in entries],
-        ))
-
-    sources = []
-    for index, (entry, article_text) in enumerate(zip(entries, article_texts), start=1):
-        content = article_text or entry["description"]
-        if not content:
-            content = "Полный текст статьи не удалось получить; в RSS доступен только заголовок."
-        source_lines = [
-            "ОТДЕЛЬНАЯ ПУБЛИКАЦИЯ ИЗ ОФИЦИАЛЬНОЙ RSS-ЛЕНТЫ LENTA.RU",
-            f"Позиция в RSS после сортировки по времени: {index}",
-            "Заголовок: " + entry["title"],
-            "Домен: lenta.ru",
-            "URL: " + entry["url"],
-            "Текст статьи или описание из RSS: " + content[:5000],
-        ]
-        sources.append("\n".join(source_lines))
-
-    logger.info(
-        "Lenta RSS completed in %.2f seconds; feed_items=%s; article_texts=%s",
-        time.perf_counter() - started,
-        len(entries),
-        sum(1 for text in article_texts if len(text) >= 250),
-    )
-    return sources
-
 def yandex_search_sources(query, required_domain=""):
     """Ищет через Yandex Search API, разделяя документы и отбрасывая разделы сайта."""
     if not YANDEX_API_KEY:
@@ -3030,14 +2827,9 @@ def yandex_search_sources(query, required_domain=""):
     search = sdk.search_api.web("SEARCH_TYPE_RU").configure(
         family_mode="FAMILY_MODE_MODERATE",
         fix_typo_mode="FIX_TYPO_MODE_ON",
-        # Для конкретного новостного сайта важнее свежесть, чем релевантность.
-        # Yandex Search API сортирует BY_TIME по времени изменения документа.
-        sort_mode=(
-            "SORT_MODE_BY_TIME" if required_domain else "SORT_MODE_BY_RELEVANCE"
-        ),
-        # Для поиска по сайту берём широкую страницу кандидатов: после
-        # фильтрации разделов и дублей должно остаться до десяти публикаций.
-        groups_on_page=50 if required_domain else 20,
+        sort_mode="SORT_MODE_BY_RELEVANCE",
+        # Берём больше пяти кандидатов: часть может оказаться разделами сайта.
+        groups_on_page=20,
         sort_order="SORT_ORDER_DESC",
         group_mode="GROUP_MODE_FLAT",
         docs_in_group=1,
@@ -3152,10 +2944,10 @@ def yandex_search_sources(query, required_domain=""):
                 source_lines.append("Содержательная выдержка: в поисковой выдаче отсутствует")
             sources.append("\n".join(source_lines))
 
-            if len(sources) >= (10 if required_domain else 5):
+            if len(sources) >= 10:
                 break
 
-        if len(sources) >= (10 if required_domain else 5):
+        if len(sources) >= 10:
             break
 
     result_domains = []
@@ -3356,36 +3148,23 @@ def search_and_answer(session_id, job_id, user_text, history):
         if required_domain:
             logger.info("User requested source domain: %s", required_domain)
 
-        # Для Lenta.ru используем официальный RSS как источник списка публикаций:
-        # это сохраняет реальную хронологию ленты и не зависит от ранжирования Яндекса.
-        # Остальные сайты и обычный веб-поиск продолжают работать по прежней схеме.
+        # Сначала Яндекс. Tavily используется только как резерв при ошибке
+        # Яндекса или пустой/непригодной поисковой выдаче общего поиска.
         try:
-            if required_domain == "lenta.ru" and is_latest_news_request(user_text):
-                sources = lenta_rss_search_sources(limit=10)
-                logger.info("Primary news source: Lenta.ru official RSS")
-            else:
-                sources = yandex_search_sources(search_query, required_domain)
-                logger.info("Primary search provider: Yandex Search API")
-        except Exception as search_error:
-            provider_name = (
-                "Lenta.ru RSS" if required_domain == "lenta.ru" and is_latest_news_request(user_text)
-                else "Yandex Search API"
-            )
+            sources = yandex_search_sources(search_query, required_domain)
+            logger.info("Primary search provider: Yandex Search API")
+        except Exception as yandex_error:
             logger.warning(
-                "%s failed%s: %s: %s",
-                provider_name,
+                "Yandex Search API failed%s: %s: %s",
                 f" for required domain {required_domain}" if required_domain else "",
-                type(search_error).__name__,
-                str(search_error)[:500],
+                type(yandex_error).__name__,
+                str(yandex_error)[:500],
             )
             if required_domain:
-                if required_domain == "lenta.ru" and is_latest_news_request(user_text):
-                    failure_text = "Не удалось получить публикации из RSS-ленты Lenta.ru."
-                else:
-                    failure_text = f"Не удалось получить подтверждённые результаты поиска с сайта {required_domain}."
                 answer = (
-                    failure_text + " Я не буду подменять их материалами "
-                    "с других сайтов. Попробуй повторить запрос немного позже."
+                    f"Не удалось получить подтверждённые результаты поиска "
+                    f"с сайта {required_domain}. Я не буду подменять их материалами "
+                    f"с других сайтов. Попробуй повторить запрос немного позже."
                 )
                 result = {"status": "ready", "answer": answer}
                 save_job_result(session_id, job_id, result)
@@ -3398,26 +3177,17 @@ def search_and_answer(session_id, job_id, user_text, history):
             )
             logger.info("Fallback search provider: Tavily")
 
-        # Короткие команды «найди последние новости...» тоже используют
-        # единый формат публикаций: заголовок отдельно, затем содержание и дата.
-        # Обычные поисковые вопросы без признака новостного запроса не затрагиваются.
-        latest_news_request = is_latest_news_request(user_text)
-        detailed_search = is_detailed_search_request(user_text) or latest_news_request
-        news_list_request = latest_news_request or (
-            detailed_search and any(
-                marker in normalize_command(user_text)
-                for marker in ("новост", "публикац", "стат", "материал")
-            ) and any(
-                marker in normalize_command(user_text)
-                for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой")
-            )
+        detailed_search = is_detailed_search_request(user_text)
+        news_list_request = detailed_search and any(
+            marker in normalize_command(user_text)
+            for marker in ("новост", "публикац", "стат", "материал")
+        ) and any(
+            marker in normalize_command(user_text)
+            for marker in ("перечисли", "список", "заголовок", "краткое содержание", "по каждой")
         )
         search_length_instruction = (
             "Поскольку пользователь просит перечислить несколько новостей или публикаций, "
-            "подготовь список максимум из десяти найденных материалов. Для явно указанного "
-            "сайта постарайся дать десять отдельных публикаций, если они есть в выдаче; "
-            "не заполняй список разделами сайта или неподтверждёнными материалами. "
-            "Не добавляй вступление. "
+            "подготовь список максимум из десяти найденных материалов. Не добавляй вступление. "
             "Не нумеруй новости и не добавляй вводные слова вроде «Первая новость». "
             "Каждую публикацию обязательно оформи строго двумя частями с отдельными "
             "служебными метками на отдельных строках. Сначала напиши строку "
@@ -3437,7 +3207,9 @@ def search_and_answer(session_id, job_id, user_text, history):
             "историю вопроса и другие подробности включай только как поясняющий контекст, "
             "не подменяя ими само событие. Если найденные фрагменты не раскрывают событие "
             "из заголовка, честно укажи, что подробностей недостаточно, либо пропусти "
-            "такую публикацию. Не придумывай подробности, которых нет в переданных фрагментах. "
+            "публикацию. Не считай материал сегодняшним только потому, "
+            "что поиск выполнен сегодня. "
+            "Не придумывай подробности, которых нет в переданных фрагментах. "
             "Каждый блок источника относится только к заголовку и URL внутри этого же блока. "
             "Никогда не переноси дату, время, факт или выдержку из одного документа в другой. "
             "Если заголовок и выдержка явно не соответствуют друг другу, не пересказывай "
@@ -3445,10 +3217,6 @@ def search_and_answer(session_id, job_id, user_text, history):
             "Не выдавай общие страницы, ленты, главные страницы и разделы сайта за новости. "
             "Если сведений недостаточно для десяти содержательных пунктов, перечисли только "
             "те материалы, содержание которых подтверждается поисковой выдачей. "
-            "Для публикаций, полученных из RSS, строго сохраняй порядок ленты: "
-            "сначала самая свежая публикация, затем более ранние. Не переставляй "
-            "материалы произвольно. Для остальных сайтов используй подтверждённое "
-            "время публикации или изменения документа. "
             "Общий объём ответа — ориентировочно 2500–3500 символов. "
             "Закончи последнюю мысль полным предложением. Не задавай вопрос о продолжении: "
             "программа сама разделит ответ на голосовые части. "
