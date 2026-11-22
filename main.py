@@ -7,6 +7,9 @@ import logging
 import threading
 import re
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
+from html import unescape
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
@@ -2837,6 +2840,184 @@ def _is_generic_site_page(title, url):
     return False
 
 
+
+class _LentaArticleTextParser(HTMLParser):
+    """Извлекает абзацы из основной части статьи Lenta.ru без сторонних блоков."""
+    BODY_MARKERS = ("topic-body", "article-body", "topic-paragraph", "article__body")
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.current_paragraph = None
+        self.paragraphs = []
+        self.meta_description = ""
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = set(str(attrs.get("class", "")).lower().split())
+        tag_name = tag.lower()
+        if tag_name not in {"meta", "link", "img", "br", "hr", "input", "source", "area", "base", "embed", "param", "track", "wbr"}:
+            self.stack.append((tag_name, classes))
+        if tag_name == "meta":
+            key = str(attrs.get("property") or attrs.get("name") or "").lower()
+            if key in {"og:description", "description", "twitter:description"}:
+                value = " ".join(str(attrs.get("content") or "").split())
+                if value and len(value) > len(self.meta_description):
+                    self.meta_description = value
+        if tag.lower() == "p":
+            self.current_paragraph = {"inside_body": any(
+                any(marker in class_name for marker in self.BODY_MARKERS)
+                for _, level_classes in self.stack for class_name in level_classes
+            ), "parts": []}
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "p" and self.current_paragraph is not None:
+            text = " ".join(" ".join(self.current_paragraph["parts"]).split())
+            if text and self.current_paragraph["inside_body"]:
+                self.paragraphs.append(text)
+            self.current_paragraph = None
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag.lower():
+                del self.stack[index:]
+                break
+
+    def handle_data(self, data):
+        if self.current_paragraph is not None and data.strip():
+            self.current_paragraph["parts"].append(data.strip())
+
+
+def _strip_rss_html(value):
+    value = unescape(str(value or ""))
+    value = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
+    value = re.sub(r"(?s)<[^>]+>", " ", value)
+    return " ".join(value.split())
+
+
+def _fetch_lenta_article(url):
+    """Загружает отдельную статью и возвращает текст её основного содержимого."""
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; DeepSeekAlisaNews/1.0)",
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "ru-RU,ru;q=0.9",
+            },
+            timeout=(5, 10),
+        )
+        response.raise_for_status()
+        parser = _LentaArticleTextParser()
+        parser.feed(response.text)
+        body = "\n".join(parser.paragraphs)
+        if len(body) < 250:
+            body = parser.meta_description
+        return body[:5000]
+    except Exception as exc:
+        logger.warning("Lenta article fetch failed for %s: %s", url, str(exc)[:250])
+        return ""
+
+
+def lenta_rss_search_sources(limit=10):
+    """Берёт последние отдельные публикации напрямую из официального RSS Lenta.ru."""
+    feed_url = "https://lenta.ru/rss"
+    started = time.perf_counter()
+    response = requests.get(
+        feed_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; DeepSeekAlisaNews/1.0)",
+            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        },
+        timeout=(5, 15),
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+
+    items = [node for node in root.iter() if _xml_local_name(node.tag) == "item"]
+    entries = []
+    seen_urls = set()
+    for item in items:
+        title = _xml_direct_text(item, {"title"})
+        url = _xml_direct_text(item, {"link"}) or _xml_direct_text(item, {"guid"})
+        if not title or not url:
+            continue
+        host = _normalize_result_domain("", url)
+        if host != "lenta.ru" and not host.endswith(".lenta.ru"):
+            continue
+        if _is_generic_site_page(title, url):
+            continue
+        canonical_url = url.split("#", 1)[0].rstrip("/").lower()
+        if canonical_url in seen_urls:
+            continue
+        seen_urls.add(canonical_url)
+
+        raw_date = _xml_direct_text(item, {"pubdate", "published", "date", "updated"})
+        timestamp = 0.0
+        normalized_date = raw_date or ""
+        if raw_date:
+            try:
+                parsed = parsedate_to_datetime(raw_date)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                timestamp = parsed.timestamp()
+                normalized_date = parsed.astimezone().strftime("%d.%m.%Y, %H:%M")
+            except Exception:
+                try:
+                    parsed = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                    timestamp = parsed.timestamp()
+                    normalized_date = parsed.astimezone().strftime("%d.%m.%Y, %H:%M")
+                except Exception:
+                    pass
+
+        description = _xml_direct_text(item, {"description", "encoded", "content"})
+        description = _strip_rss_html(description)
+        entries.append({
+            "title": title,
+            "url": url,
+            "date": normalized_date or "не указана в RSS",
+            "timestamp": timestamp,
+            "description": description,
+        })
+
+    # Если даты доступны, сортируем строго по времени публикации; иначе
+    # сохраняем исходный порядок RSS, который обычно уже newest-first.
+    if entries and any(entry["timestamp"] for entry in entries):
+        entries.sort(key=lambda entry: entry["timestamp"], reverse=True)
+    entries = entries[:max(1, int(limit))]
+    if not entries:
+        raise RuntimeError("Lenta RSS returned no eligible article entries")
+
+    # Загружаем тексты параллельно, чтобы десять статей не увеличивали ожидание
+    # на сумму десяти сетевых таймаутов.
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        article_texts = list(pool.map(
+            _fetch_lenta_article,
+            [entry["url"] for entry in entries],
+        ))
+
+    sources = []
+    for index, (entry, article_text) in enumerate(zip(entries, article_texts), start=1):
+        content = article_text or entry["description"]
+        if not content:
+            content = "Полный текст статьи не удалось получить; в RSS доступен только заголовок."
+        source_lines = [
+            "ОТДЕЛЬНАЯ ПУБЛИКАЦИЯ ИЗ ОФИЦИАЛЬНОЙ RSS-ЛЕНТЫ LENTA.RU",
+            f"Позиция в RSS после сортировки по времени: {index}",
+            "Заголовок: " + entry["title"],
+            "Домен: lenta.ru",
+            "Дата публикации: " + entry["date"],
+            "URL: " + entry["url"],
+            "Текст статьи или описание из RSS: " + content[:5000],
+        ]
+        sources.append("\n".join(source_lines))
+
+    logger.info(
+        "Lenta RSS completed in %.2f seconds; feed_items=%s; article_texts=%s",
+        time.perf_counter() - started,
+        len(entries),
+        sum(1 for text in article_texts if len(text) >= 250),
+    )
+    return sources
+
 def yandex_search_sources(query, required_domain=""):
     """Ищет через Yandex Search API, разделяя документы и отбрасывая разделы сайта."""
     if not YANDEX_API_KEY:
@@ -3178,23 +3359,36 @@ def search_and_answer(session_id, job_id, user_text, history):
         if required_domain:
             logger.info("User requested source domain: %s", required_domain)
 
-        # Сначала Яндекс. Tavily используется только как резерв при ошибке
-        # Яндекса или пустой/непригодной поисковой выдаче общего поиска.
+        # Для Lenta.ru используем официальный RSS как источник списка публикаций:
+        # это сохраняет реальную хронологию ленты и не зависит от ранжирования Яндекса.
+        # Остальные сайты и обычный веб-поиск продолжают работать по прежней схеме.
         try:
-            sources = yandex_search_sources(search_query, required_domain)
-            logger.info("Primary search provider: Yandex Search API")
-        except Exception as yandex_error:
+            if required_domain == "lenta.ru" and is_latest_news_request(user_text):
+                sources = lenta_rss_search_sources(limit=10)
+                logger.info("Primary news source: Lenta.ru official RSS")
+            else:
+                sources = yandex_search_sources(search_query, required_domain)
+                logger.info("Primary search provider: Yandex Search API")
+        except Exception as search_error:
+            provider_name = (
+                "Lenta.ru RSS" if required_domain == "lenta.ru" and is_latest_news_request(user_text)
+                else "Yandex Search API"
+            )
             logger.warning(
-                "Yandex Search API failed%s: %s: %s",
+                "%s failed%s: %s: %s",
+                provider_name,
                 f" for required domain {required_domain}" if required_domain else "",
-                type(yandex_error).__name__,
-                str(yandex_error)[:500],
+                type(search_error).__name__,
+                str(search_error)[:500],
             )
             if required_domain:
+                if required_domain == "lenta.ru" and is_latest_news_request(user_text):
+                    failure_text = "Не удалось получить публикации из RSS-ленты Lenta.ru."
+                else:
+                    failure_text = f"Не удалось получить подтверждённые результаты поиска с сайта {required_domain}."
                 answer = (
-                    f"Не удалось получить подтверждённые результаты поиска "
-                    f"с сайта {required_domain}. Я не буду подменять их материалами "
-                    f"с других сайтов. Попробуй повторить запрос немного позже."
+                    failure_text + " Я не буду подменять их материалами "
+                    "с других сайтов. Попробуй повторить запрос немного позже."
                 )
                 result = {"status": "ready", "answer": answer}
                 save_job_result(session_id, job_id, result)
@@ -3261,9 +3455,10 @@ def search_and_answer(session_id, job_id, user_text, history):
             "Не выдавай общие страницы, ленты, главные страницы и разделы сайта за новости. "
             "Если сведений недостаточно для десяти содержательных пунктов, перечисли только "
             "те материалы, содержание которых подтверждается поисковой выдачей. "
-            "Для запроса с конкретным сайтом располагай материалы от наиболее свежих "
-            "к более старым по времени изменения документа, если отдельное время "
-            "публикации не предоставлено. Не переставляй материалы произвольно. "
+            "Для публикаций, полученных из RSS, строго сохраняй порядок ленты: "
+            "сначала самая свежая публикация, затем более ранние. Не переставляй "
+            "материалы произвольно. Для остальных сайтов используй подтверждённое "
+            "время публикации или изменения документа. "
             "Общий объём ответа — ориентировочно 3500–5000 символов. "
             "Закончи последнюю мысль полным предложением. Не задавай вопрос о продолжении: "
             "программа сама разделит ответ на голосовые части. "
