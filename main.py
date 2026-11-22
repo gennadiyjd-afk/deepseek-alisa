@@ -7,6 +7,7 @@ import logging
 import threading
 import re
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1322,10 +1323,18 @@ def is_oil_request(text):
 
 
 def needs_search(text):
-    text = str(text or "").lower().replace("ё", "е")
+    text = str(text or "").lower().replace("ё", "е").strip()
+    # Самостоятельная команда «найди» запускает поиск даже без слов «в интернете».
+    # «Посмотри» и «глянь» требуют явного уточнения «в интернете».
+    explicit_find = bool(re.search(r"^(?:а\s+)?найди\b", text))
+    explicit_web_look = any(
+        phrase in text
+        for phrase in ("найди в интернете", "посмотри в интернете", "глянь в интернете")
+    )
     return (
-        "найди в интернете" in text
-        or "посмотри в интернете" in text
+        explicit_find
+        or explicit_web_look
+        or is_telegram_channel_request(text)
         or is_stock_quote_request(text)
         or is_currency_rate_request(text)
         or is_weather_request(text)
@@ -1337,7 +1346,7 @@ def extract_stock_query(user_text):
     """Оставляет в запросе название компании или биржевой тикер."""
     query = str(user_text or "").strip()
     query = re.sub(
-        r"(?i)\bнайди\s+в\s+интернете\b|\bпосмотри\s+в\s+интернете\b",
+        r"(?i)\bнайди(?:\s+в\s+интернете)?\b|\b(?:посмотри|глянь)\s+в\s+интернете\b",
         " ", query,
     )
     query = re.sub(
@@ -2722,7 +2731,7 @@ def extract_requested_search_domain(user_text):
     publisher_aliases = (
         (r"интерфакс(?:а|е|ом)?", "interfax.ru"),
         (r"рбк", "rbc.ru"),
-        (r"лента(?:\.ру)?", "lenta.ru"),
+        (r"лент(?:а|ы|е|у|ой|ою)(?:\.ру)?", "lenta.ru"),
         (r"тасс", "tass.ru"),
         (r"риа\s+новости", "ria.ru"),
         (r"коммерсант(?:а|е|ом)?", "kommersant.ru"),
@@ -2740,6 +2749,149 @@ def extract_requested_search_domain(user_text):
             return domain
 
     return ""
+
+
+class _TelegramPublicChannelParser(HTMLParser):
+    """Извлекает текст и время отдельных публикаций из публичного preview Telegram."""
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+    BLOCK_TAGS = {"p", "div", "br", "li", "blockquote"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.posts = []
+        self.current = None
+        self.capture_depth = 0
+
+    def _finish_post(self):
+        if not self.current:
+            return
+        text = " ".join("".join(self.current["parts"]).replace("\xa0", " ").split())
+        if text:
+            self.posts.append({
+                "post_id": self.current.get("post_id", ""),
+                "date": self.current.get("date", ""),
+                "text": text,
+            })
+        self.current = None
+        self.capture_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = set(str(attrs.get("class", "")).split())
+        if "tgme_widget_message_wrap" in classes:
+            self._finish_post()
+            self.current = {
+                "post_id": str(attrs.get("data-post", "")),
+                "date": "",
+                "parts": [],
+            }
+
+        if self.current and tag == "time" and attrs.get("datetime"):
+            self.current["date"] = str(attrs["datetime"])
+
+        if self.current and "tgme_widget_message_text" in classes:
+            self.capture_depth = 1
+            return
+
+        if self.capture_depth:
+            if tag in self.BLOCK_TAGS:
+                self.current["parts"].append(" ")
+            if tag not in self.VOID_TAGS:
+                self.capture_depth += 1
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in self.VOID_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        if self.capture_depth:
+            self.capture_depth -= 1
+            if self.capture_depth == 0 and self.current:
+                self.current["parts"].append(" ")
+
+    def handle_data(self, data):
+        if self.current and self.capture_depth:
+            self.current["parts"].append(data)
+
+    def close(self):
+        super().close()
+        self._finish_post()
+
+
+def is_telegram_channel_request(text):
+    """Распознаёт явный запрос к согласованному Telegram-каналу."""
+    normalized = normalize_command(text).replace("ё", "е")
+    if "bbbreaking" in normalized or "раньше всех" in normalized:
+        return True
+    return bool(re.search(
+        r"\b(?:в|из|с)\s+(?:телеграм{1,2}(?:е|а|у|ом)?|telegram)(?:[- ]канал(?:е|а|у|ом)?)?\b",
+        normalized,
+    )) or bool(re.search(r"\bтелеграм{1,2}[- ]канал(?:е|а|у|ом)?\b", normalized))
+
+
+def telegram_channel_search_sources(limit=20):
+    """Получает последние публикации публичного канала @bbbreaking без авторизации."""
+    channel_url = "https://t.me/s/bbbreaking"
+    response = requests.get(
+        channel_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; DeepSeekAlisaNews/1.0)",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+        timeout=(7, 20),
+    )
+    response.raise_for_status()
+
+    parser = _TelegramPublicChannelParser()
+    parser.feed(response.text)
+    parser.close()
+
+    posts = parser.posts
+    if not posts:
+        raise RuntimeError("Telegram public preview returned no readable channel posts")
+
+    def date_key(item):
+        raw = str(item.get("date") or "")
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except Exception:
+            return 0.0
+
+    # Сортируем по времени, удаляем дубли и оставляем последние публикации.
+    posts.sort(key=date_key, reverse=True)
+    unique_posts = []
+    seen = set()
+    for post in posts:
+        key = post.get("post_id") or post.get("text", "")[:300]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique_posts.append(post)
+        if len(unique_posts) >= max(1, int(limit)):
+            break
+
+    sources = []
+    for index, post in enumerate(unique_posts, start=1):
+        post_id = str(post.get("post_id") or "").rsplit("/", 1)[-1]
+        post_url = f"https://t.me/bbbreaking/{post_id}" if post_id.isdigit() else channel_url
+        source_lines = [
+            "ОТДЕЛЬНАЯ ПУБЛИКАЦИЯ ПУБЛИЧНОГО TELEGRAM-КАНАЛА «РАНЬШЕ ВСЕХ. НУ ПОЧТИ.»",
+            f"Позиция после сортировки по времени: {index}",
+            "Дата публикации (только для внутренней хронологии): " + (post.get("date") or "не указана"),
+            "URL: " + post_url,
+            "Текст публикации: " + str(post.get("text") or "")[:4500],
+        ]
+        sources.append("\n".join(source_lines))
+
+    logger.info(
+        "Telegram @bbbreaking completed; parsed_posts=%s; returned_posts=%s",
+        len(posts), len(sources),
+    )
+    return sources
 
 
 def _normalize_result_domain(domain, url=""):
@@ -3145,30 +3297,43 @@ def search_and_answer(session_id, job_id, user_text, history):
         # В таком режиме не переключаемся на общий резервный поиск Tavily,
         # чтобы не подменить результаты материалами с других доменов.
         required_domain = extract_requested_search_domain(user_text)
+        telegram_channel_request = is_telegram_channel_request(user_text)
         if required_domain:
             logger.info("User requested source domain: %s", required_domain)
 
-        # Сначала Яндекс. Tavily используется только как резерв при ошибке
-        # Яндекса или пустой/непригодной поисковой выдаче общего поиска.
+        # Telegram-канал — отдельный источник. Все сайты, включая Ленту,
+        # работают через единый Yandex Search API без отдельной RSS-ветки.
         try:
-            sources = yandex_search_sources(search_query, required_domain)
-            logger.info("Primary search provider: Yandex Search API")
-        except Exception as yandex_error:
+            if telegram_channel_request:
+                sources = telegram_channel_search_sources(limit=20)
+                logger.info("Primary news source: Telegram @bbbreaking public channel")
+            else:
+                sources = yandex_search_sources(search_query, required_domain)
+                logger.info("Primary search provider: Yandex Search API")
+        except Exception as search_error:
             logger.warning(
-                "Yandex Search API failed%s: %s: %s",
-                f" for required domain {required_domain}" if required_domain else "",
-                type(yandex_error).__name__,
-                str(yandex_error)[:500],
+                "News source failed%s: %s: %s",
+                " for Telegram @bbbreaking" if telegram_channel_request else (
+                    f" for required domain {required_domain}" if required_domain else ""
+                ),
+                type(search_error).__name__,
+                str(search_error)[:500],
             )
-            if required_domain:
-                answer = (
-                    f"Не удалось получить подтверждённые результаты поиска "
-                    f"с сайта {required_domain}. Я не буду подменять их материалами "
-                    f"с других сайтов. Попробуй повторить запрос немного позже."
-                )
-                result = {"status": "ready", "answer": answer}
+            if required_domain or telegram_channel_request:
+                if telegram_channel_request:
+                    failure_text = (
+                        "Не удалось получить публикации из публичного Telegram-канала "
+                        "«Раньше всех. Ну почти.». Попробуй повторить запрос немного позже."
+                    )
+                else:
+                    failure_text = (
+                        f"Не удалось получить подтверждённые результаты поиска "
+                        f"с сайта {required_domain}. Я не буду подменять их материалами "
+                        f"с других сайтов. Попробуй повторить запрос немного позже."
+                    )
+                result = {"status": "ready", "answer": failure_text}
                 save_job_result(session_id, job_id, result)
-                logger.info("Restricted-site search finished without cross-domain fallback")
+                logger.info("Restricted-source search finished without cross-source fallback")
                 return result
             sources = tavily_search_sources(
                 search_query,
@@ -3291,6 +3456,14 @@ def search_and_answer(session_id, job_id, user_text, history):
                     "биржа или тип цены. Если причина не ясна, так и скажи "
                     "и приведи обе цифры с названиями источников. "
                     "Учитывай все найденные материалы, а не только первые. "
+                    + (
+                        "Источники взяты из публичного Telegram-канала «Раньше всех. Ну почти.». "
+                        "Считай каждую публикацию отдельной единицей информации, не смешивай "
+                        "сведения из разных сообщений и не повторяй одно событие дважды. "
+                        "Сохраняй хронологию от новых публикаций к более ранним. "
+                        "Не произноси время публикации и не называй его временем самого события. "
+                        if telegram_channel_request else ""
+                    )
                     + search_length_instruction + " "
                     "Не произноси URL, адреса сайтов и ссылки. "
                     "Не предлагай пользователю источники и не спрашивай, "
