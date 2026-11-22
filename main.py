@@ -1003,7 +1003,7 @@ def is_joke_request(text):
     ))
 
 
-def split_answer_into_parts(answer, chunk_size=350, preserve_news_boundaries=False, hard_limit=False):
+def split_answer_into_parts(answer, chunk_size=400, preserve_news_boundaries=False, hard_limit=False):
     """Делит текст по предложениям и не склеивает соседние новостные публикации."""
     text = str(answer or "").strip()
     text = re.sub(
