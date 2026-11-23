@@ -485,7 +485,7 @@ body{font-family:system-ui,-apple-system,sans-serif;max-width:620px;margin:12vh 
 main{background:white;padding:24px;border-radius:16px;box-shadow:0 2px 16px #0001}h1{font-size:1.5rem}input,button{box-sizing:border-box;width:100%;padding:14px;margin-top:12px;font-size:1rem;border-radius:9px;border:1px solid #bbb}button{background:#202124;color:white;border:0}p{color:#a33}
 </style></head><body><main><h1>Сохранённые ответы</h1>
 <p>Введите пароль доступа к архиву.</p><form method="post" action="/saved/login">
-<input type="password" name="token" autocomplete="current-password" required placeholder="Пароль доступа">
+<input type="password" name="password" autocomplete="current-password" required placeholder="Пароль доступа">
 <button type="submit">Открыть архив</button></form><p>""" + safe_message + """</p></main></body></html>"""
 
 
@@ -499,7 +499,7 @@ def render_saved_answers(records):
             continue
         question = html_escape(str(record.get("question") or "Без названия"))
         answer = html_escape(str(record.get("answer") or ""))
-        created = time.strftime("%d.%m.%Y %H:%M", time.localtime(int(record.get("saved_at") or record.get("created_at") or 0)))
+        created = (datetime.fromtimestamp(int(record.get("saved_at") or record.get("created_at") or 0), tz=timezone.utc) + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M")
         cards.append(
             '<article><div class="meta">' + html_escape(created) + '</div><h2>' + question + '</h2>'
             '<details><summary>Открыть текст ответа</summary><pre>' + answer + '</pre></details>'
@@ -3756,7 +3756,7 @@ async def saved_answers_login(request: Request):
     try:
         body_bytes = await request.body()
         fields = parse_qs(body_bytes.decode("utf-8", errors="replace"), keep_blank_values=True)
-        supplied = (fields.get("token") or [""])[0]
+        supplied = (fields.get("password") or fields.get("token") or [""])[0]
     except Exception:
         supplied = ""
     if not hmac.compare_digest(supplied, SAVED_ANSWERS_ACCESS_TOKEN):
@@ -3765,7 +3765,7 @@ async def saved_answers_login(request: Request):
     response.set_cookie(
         key=SAVED_ANSWERS_COOKIE,
         value=SAVED_ANSWERS_ACCESS_TOKEN,
-        max_age=30 * 24 * 60 * 60,
+        max_age=365 * 24 * 60 * 60,
         httponly=True,
         secure=True,
         samesite="strict",
