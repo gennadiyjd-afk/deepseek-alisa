@@ -311,7 +311,7 @@ def schedule_auto_next_part(job_key, job_id, part_text, pause_after_seconds=0.0)
     """Ждёт расчётную длительность чтения и дополнительную паузу; старые таймеры игнорируются."""
     # Расчёт времени чтения: 19 символов в секунду + 0,5 секунды запаса.
     # Для заголовка новости дополнительно выдерживаем 1 секунду после чтения.
-    estimated_seconds = max(4.0, len(str(part_text or "")) / 18.5 + 1.0)
+    estimated_seconds = max(4.0, len(str(part_text or "")) / 18.0 + 1.0)
     estimated_seconds += max(0.0, float(pause_after_seconds or 0.0))
     with jobs_lock:
         current = search_jobs.get(job_key)
