@@ -3746,7 +3746,19 @@ async def saved_answers_page(request: Request):
     try:
         raw_records = redis_command(["LRANGE", SAVED_ANSWERS_LIST_KEY, 0, SAVED_ANSWERS_MAX_ITEMS - 1])
         records = [json.loads(item) for item in (raw_records or [])]
-        return HTMLResponse(render_saved_answers(records), headers={"Cache-Control": "no-store"})
+        response = HTMLResponse(render_saved_answers(records), headers={"Cache-Control": "no-store"})
+        # Refresh the persistent cookie on successful archive visits.
+        response.set_cookie(
+            key=SAVED_ANSWERS_COOKIE,
+            value=SAVED_ANSWERS_ACCESS_TOKEN,
+            max_age=365 * 24 * 60 * 60,
+            expires=datetime.now(timezone.utc) + timedelta(days=365),
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            path="/",
+        )
+        return response
     except Exception:
         logger.exception("Could not load saved answers page")
         return HTMLResponse("<h1>Не удалось загрузить архив</h1><p>Проверьте подключение Redis.</p>", status_code=503)
@@ -3769,9 +3781,10 @@ async def saved_answers_login(request: Request):
         key=SAVED_ANSWERS_COOKIE,
         value=SAVED_ANSWERS_ACCESS_TOKEN,
         max_age=365 * 24 * 60 * 60,
+        expires=datetime.now(timezone.utc) + timedelta(days=365),
         httponly=True,
         secure=True,
-        samesite="strict",
+        samesite="lax",
         path="/",
     )
     response.headers["Cache-Control"] = "no-store"
