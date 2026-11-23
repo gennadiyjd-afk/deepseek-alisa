@@ -8,11 +8,14 @@ import threading
 import re
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
-from urllib.parse import urlsplit
+from html import escape as html_escape
+from urllib.parse import urlsplit, parse_qs
+import hmac
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, Response, RedirectResponse, PlainTextResponse
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -53,6 +56,13 @@ WEATHER_CACHE_LOCK = threading.Lock()
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 REDIS_STATE_KEY = "deepseek-alisa:conversation-jobs:v1"
+# Отдельный постоянный архив: эти ключи не входят в очищаемое состояние диалога.
+SAVED_ANSWERS_LATEST_KEY = "deepseek-alisa:saved-answers:latest:v1"
+SAVED_ANSWERS_LIST_KEY = "deepseek-alisa:saved-answers:archive:v1"
+SAVED_ANSWERS_MAX_ITEMS = 100
+SAVED_ANSWERS_ACCESS_TOKEN = os.getenv("SAVED_ANSWERS_ACCESS_TOKEN", "")
+SAVED_ANSWERS_AUTH_READY = len(SAVED_ANSWERS_ACCESS_TOKEN) >= 32
+SAVED_ANSWERS_COOKIE = "deepseek_saved_access"
 REDIS_STATE_LOCK = threading.Lock()
 REDIS_AVAILABLE = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
 
@@ -414,6 +424,95 @@ def redis_command(command):
     if payload.get("error"):
         raise RuntimeError("Upstash Redis command failed")
     return payload.get("result")
+
+
+def persist_latest_answer(answer, user_text=""):
+    """Сохраняет последний полностью подготовленный ответ отдельно от рабочих задач."""
+    text = str(answer or "").strip()
+    if not text or not REDIS_AVAILABLE:
+        return False
+    record = {
+        "id": uuid.uuid4().hex,
+        "created_at": int(time.time()),
+        "question": str(user_text or "").strip()[:500],
+        "answer": text,
+    }
+    try:
+        redis_command([
+            "SET", SAVED_ANSWERS_LATEST_KEY,
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+        ])
+        return True
+    except Exception as exc:
+        logger.warning("Could not persist latest answer for saving: %s", exc)
+        return False
+
+
+def save_latest_answer_to_archive():
+    """Добавляет последний готовый ответ в отдельный постоянный архив Redis."""
+    if not REDIS_AVAILABLE:
+        return False
+    try:
+        raw = redis_command(["GET", SAVED_ANSWERS_LATEST_KEY])
+        if not raw:
+            return None
+        record = json.loads(raw)
+        if not isinstance(record, dict) or not str(record.get("answer") or "").strip():
+            return None
+        record["saved_at"] = int(time.time())
+        record["id"] = uuid.uuid4().hex
+        serialized = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        redis_command(["LPUSH", SAVED_ANSWERS_LIST_KEY, serialized])
+        redis_command(["LTRIM", SAVED_ANSWERS_LIST_KEY, 0, SAVED_ANSWERS_MAX_ITEMS - 1])
+        return True
+    except Exception as exc:
+        logger.warning("Could not archive latest answer in Redis: %s", exc)
+        return False
+
+
+def saved_answers_authorized(request):
+    configured = SAVED_ANSWERS_ACCESS_TOKEN
+    supplied = request.cookies.get(SAVED_ANSWERS_COOKIE, "")
+    return bool(SAVED_ANSWERS_AUTH_READY and supplied and hmac.compare_digest(supplied, configured))
+
+
+def saved_answers_login_page(message=""):
+    safe_message = html_escape(message)
+    return """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Сохранённые ответы</title><style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:620px;margin:12vh auto;padding:24px;color:#202124;background:#f7f7f7}
+main{background:white;padding:24px;border-radius:16px;box-shadow:0 2px 16px #0001}h1{font-size:1.5rem}input,button{box-sizing:border-box;width:100%;padding:14px;margin-top:12px;font-size:1rem;border-radius:9px;border:1px solid #bbb}button{background:#202124;color:white;border:0}p{color:#a33}
+</style></head><body><main><h1>Сохранённые ответы</h1>
+<p>Введите пароль доступа к архиву.</p><form method="post" action="/saved/login">
+<input type="password" name="token" autocomplete="current-password" required placeholder="Пароль доступа">
+<button type="submit">Открыть архив</button></form><p>""" + safe_message + """</p></main></body></html>"""
+
+
+def render_saved_answers(records):
+    cards = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        entry_id = str(record.get("id") or "")
+        if not re.fullmatch(r"[a-f0-9]{32}", entry_id):
+            continue
+        question = html_escape(str(record.get("question") or "Без названия"))
+        answer = html_escape(str(record.get("answer") or ""))
+        created = time.strftime("%d.%m.%Y %H:%M", time.localtime(int(record.get("saved_at") or record.get("created_at") or 0)))
+        cards.append(
+            '<article><div class="meta">' + html_escape(created) + '</div><h2>' + question + '</h2>'
+            '<details><summary>Открыть текст ответа</summary><pre>' + answer + '</pre></details>'
+            '<a href="/saved/download/' + entry_id + '">Скачать TXT</a></article>'
+        )
+    body = "".join(cards) if cards else "<p>Пока нет сохранённых ответов.</p>"
+    return """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Сохранённые ответы</title><style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:850px;margin:24px auto;padding:0 14px;color:#202124;background:#f7f7f7}
+header,article{background:white;padding:18px 20px;border-radius:14px;margin:12px 0;box-shadow:0 1px 8px #0000000d}
+h1{font-size:1.5rem}h2{font-size:1.08rem;margin:8px 0 14px}.meta{font-size:.85rem;color:#666}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.5}a{display:inline-block;margin-top:14px;color:#1458a6}
+button{padding:9px 14px;border:0;border-radius:8px;background:#333;color:#fff}form{display:inline}
+</style></head><body><header><h1>Сохранённые ответы</h1><p>Последние 100 сохранений</p><form method="post" action="/saved/logout"><button type="submit">Выйти</button></form></header>""" + body + "</body></html>"
 
 
 def persist_job_maps():
@@ -1250,6 +1349,8 @@ def prepare_job_parts(job, answer):
             part_delays[index] = 1.0
 
     job["answer"] = original_answer
+    # Отдельная запись переживает удаление рабочей задачи при завершении навыка.
+    persist_latest_answer(original_answer, user_text)
     job["parts"] = parts
     job["timing_parts"] = timing_parts
     job["part_delays"] = part_delays
@@ -2463,6 +2564,10 @@ def save_job_result(session_id, job_id, result):
         current = search_jobs.get(session_id)
         if current and current.get("job_id") == job_id:
             current.update(result)
+            if result.get("status") == "ready":
+                # Фиксируем ответ сразу после полного завершения генерации,
+                # даже если Алиса ещё не запросила его озвучивание.
+                persist_latest_answer(result.get("answer", ""), current.get("user_text", ""))
             should_auto_deliver = (
                 result.get("status") == "ready"
                 and bool(current.get("auto_delivery"))
@@ -2473,6 +2578,8 @@ def save_job_result(session_id, job_id, result):
             for saved_job in interrupted:
                 if saved_job.get("job_id") == job_id:
                     saved_job.update(result)
+                    if result.get("status") == "ready":
+                        persist_latest_answer(result.get("answer", ""), saved_job.get("user_text", ""))
                     persist_job_maps()
                     logger.info("Background result saved for an interrupted conversation")
                     return
@@ -3616,6 +3723,85 @@ async def startup_restore_redis_state():
     load_job_maps()
 
 
+@app.get("/saved", response_class=HTMLResponse)
+async def saved_answers_page(request: Request):
+    if not SAVED_ANSWERS_AUTH_READY:
+        return HTMLResponse(
+            "<h1>Архив пока не настроен</h1><p>Добавьте SAVED_ANSWERS_ACCESS_TOKEN в переменные окружения Render.</p>",
+            status_code=503,
+        )
+    if not saved_answers_authorized(request):
+        return HTMLResponse(saved_answers_login_page(), status_code=401)
+    try:
+        raw_records = redis_command(["LRANGE", SAVED_ANSWERS_LIST_KEY, 0, SAVED_ANSWERS_MAX_ITEMS - 1])
+        records = [json.loads(item) for item in (raw_records or [])]
+        return HTMLResponse(render_saved_answers(records), headers={"Cache-Control": "no-store"})
+    except Exception:
+        logger.exception("Could not load saved answers page")
+        return HTMLResponse("<h1>Не удалось загрузить архив</h1><p>Проверьте подключение Redis.</p>", status_code=503)
+
+
+@app.post("/saved/login")
+async def saved_answers_login(request: Request):
+    if not SAVED_ANSWERS_AUTH_READY:
+        return HTMLResponse("Архив не настроен.", status_code=503)
+    try:
+        body_bytes = await request.body()
+        fields = parse_qs(body_bytes.decode("utf-8", errors="replace"), keep_blank_values=True)
+        supplied = (fields.get("token") or [""])[0]
+    except Exception:
+        supplied = ""
+    if not hmac.compare_digest(supplied, SAVED_ANSWERS_ACCESS_TOKEN):
+        return HTMLResponse(saved_answers_login_page("Неверный пароль."), status_code=401)
+    response = RedirectResponse(url="/saved", status_code=303)
+    response.set_cookie(
+        key=SAVED_ANSWERS_COOKIE,
+        value=SAVED_ANSWERS_ACCESS_TOKEN,
+        max_age=30 * 24 * 60 * 60,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path="/saved",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/saved/logout")
+async def saved_answers_logout():
+    response = RedirectResponse(url="/saved", status_code=303)
+    response.delete_cookie(key=SAVED_ANSWERS_COOKIE, path="/saved", secure=True, httponly=True, samesite="strict")
+    return response
+
+
+@app.get("/saved/download/{entry_id}")
+async def download_saved_answer(entry_id: str, request: Request):
+    if not SAVED_ANSWERS_AUTH_READY:
+        return PlainTextResponse("Архив не настроен.", status_code=503)
+    if not saved_answers_authorized(request):
+        return PlainTextResponse("Требуется авторизация.", status_code=401)
+    if not re.fullmatch(r"[a-f0-9]{32}", entry_id):
+        return PlainTextResponse("Запись не найдена.", status_code=404)
+    try:
+        raw_records = redis_command(["LRANGE", SAVED_ANSWERS_LIST_KEY, 0, SAVED_ANSWERS_MAX_ITEMS - 1])
+        for raw in raw_records or []:
+            record = json.loads(raw)
+            if record.get("id") == entry_id:
+                filename = "deepseek-answer-" + entry_id[:8] + ".txt"
+                return Response(
+                    content=str(record.get("answer") or ""),
+                    media_type="text/plain; charset=utf-8",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                        "Cache-Control": "no-store",
+                    },
+                )
+        return PlainTextResponse("Запись не найдена.", status_code=404)
+    except Exception:
+        logger.exception("Could not download saved answer")
+        return PlainTextResponse("Не удалось получить запись из Redis.", status_code=503)
+
+
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok", "redis_configured": REDIS_AVAILABLE}
@@ -3678,6 +3864,17 @@ async def main(body: dict):
             history=[],
             end_session=True,
         )
+
+    # Явная команда сохранения не должна останавливать мост или менять очередь чтения.
+    normalized_save_command = " ".join(normalize_command(user_text).replace(",", " ").split())
+    save_command = re.fullmatch(r"(?:алиса\s+)?сохрани\s+ответ", normalized_save_command)
+    if save_command:
+        saved = save_latest_answer_to_archive()
+        if saved is True:
+            return make_response(body, "Ответ сохранён.")
+        if saved is None:
+            return make_response(body, "Пока нет готового ответа, который можно сохранить.")
+        return make_response(body, "Не удалось сохранить ответ. Проверь подключение Redis.")
 
     # Автоматическая команда моста «Алиса, продолжи» приходит в тот же вебхук,
     # что и реплики пользователя. Её нельзя трактовать как новое прерывание:
