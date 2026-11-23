@@ -484,8 +484,11 @@ def saved_answers_login_page(message=""):
 body{font-family:system-ui,-apple-system,sans-serif;max-width:620px;margin:12vh auto;padding:24px;color:#202124;background:#f7f7f7}
 main{background:white;padding:24px;border-radius:16px;box-shadow:0 2px 16px #0001}h1{font-size:1.5rem}input,button{box-sizing:border-box;width:100%;padding:14px;margin-top:12px;font-size:1rem;border-radius:9px;border:1px solid #bbb}button{background:#202124;color:white;border:0}p{color:#a33}
 </style></head><body><main><h1>Сохранённые ответы</h1>
-<p>Введите пароль доступа к архиву.</p><form method="post" action="/saved/login">
-<input type="password" name="password" autocomplete="current-password" required placeholder="Пароль доступа">
+<p>Введите пароль доступа к архиву.</p><form method="post" action="/saved/login" autocomplete="on">
+<label for="saved-username">Имя пользователя</label>
+<input id="saved-username" type="text" name="username" value="Архив" autocomplete="username" required>
+<label for="saved-password">Пароль</label>
+<input id="saved-password" type="password" name="password" autocomplete="current-password" required placeholder="Пароль доступа">
 <button type="submit">Открыть архив</button></form><p>""" + safe_message + """</p></main></body></html>"""
 
 
@@ -3769,7 +3772,7 @@ async def saved_answers_login(request: Request):
         httponly=True,
         secure=True,
         samesite="strict",
-        path="/saved",
+        path="/",
     )
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -3815,7 +3818,7 @@ async def clear_saved_answers(request: Request):
 @app.post("/saved/logout")
 async def saved_answers_logout():
     response = RedirectResponse(url="/saved", status_code=303)
-    response.delete_cookie(key=SAVED_ANSWERS_COOKIE, path="/saved", secure=True, httponly=True, samesite="strict")
+    response.delete_cookie(key=SAVED_ANSWERS_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
     return response
 
 
