@@ -1391,16 +1391,25 @@ def is_oil_request(text):
 
 def needs_search(text):
     text = str(text or "").lower().replace("ё", "е").strip()
-    # Самостоятельная команда «найди» запускает поиск даже без слов «в интернете».
-    # «Посмотри» и «глянь» требуют явного уточнения «в интернете».
-    explicit_find = bool(re.search(r"^(?:а\s+)?найди\b", text))
-    explicit_web_look = any(
-        phrase in text
-        for phrase in ("найди в интернете", "посмотри в интернете", "глянь в интернете")
+    # Общий веб-поиск запускается при явном упоминании интернета
+    # либо по конструкции «на сайте»; название сайта определяет поисковик.
+    explicit_internet = bool(re.search(r"\bинтернет(?:а|е|у|ом|ы)?\b", text))
+    # Учитываем разные голосовые формулировки и возможную потерю предлога:
+    # «найди/поищи/глянь/посмотри сайт», «... на сайте», «... с сайта».
+    explicit_site_request = bool(
+        re.search(r"\b(?:на|с|со|из)\s+сайт(?:е|а|у|ом)\b", text)
+        or re.search(
+            r"\b(?:найди|поищи|глянь|посмотри|проверь|прочитай)\b"
+            r"(?:\s+[а-яa-z]+){0,3}\s+сайт(?:е|а|у|ом)?\b",
+            text,
+        )
+        or re.search(r"\b(?:что\s+пишут|новости|информация)\b.{0,35}\bсайт(?:е|а|у|ом)?\b", text)
     )
     return (
-        explicit_find
-        or explicit_web_look
+        explicit_internet
+        or explicit_site_request
+        # Отдельные источники и специализированные запросы не являются
+        # общим веб-поиском и сохраняют прежние правила запуска.
         or is_telegram_channel_request(text)
         or is_stock_quote_request(text)
         or is_currency_rate_request(text)
@@ -2793,28 +2802,8 @@ def extract_requested_search_domain(user_text):
         if re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
             return domain
 
-    # Часто в голосовом запросе пользователь называет издание, а не домен.
-    # Добавляем домены только для однозначно узнаваемых названий СМИ.
-    publisher_aliases = (
-        (r"интерфакс(?:а|е|ом)?", "interfax.ru"),
-        (r"рбк", "rbc.ru"),
-        (r"лент(?:а|ы|е|у|ой|ою)(?:\.ру)?", "lenta.ru"),
-        (r"тасс", "tass.ru"),
-        (r"риа\s+новости", "ria.ru"),
-        (r"коммерсант(?:а|е|ом)?", "kommersant.ru"),
-        (r"известия", "iz.ru"),
-        (r"ведомости", "vedomosti.ru"),
-        (r"газета\.ру", "gazeta.ru"),
-        (r"аргументы\s+и\s+факты", "aif.ru"),
-    )
-    source_prefix = (
-        r"\b(?:с|со|на|из)\s+"
-        r"(?:(?:сайта|сайте|сайту|ресурса|ресурсе|портала|портале|издания)\s+)?"
-    )
-    for alias_pattern, domain in publisher_aliases:
-        if re.search(source_prefix + r"(?:" + alias_pattern + r")\b", text, flags=re.IGNORECASE):
-            return domain
-
+    # Названия изданий словами намеренно не переводим в домены:
+    # конкретный сайт должен определить поисковик по исходному запросу.
     return ""
 
 
