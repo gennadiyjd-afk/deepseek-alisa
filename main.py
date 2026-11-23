@@ -503,7 +503,10 @@ def render_saved_answers(records):
         cards.append(
             '<article><div class="meta">' + html_escape(created) + '</div><h2>' + question + '</h2>'
             '<details><summary>Открыть текст ответа</summary><pre>' + answer + '</pre></details>'
-            '<a href="/saved/download/' + entry_id + '">Скачать TXT</a></article>'
+            '<a href="/saved/download/' + entry_id + '">Скачать TXT</a>'
+            '<form method="post" action="/saved/delete/' + entry_id + '" '
+            'onsubmit="return confirm(&quot;Удалить этот ответ из архива?&quot;)">'
+            '<button class="delete-button" type="submit">Удалить</button></form></article>'
         )
     body = "".join(cards) if cards else "<p>Пока нет сохранённых ответов.</p>"
     return """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -511,8 +514,13 @@ def render_saved_answers(records):
 body{font-family:system-ui,-apple-system,sans-serif;max-width:850px;margin:24px auto;padding:0 14px;color:#202124;background:#f7f7f7}
 header,article{background:white;padding:18px 20px;border-radius:14px;margin:12px 0;box-shadow:0 1px 8px #0000000d}
 h1{font-size:1.5rem}h2{font-size:1.08rem;margin:8px 0 14px}.meta{font-size:.85rem;color:#666}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.5}a{display:inline-block;margin-top:14px;color:#1458a6}
-button{padding:9px 14px;border:0;border-radius:8px;background:#333;color:#fff}form{display:inline}
-</style></head><body><header><h1>Сохранённые ответы</h1><p>Последние 100 сохранений</p><form method="post" action="/saved/logout"><button type="submit">Выйти</button></form></header>""" + body + "</body></html>"
+button{padding:9px 14px;border:0;border-radius:8px;background:#333;color:#fff;cursor:pointer}
+form{display:inline}.delete-button{margin-left:12px;background:#8b2525}
+.clear-form{display:inline-block;margin:10px 10px 0 0}.clear-button{background:#8b2525}
+</style></head><body><header><h1>Сохранённые ответы</h1><p>Последние 100 сохранений</p>
+<form class="clear-form" method="post" action="/saved/clear" onsubmit="return confirm('Удалить ВСЕ сохранённые ответы? Это действие нельзя отменить.')">
+<button class="clear-button" type="submit">Очистить весь архив</button></form>
+<form method="post" action="/saved/logout"><button type="submit">Выйти</button></form></header>""" + body + "</body></html>"
 
 
 def persist_job_maps():
@@ -3765,6 +3773,43 @@ async def saved_answers_login(request: Request):
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.post("/saved/delete/{entry_id}")
+async def delete_saved_answer(entry_id: str, request: Request):
+    if not SAVED_ANSWERS_AUTH_READY:
+        return PlainTextResponse("Архив не настроен.", status_code=503)
+    if not saved_answers_authorized(request):
+        return PlainTextResponse("Требуется авторизация.", status_code=401)
+    if not re.fullmatch(r"[a-f0-9]{32}", entry_id):
+        return PlainTextResponse("Запись не найдена.", status_code=404)
+    try:
+        raw_records = redis_command(["LRANGE", SAVED_ANSWERS_LIST_KEY, 0, SAVED_ANSWERS_MAX_ITEMS - 1])
+        for raw in raw_records or []:
+            record = json.loads(raw)
+            if isinstance(record, dict) and record.get("id") == entry_id:
+                # Удаляем ровно найденную запись, не затрагивая другие ответы.
+                redis_command(["LREM", SAVED_ANSWERS_LIST_KEY, 1, raw])
+                break
+        return RedirectResponse(url="/saved", status_code=303, headers={"Cache-Control": "no-store"})
+    except Exception:
+        logger.exception("Could not delete saved answer")
+        return PlainTextResponse("Не удалось удалить запись из Redis.", status_code=503)
+
+
+@app.post("/saved/clear")
+async def clear_saved_answers(request: Request):
+    if not SAVED_ANSWERS_AUTH_READY:
+        return PlainTextResponse("Архив не настроен.", status_code=503)
+    if not saved_answers_authorized(request):
+        return PlainTextResponse("Требуется авторизация.", status_code=401)
+    try:
+        # Удаляем только список архива. Последний готовый ответ и состояние диалога остаются нетронутыми.
+        redis_command(["DEL", SAVED_ANSWERS_LIST_KEY])
+        return RedirectResponse(url="/saved", status_code=303, headers={"Cache-Control": "no-store"})
+    except Exception:
+        logger.exception("Could not clear saved answers archive")
+        return PlainTextResponse("Не удалось очистить архив Redis.", status_code=503)
 
 
 @app.post("/saved/logout")
