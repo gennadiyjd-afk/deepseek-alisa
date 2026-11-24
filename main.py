@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, Response, RedirectResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, Response, RedirectResponse, PlainTextResponse, JSONResponse
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -28,6 +28,8 @@ logger = logging.getLogger("deepseek_alisa")
 
 API_URL = "https://routerapi.ru/api/v1/chat/completions"
 API_KEY = os.getenv("ROUTER_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_TEST_TOKEN = os.getenv("GEMINI_TEST_TOKEN", "")
 
 TAVILY_URL = "https://api.tavily.com/search"
 TAVILY_KEY = os.getenv("TAVILY_API_KEY")
@@ -3891,6 +3893,164 @@ async def download_saved_answer(entry_id: str, request: Request):
     except Exception:
         logger.exception("Could not download saved answer")
         return PlainTextResponse("Не удалось получить запись из Redis.", status_code=503)
+
+
+@app.get("/gemini-test", response_class=HTMLResponse)
+async def gemini_test_page():
+    """Temporary password-protected page for an isolated Gemini API check."""
+    return HTMLResponse(
+        """<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Проверка Gemini API</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:620px;margin:8vh auto;padding:20px;color:#202124;background:#f7f7f7}
+main{background:#fff;padding:22px;border-radius:14px;box-shadow:0 1px 10px #0001}
+input,button{box-sizing:border-box;width:100%;padding:13px;margin-top:12px;font-size:1rem;border-radius:9px;border:1px solid #bbb}
+button{background:#202124;color:white;border:0;cursor:pointer}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f1f3f4;padding:12px;border-radius:8px}
+</style>
+</head>
+<body><main>
+<h2>Проверка подключения Gemini</h2>
+<p>Введите временный пароль проверки, заданный в Render как GEMINI_TEST_TOKEN.</p>
+<form id="test-form">
+<input id="token" type="password" autocomplete="off" placeholder="Временный пароль" required>
+<button id="run" type="submit">Проверить Gemini</button>
+</form>
+<pre id="result" hidden></pre>
+</main>
+<script>
+document.getElementById("test-form").addEventListener("submit", async function(event){
+  event.preventDefault();
+  const button=document.getElementById("run");
+  const result=document.getElementById("result");
+  button.disabled=true;
+  button.textContent="Проверяю...";
+  result.hidden=false;
+  result.textContent="Отправляю контрольный запрос...";
+  try{
+    const response=await fetch("/gemini-test/run",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({token:document.getElementById("token").value})
+    });
+    const data=await response.json();
+    result.textContent=JSON.stringify(data,null,2);
+  }catch(error){
+    result.textContent="Не удалось выполнить проверку: "+String(error);
+  }finally{
+    button.disabled=false;
+    button.textContent="Проверить Gemini";
+  }
+});
+</script>
+</body></html>"""
+    )
+
+
+@app.post("/gemini-test/run")
+async def gemini_test_run(request: Request):
+    """Makes one fixed, isolated request to Gemini without touching DeepSeek."""
+    if not GEMINI_TEST_TOKEN:
+        return JSONResponse(
+            {"ok": False, "message": "Не задан GEMINI_TEST_TOKEN в Render."},
+            status_code=503,
+        )
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    supplied_token = payload.get("token", "") if isinstance(payload, dict) else ""
+    if not isinstance(supplied_token, str) or not hmac.compare_digest(
+        supplied_token, GEMINI_TEST_TOKEN
+    ):
+        return JSONResponse(
+            {"ok": False, "message": "Неверный пароль проверки."},
+            status_code=403,
+        )
+
+    if not GEMINI_API_KEY:
+        return JSONResponse(
+            {"ok": False, "message": "GEMINI_API_KEY не найден в окружении Render."},
+            status_code=503,
+        )
+
+    model = "gemini-3.8-flash"
+    try:
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            headers={
+                "x-goog-api-key": GEMINI_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": "Ответь одной короткой фразой по-русски: «Gemini работает»."}],
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 80,
+                },
+            },
+            timeout=35,
+        )
+    except requests.RequestException as exc:
+        logger.warning("Gemini isolated test request failed: %s", type(exc).__name__)
+        return JSONResponse(
+            {"ok": False, "model": model, "message": "Не удалось связаться с Gemini API (сетевая ошибка или тайм-аут)."},
+            status_code=502,
+        )
+
+    if not response.ok:
+        logger.warning("Gemini isolated test returned HTTP %s", response.status_code)
+        try:
+            error_data = response.json()
+            error_message = (
+                error_data.get("error", {}).get("message", "")
+                if isinstance(error_data, dict)
+                else ""
+            )
+        except Exception:
+            error_message = ""
+        return JSONResponse(
+            {
+                "ok": False,
+                "model": model,
+                "http_status": response.status_code,
+                "message": str(error_message or "Gemini API отклонил запрос.")[:500],
+            },
+            status_code=502,
+        )
+
+    try:
+        data = response.json()
+        candidates = data.get("candidates", [])
+        content = candidates[0].get("content", {}) if candidates else {}
+        parts = content.get("parts", []) if isinstance(content, dict) else []
+        answer = "\n".join(
+            part.get("text", "")
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ).strip()
+    except Exception:
+        answer = ""
+
+    if not answer:
+        return JSONResponse(
+            {"ok": False, "model": model, "message": "Gemini ответил, но текст ответа не найден."},
+            status_code=502,
+        )
+
+    logger.info("Gemini isolated test succeeded: model=%s", model)
+    return {"ok": True, "model": model, "answer": answer}
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
