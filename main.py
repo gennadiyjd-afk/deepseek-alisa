@@ -2920,8 +2920,38 @@ def extract_requested_search_domain(user_text):
         if re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
             return domain
 
-    # Названия изданий словами намеренно не переводим в домены:
-    # конкретный сайт должен определить поисковик по исходному запросу.
+    # Если пользователь назвал издание словами после конструкции
+    # «на сайте», «с сайта», «издания/портала» и т. п.,
+    # ограничиваем поиск доменом из нашего небольшого списка.
+    source_match = re.search(
+        r"\b(?:с|со|на|из)\s+"
+        r"(?:(?:сайта|сайте|сайту|ресурса|ресурсе|портала|портале)\s+)?"
+        r"(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if source_match:
+        source_name = source_match.group(1).casefold().replace("ё", "е")
+        publication_domains = (
+            (("лента.ру", "лента"), "lenta.ru"),
+            (("рбк",), "rbc.ru"),
+            (("интерфакс",), "interfax.ru"),
+            (("известия",), "iz.ru"),
+            (("тасс",), "tass.ru"),
+            (("риа новости", "риа"), "ria.ru"),
+            (("коммерсантъ", "коммерсант"), "kommersant.ru"),
+            (("ведомости",), "vedomosti.ru"),
+            (("газета.ru", "газета ru"), "gazeta.ru"),
+            (("аргументы и факты", "аиф"), "aif.ru"),
+        )
+        for aliases, domain in publication_domains:
+            for alias in aliases:
+                alias_pattern = re.escape(alias).replace(r"\.", r"\.?\s*")
+                if re.search(r"(?<!\w)" + alias_pattern + r"(?!\w)", source_name):
+                    return domain
+
+    # Неизвестные издания не подменяем догадкой: их определит Яндекс
+    # по исходному запросу пользователя.
     return ""
 
 
