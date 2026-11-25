@@ -44,6 +44,10 @@ interrupted_jobs = {}
 # Последний полностью сгенерированный ответ для каждой пользовательской сессии.
 # Нужен для повтора без нового обращения к DeepSeek даже после завершения чтения.
 latest_answers = {}
+# Два последних полностью готовых ответа для голосового повтора.
+# Порядок: [последний, предыдущий]. Не смешивается с архивом тем/прерванных задач.
+completed_answers = {}
+MAX_COMPLETED_ANSWERS = 2
 MAX_CONVERSATION_TOPICS = 2
 jobs_lock = threading.RLock()
 # Serializes bridge continue/stop HTTP calls so a late timer cannot restart
@@ -541,6 +545,7 @@ def persist_job_maps():
                 "search_jobs": search_jobs,
                 "interrupted_jobs": interrupted_jobs,
                 "latest_answers": latest_answers,
+                "completed_answers": completed_answers,
                 "saved_at": int(time.time()),
             }
             serialized = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
@@ -567,10 +572,12 @@ def load_job_maps():
         restored_search = saved.get("search_jobs", {})
         restored_interrupted_raw = saved.get("interrupted_jobs", {})
         restored_latest_answers = saved.get("latest_answers", {})
+        restored_completed_raw = saved.get("completed_answers", {})
         if (
             not isinstance(restored_search, dict)
             or not isinstance(restored_interrupted_raw, dict)
             or not isinstance(restored_latest_answers, dict)
+            or not isinstance(restored_completed_raw, dict)
         ):
             raise ValueError("Unexpected Redis state format")
 
@@ -601,6 +608,25 @@ def load_job_maps():
         for key in restored_search:
             if key in restored_interrupted:
                 restored_interrupted[key] = restored_interrupted[key][-1:]
+        normalized_completed = {}
+        for key, records in restored_completed_raw.items():
+            if isinstance(records, list):
+                valid = [
+                    item for item in records
+                    if isinstance(item, dict) and str(item.get("answer") or "").strip()
+                ]
+                if valid:
+                    normalized_completed[str(key)] = valid[:MAX_COMPLETED_ANSWERS]
+            elif isinstance(records, dict) and str(records.get("answer") or "").strip():
+                normalized_completed[str(key)] = [records]
+
+        # Миграция старого Redis-состояния: если списка ещё нет,
+        # поднимаем в него единственный известный последний ответ.
+        for key, record in restored_latest_answers.items():
+            key = str(key)
+            if key not in normalized_completed and isinstance(record, dict) and str(record.get("answer") or "").strip():
+                normalized_completed[key] = [record]
+
         with jobs_lock:
             search_jobs.update(restored_search)
             interrupted_jobs.update(restored_interrupted)
@@ -608,7 +634,8 @@ def load_job_maps():
                 str(key): value for key, value in restored_latest_answers.items()
                 if isinstance(value, dict) and str(value.get("answer") or "").strip()
             })
-        if restored_search or restored_interrupted or restored_latest_answers:
+            completed_answers.update(normalized_completed)
+        if restored_search or restored_interrupted or restored_latest_answers or normalized_completed:
             persist_job_maps()
         logger.info(
             "Restored conversation state from Redis: %s active, %s interrupted",
@@ -737,16 +764,30 @@ def pending_job_notice(job):
     return "Ответ ещё готовится."
 
 
-def is_repeat_answer_command(text):
-    """Распознаёт команды полного повтора последнего ответа без нового запроса."""
+def repeat_answer_index(text):
+    """0 — последний ответ, 1 — предыдущий; None — не команда повтора."""
     command = " ".join(normalize_command(text).replace(",", " ").split())
     command = re.sub(r"^алиса\s+", "", command).strip()
-    return command in {
+    if command in {
+        "повтори предыдущий ответ",
+        "повтори первый ответ",
+        "прочитай предыдущий ответ",
+        "прочитай первый ответ",
+    }:
+        return 1
+    if command in {
         "повтори ответ",
         "повтори последний ответ",
         "прочитай ответ еще раз",
         "прочитай последний ответ еще раз",
-    }
+    }:
+        return 0
+    return None
+
+
+def is_repeat_answer_command(text):
+    """Распознаёт команды полного повтора одного из двух последних ответов."""
+    return repeat_answer_index(text) is not None
 
 
 def is_continue_command(text):
@@ -2593,6 +2634,25 @@ def is_detailed_search_request(text):
     )
 
 
+def remember_completed_answer(job_key, job):
+    """Хранит два последних завершённых ответа: последний и предыдущий."""
+    answer_text = str(job.get("answer") or "").strip()
+    if not answer_text:
+        return
+    records = completed_answers.setdefault(job_key, [])
+    record = {
+        "job_id": str(job.get("job_id") or ""),
+        "answer": answer_text,
+        "user_text": str(job.get("user_text") or ""),
+        "history": job.get("history", [])[-4:],
+        "updated_at": int(time.time()),
+    }
+    # Один и тот же результат может пройти через несколько ветвей сохранения.
+    records[:] = [item for item in records if item.get("job_id") != record["job_id"]]
+    records.insert(0, record)
+    del records[MAX_COMPLETED_ANSWERS:]
+
+
 def save_job_result(session_id, job_id, result):
     """Записывает результат и автоматически вызывает навык, если ожидание уже объявлено."""
     should_auto_deliver = False
@@ -2611,6 +2671,7 @@ def save_job_result(session_id, job_id, result):
                         "history": current.get("history", [])[-4:],
                         "updated_at": int(time.time()),
                     }
+                    remember_completed_answer(session_id, current)
                 persist_latest_answer(answer_text, current.get("user_text", ""))
             should_auto_deliver = (
                 result.get("status") == "ready"
@@ -2631,6 +2692,7 @@ def save_job_result(session_id, job_id, result):
                                 "history": saved_job.get("history", [])[-4:],
                                 "updated_at": int(time.time()),
                             }
+                            remember_completed_answer(session_id, saved_job)
                         persist_latest_answer(answer_text, saved_job.get("user_text", ""))
                     persist_job_maps()
                     logger.info("Background result saved for an interrupted conversation")
@@ -3971,6 +4033,7 @@ async def main(body: dict):
             search_jobs.pop(job_key, None)
             interrupted_jobs.pop(job_key, None)
             latest_answers.pop(job_key, None)
+            completed_answers.pop(job_key, None)
             persist_job_maps()
         logger.info(
             "New skill session: cleared answer/topic state (session.new=%s, empty_utterance=%s, key=%s)",
@@ -3991,6 +4054,7 @@ async def main(body: dict):
             search_jobs.pop(job_key, None)
             interrupted_jobs.pop(job_key, None)
             latest_answers.pop(job_key, None)
+            completed_answers.pop(job_key, None)
             persist_job_maps()
         stop_tts_bridge_on_skill_exit()
         return make_response(
@@ -4014,9 +4078,32 @@ async def main(body: dict):
     # Повтор последнего ответа — отдельная команда, не связанная с архивом тем.
     # Новый job_id инвалидирует старые таймеры и отложенные команды.
     if is_repeat_answer_command(user_text):
+        requested_answer_index = repeat_answer_index(user_text)
         with jobs_lock:
-            saved_answer = latest_answers.get(job_key)
-            if not saved_answer:
+            answer_records = completed_answers.get(job_key, [])
+            saved_answer = answer_records[requested_answer_index] if len(answer_records) > requested_answer_index else None
+            if saved_answer is None and requested_answer_index == 0:
+                saved_answer = latest_answers.get(job_key)
+            if saved_answer is None and requested_answer_index == 1:
+                # Совместимость с уже сохранёнными до обновления прерванными темами:
+                # если второй завершённый ответ ещё не попал в новый список, ищем
+                # предыдущий готовый текст среди сохранённых рабочих задач.
+                newest = answer_records[0] if answer_records else latest_answers.get(job_key)
+                newest_text = str((newest or {}).get("answer") or "").strip()
+                candidates = [
+                    item for item in interrupted_list(job_key)
+                    if item.get("status") == "ready" and str(item.get("answer") or "").strip()
+                ]
+                for candidate in reversed(candidates):
+                    candidate_text = str(candidate.get("answer") or "").strip()
+                    if candidate_text and candidate_text != newest_text:
+                        saved_answer = {
+                            "answer": candidate_text,
+                            "user_text": str(candidate.get("user_text") or ""),
+                            "history": candidate.get("history", [])[-4:],
+                        }
+                        break
+            if not saved_answer and requested_answer_index == 0:
                 active = search_jobs.get(job_key)
                 if active and active.get("status") == "ready" and str(active.get("answer") or "").strip():
                     saved_answer = {
@@ -4034,7 +4121,12 @@ async def main(body: dict):
                             "history": candidate.get("history", [])[-4:],
                         }
             if not saved_answer or not str(saved_answer.get("answer") or "").strip():
-                logger.info("Repeat-answer requested but no completed answer is available")
+                logger.info(
+                    "Repeat-answer requested but answer index %s is unavailable",
+                    requested_answer_index,
+                )
+                if requested_answer_index == 1:
+                    return make_response(body, "Пока нет предыдущего готового ответа. Сначала должен завершиться ещё один ответ.")
                 return make_response(body, "Пока нет готового ответа, который можно повторить.")
 
             replay_answer = str(saved_answer.get("answer") or "").strip()
@@ -4230,6 +4322,7 @@ async def main(body: dict):
                 search_jobs.pop(job_key, None)
             interrupted_jobs.pop(job_key, None)
             latest_answers.pop(job_key, None)
+            completed_answers.pop(job_key, None)
             persist_job_maps()
         return make_response(body, "Хорошо, больше не буду продолжать.")
 
