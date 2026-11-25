@@ -434,7 +434,7 @@ def redis_command(command):
 
 
 def persist_latest_answer(answer, user_text=""):
-    """Сохраняет последний полностью подготовленный ответ отдельно от рабочих задач."""
+    """Сохраняет текущий выбранный полный ответ отдельно от рабочих задач."""
     text = str(answer or "").strip()
     if not text or not REDIS_AVAILABLE:
         return False
@@ -456,7 +456,7 @@ def persist_latest_answer(answer, user_text=""):
 
 
 def save_latest_answer_to_archive():
-    """Добавляет последний готовый ответ в отдельный постоянный архив Redis."""
+    """Добавляет текущий выбранный ответ в отдельный постоянный архив Redis."""
     if not REDIS_AVAILABLE:
         return False
     try:
@@ -770,9 +770,7 @@ def repeat_answer_index(text):
     command = re.sub(r"^алиса\s+", "", command).strip()
     if command in {
         "повтори предыдущий ответ",
-        "повтори первый ответ",
-        "прочитай предыдущий ответ",
-        "прочитай первый ответ",
+        "повтори прежний ответ",
     }:
         return 1
     if command in {
@@ -798,19 +796,6 @@ def is_continue_command(text):
     return bool(re.match(r"^(?:алиса\s+)?(?:продолжи|продолжай|продолжить)\b", command))
 
 
-def is_topic_return_command(text):
-    """Распознаёт только пять согласованных форм возврата к прежней теме."""
-    command = " ".join(normalize_command(text).replace(",", " ").split())
-    command = re.sub(r"^алиса\s+", "", command).strip()
-    fixed_phrases = {
-        "вернись к прежней теме",
-        "вернись к предыдущей теме",
-        "продолжи переднюю тему",
-        "продолжи предыдущую тему",
-    }
-    if command in fixed_phrases:
-        return True
-    return bool(re.fullmatch(r"вернись к теме\s+.+", command))
 def interrupted_list(job_key):
     """Возвращает список сохранённых тем и мигрирует старый формат при необходимости."""
     saved = interrupted_jobs.get(job_key)
@@ -864,71 +849,6 @@ def trim_interrupted_for_active(job_key):
         interrupted_jobs[job_key] = saved
     else:
         interrupted_jobs.pop(job_key, None)
-
-
-_TOPIC_STOP_WORDS = {
-    "алиса", "пожалуйста", "вернись", "вернуться", "возвратись", "верни", "к", "ко",
-    "предыдущему", "предыдущей", "предыдущий", "предыдущая", "вопросу", "вопрос", "ответу",
-    "ответ", "рассказу", "рассказ", "теме", "тему", "тема", "про", "об", "обо", "о", "по",
-    "и", "продолжи", "продолжай", "продолжить", "с", "того", "места", "где", "остановилась",
-    "остановился", "остановились", "мы", "на", "чем", "именно", "прошлому", "прошлой",
-    "начатому", "начатой", "мне", "расскажи", "рассказать", "подробно", "пожалуйста",
-    "прежней", "прежнюю", "прежний", "прежняя", "прежнему", "прежнее",
-    "прошлую", "прошлый", "прошлое", "прошлому",
-}
-
-
-def topic_tokens(text):
-    normalized = normalize_command(text).replace("ё", "е")
-    meaningful_short_tokens = {"ии", "ai", "сша", "нлп", "аги"}
-    tokens = [
-        token for token in re.findall(r"[a-zа-я0-9]+", normalized)
-        if (len(token) >= 4 or token in meaningful_short_tokens)
-        and token not in _TOPIC_STOP_WORDS
-    ]
-    # Считаем «ИИ» и полную формулировку «искусственный интеллект» одной темой.
-    if (
-        any(token.startswith("искусствен") for token in tokens)
-        and any(token.startswith("интеллект") for token in tokens)
-    ):
-        tokens.append("ии")
-    return tokens
-
-
-def _topic_words_match(left, right):
-    if left == right:
-        return True
-    common = 0
-    for a, b in zip(left, right):
-        if a != b:
-            break
-        common += 1
-    return common >= 4
-
-
-def choose_interrupted_topic(user_text, candidates):
-    """Выбирает сохранённый ответ по словам темы; общий возврат берёт самый свежий."""
-    if not candidates:
-        return None
-    query_tokens = topic_tokens(user_text)
-    if not query_tokens:
-        return candidates[-1]
-
-    best_job = None
-    best_score = 0.0
-    for candidate in candidates:
-        saved_tokens = list(dict.fromkeys(topic_tokens(candidate.get("user_text", ""))))
-        if not saved_tokens:
-            continue
-        matched = sum(
-            1 for saved_word in saved_tokens
-            if any(_topic_words_match(saved_word, query_word) for query_word in query_tokens)
-        )
-        score = matched / len(saved_tokens)
-        if score > best_score:
-            best_score = score
-            best_job = candidate
-    return best_job if best_score >= 0.25 else None
 
 
 def is_continuation_repair_request(text):
@@ -2635,21 +2555,36 @@ def is_detailed_search_request(text):
 
 
 def remember_completed_answer(job_key, job):
-    """Хранит два последних завершённых ответа: последний и предыдущий."""
+    """Хранит два самых новых ответа; повторное прослушивание не меняет их возраст."""
     answer_text = str(job.get("answer") or "").strip()
     if not answer_text:
         return
     records = completed_answers.setdefault(job_key, [])
+    if not job.get("completed_at_ns"):
+        job["completed_at_ns"] = time.time_ns()
+    created_at_ns = int(job["completed_at_ns"])
     record = {
         "job_id": str(job.get("job_id") or ""),
         "answer": answer_text,
         "user_text": str(job.get("user_text") or ""),
         "history": job.get("history", [])[-4:],
+        "created_at_ns": created_at_ns,
         "updated_at": int(time.time()),
     }
     # Один и тот же результат может пройти через несколько ветвей сохранения.
     records[:] = [item for item in records if item.get("job_id") != record["job_id"]]
-    records.insert(0, record)
+    records.append(record)
+
+    def age_key(item):
+        # Старые Redis-записи не содержат created_at_ns: используем updated_at.
+        value = item.get("created_at_ns")
+        if value is None:
+            value = int(item.get("updated_at") or 0) * 1_000_000_000
+        return int(value)
+
+    # Новый ответ всегда первый, предыдущий — второй. При этом возраст
+    # берётся из timestamp, а не из текущей позиции после команды повтора.
+    records.sort(key=age_key, reverse=True)
     del records[MAX_COMPLETED_ANSWERS:]
 
 
@@ -4081,28 +4016,21 @@ async def main(body: dict):
         requested_answer_index = repeat_answer_index(user_text)
         with jobs_lock:
             answer_records = completed_answers.get(job_key, [])
+            if requested_answer_index == 1 and len(answer_records) > 1:
+                # Для старых записей без точного времени фиксируем возраст
+                # по прежнему порядку [последний, предыдущий] до перестановки.
+                for position, item in enumerate(answer_records):
+                    if not item.get("created_at_ns"):
+                        base_time = int(item.get("updated_at") or 0) * 1_000_000_000
+                        item["created_at_ns"] = base_time + (len(answer_records) - position)
+                # Предыдущий становится текущим для повтора, но его возраст
+                # не меняется: новый ответ вытеснит самый старый по timestamp.
+                answer_records[0], answer_records[1] = answer_records[1], answer_records[0]
+                requested_answer_index = 0
+                persist_job_maps()
             saved_answer = answer_records[requested_answer_index] if len(answer_records) > requested_answer_index else None
             if saved_answer is None and requested_answer_index == 0:
                 saved_answer = latest_answers.get(job_key)
-            if saved_answer is None and requested_answer_index == 1:
-                # Совместимость с уже сохранёнными до обновления прерванными темами:
-                # если второй завершённый ответ ещё не попал в новый список, ищем
-                # предыдущий готовый текст среди сохранённых рабочих задач.
-                newest = answer_records[0] if answer_records else latest_answers.get(job_key)
-                newest_text = str((newest or {}).get("answer") or "").strip()
-                candidates = [
-                    item for item in interrupted_list(job_key)
-                    if item.get("status") == "ready" and str(item.get("answer") or "").strip()
-                ]
-                for candidate in reversed(candidates):
-                    candidate_text = str(candidate.get("answer") or "").strip()
-                    if candidate_text and candidate_text != newest_text:
-                        saved_answer = {
-                            "answer": candidate_text,
-                            "user_text": str(candidate.get("user_text") or ""),
-                            "history": candidate.get("history", [])[-4:],
-                        }
-                        break
             if not saved_answer and requested_answer_index == 0:
                 active = search_jobs.get(job_key)
                 if active and active.get("status") == "ready" and str(active.get("answer") or "").strip():
@@ -4166,6 +4094,12 @@ async def main(body: dict):
                 "updated_at": int(time.time()),
             }
             persist_job_maps()
+
+        # Выбранный для повтора ответ становится текущим и для команды
+        # «Сохрани ответ». Время создания и возраст записей completed_answers
+        # при этом не меняются.
+        persist_latest_answer(replay_answer, replay_question)
+
         logger.info("DIAG repeat-answer started from first fragment with fresh job_id=%s", replay_job["job_id"][:8])
         return deliver_job_part(body, job_key, replay_job)
 
@@ -4202,65 +4136,15 @@ async def main(body: dict):
     wake_command = is_wake_command(user_text)
     continue_command = is_continue_command(user_text)
     repair_continue_command = is_continuation_repair_request(user_text)
-    topic_return_command = is_topic_return_command(user_text)
     wait_command = is_wait_command(user_text)
     retrieval_command = (
         wake_command or wait_command or continue_command
-        or repair_continue_command or topic_return_command
+        or repair_continue_command
     )
 
     with jobs_lock:
         job = search_jobs.get(job_key)
         interrupted = interrupted_list(job_key)
-
-    # Явный возврат выбирает нужную тему по словам исходного вопроса.
-    # При переключении текущий ответ сохраняется, а выбранный становится активным.
-    if topic_return_command:
-        with jobs_lock:
-            current = search_jobs.get(job_key)
-            saved = interrupted_list(job_key)
-            candidates = ([current] if current else []) + list(saved)
-            selected = choose_interrupted_topic(user_text, candidates)
-
-            if selected is None:
-                return make_response(
-                    body,
-                    "Не нашла эту тему среди двух сохранённых разговоров. Назови тему ещё раз, пожалуйста.",
-                )
-
-            if current and selected.get("job_id") == current.get("job_id"):
-                job = current
-            else:
-                if current:
-                    search_jobs.pop(job_key, None)
-                    parts = current.get("parts") or []
-                    resume_index = resume_index_for_job(current)
-                    if current.get("status") == "pending" or (
-                        current.get("status") == "ready" and len(parts) > resume_index and len(parts) > 1
-                    ):
-                        save_interrupted_job(job_key, current)
-
-                saved = interrupted_list(job_key)
-                saved[:] = [item for item in saved if item.get("job_id") != selected.get("job_id")]
-                search_jobs[job_key] = selected
-                trim_interrupted_for_active(job_key)
-                job = selected
-                persist_job_maps()
-
-        if job and job.get("status") == "pending":
-            with jobs_lock:
-                current = search_jobs.get(job_key)
-                notice = pending_job_notice(current) if current else "Хорошо"
-            return make_response(body, notice)
-        if job and job.get("status") == "ready":
-            return deliver_job_part(body, job_key, job)
-        if job and job.get("status") == "error":
-            with jobs_lock:
-                current = search_jobs.get(job_key)
-                if current and current.get("job_id") == job.get("job_id"):
-                    search_jobs.pop(job_key, None)
-                    persist_job_maps()
-            return make_response(body, "Не удалось получить ответ. Попробуй повторить запрос.")
 
     # Обычное «Да» продолжает активную тему. Если активной нет, восстанавливаем
     # самую недавно прерванную из сохранённых.
