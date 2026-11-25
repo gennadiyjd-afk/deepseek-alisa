@@ -41,6 +41,9 @@ search_jobs = {}
 # Последний прерванный многочастный ответ сохраняется отдельно,
 # чтобы короткое случайное сообщение не уничтожало контекст продолжения.
 interrupted_jobs = {}
+# Последний полностью сгенерированный ответ для каждой пользовательской сессии.
+# Нужен для повтора без нового обращения к DeepSeek даже после завершения чтения.
+latest_answers = {}
 MAX_CONVERSATION_TOPICS = 2
 jobs_lock = threading.RLock()
 # Serializes bridge continue/stop HTTP calls so a late timer cannot restart
@@ -537,6 +540,7 @@ def persist_job_maps():
             snapshot = {
                 "search_jobs": search_jobs,
                 "interrupted_jobs": interrupted_jobs,
+                "latest_answers": latest_answers,
                 "saved_at": int(time.time()),
             }
             serialized = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
@@ -562,7 +566,12 @@ def load_job_maps():
         saved = json.loads(raw)
         restored_search = saved.get("search_jobs", {})
         restored_interrupted_raw = saved.get("interrupted_jobs", {})
-        if not isinstance(restored_search, dict) or not isinstance(restored_interrupted_raw, dict):
+        restored_latest_answers = saved.get("latest_answers", {})
+        if (
+            not isinstance(restored_search, dict)
+            or not isinstance(restored_interrupted_raw, dict)
+            or not isinstance(restored_latest_answers, dict)
+        ):
             raise ValueError("Unexpected Redis state format")
 
         # Older deployments stored one interrupted job as an object. Migrate it
@@ -595,7 +604,11 @@ def load_job_maps():
         with jobs_lock:
             search_jobs.update(restored_search)
             interrupted_jobs.update(restored_interrupted)
-        if restored_search or restored_interrupted:
+            latest_answers.update({
+                str(key): value for key, value in restored_latest_answers.items()
+                if isinstance(value, dict) and str(value.get("answer") or "").strip()
+            })
+        if restored_search or restored_interrupted or restored_latest_answers:
             persist_job_maps()
         logger.info(
             "Restored conversation state from Redis: %s active, %s interrupted",
@@ -722,6 +735,18 @@ def pending_job_notice(job):
         return "Хорошо"
 
     return "Ответ ещё готовится."
+
+
+def is_repeat_answer_command(text):
+    """Распознаёт команды полного повтора последнего ответа без нового запроса."""
+    command = " ".join(normalize_command(text).replace(",", " ").split())
+    command = re.sub(r"^алиса\s+", "", command).strip()
+    return command in {
+        "повтори ответ",
+        "повтори последний ответ",
+        "прочитай ответ еще раз",
+        "прочитай последний ответ еще раз",
+    }
 
 
 def is_continue_command(text):
@@ -2576,9 +2601,17 @@ def save_job_result(session_id, job_id, result):
         if current and current.get("job_id") == job_id:
             current.update(result)
             if result.get("status") == "ready":
-                # Фиксируем ответ сразу после полного завершения генерации,
-                # даже если Алиса ещё не запросила его озвучивание.
-                persist_latest_answer(result.get("answer", ""), current.get("user_text", ""))
+                # Фиксируем последний готовый ответ отдельно от активной очереди.
+                # Это позволяет повторить его после завершения/прерывания озвучивания.
+                answer_text = str(result.get("answer") or "").strip()
+                if answer_text:
+                    latest_answers[session_id] = {
+                        "answer": answer_text,
+                        "user_text": str(current.get("user_text") or ""),
+                        "history": current.get("history", [])[-4:],
+                        "updated_at": int(time.time()),
+                    }
+                persist_latest_answer(answer_text, current.get("user_text", ""))
             should_auto_deliver = (
                 result.get("status") == "ready"
                 and bool(current.get("auto_delivery"))
@@ -2590,7 +2623,15 @@ def save_job_result(session_id, job_id, result):
                 if saved_job.get("job_id") == job_id:
                     saved_job.update(result)
                     if result.get("status") == "ready":
-                        persist_latest_answer(result.get("answer", ""), saved_job.get("user_text", ""))
+                        answer_text = str(result.get("answer") or "").strip()
+                        if answer_text:
+                            latest_answers[session_id] = {
+                                "answer": answer_text,
+                                "user_text": str(saved_job.get("user_text") or ""),
+                                "history": saved_job.get("history", [])[-4:],
+                                "updated_at": int(time.time()),
+                            }
+                        persist_latest_answer(answer_text, saved_job.get("user_text", ""))
                     persist_job_maps()
                     logger.info("Background result saved for an interrupted conversation")
                     return
@@ -3909,9 +3950,10 @@ async def main(body: dict):
         diag_pause = is_pause_command(user_text)
         diag_stop = is_stop_command(user_text)
         diag_continue = is_continue_command(user_text)
+        diag_repeat = is_repeat_answer_command(user_text)
         logger.info(
-            "DIAG webhook utterance=%r | exit=%s pause=%s stop=%s continue=%s",
-            user_text, diag_exit, diag_pause, diag_stop, diag_continue,
+            "DIAG webhook utterance=%r | exit=%s pause=%s stop=%s continue=%s repeat=%s",
+            user_text, diag_exit, diag_pause, diag_stop, diag_continue, diag_repeat,
         )
     else:
         logger.info("DIAG webhook received empty original_utterance (skill launch/wakeup)")
@@ -3928,6 +3970,7 @@ async def main(body: dict):
         with jobs_lock:
             search_jobs.pop(job_key, None)
             interrupted_jobs.pop(job_key, None)
+            latest_answers.pop(job_key, None)
             persist_job_maps()
         logger.info(
             "New skill session: cleared answer/topic state (session.new=%s, empty_utterance=%s, key=%s)",
@@ -3947,6 +3990,7 @@ async def main(body: dict):
         with jobs_lock:
             search_jobs.pop(job_key, None)
             interrupted_jobs.pop(job_key, None)
+            latest_answers.pop(job_key, None)
             persist_job_maps()
         stop_tts_bridge_on_skill_exit()
         return make_response(
@@ -3966,6 +4010,72 @@ async def main(body: dict):
         if saved is None:
             return make_response(body, "Пока нет готового ответа, который можно сохранить.")
         return make_response(body, "Не удалось сохранить ответ. Проверь подключение Redis.")
+
+    # Повтор последнего ответа — отдельная команда, не связанная с архивом тем.
+    # Новый job_id инвалидирует старые таймеры и отложенные команды.
+    if is_repeat_answer_command(user_text):
+        with jobs_lock:
+            saved_answer = latest_answers.get(job_key)
+            if not saved_answer:
+                active = search_jobs.get(job_key)
+                if active and active.get("status") == "ready" and str(active.get("answer") or "").strip():
+                    saved_answer = {
+                        "answer": str(active.get("answer") or "").strip(),
+                        "user_text": str(active.get("user_text") or ""),
+                        "history": active.get("history", [])[-4:],
+                    }
+                else:
+                    candidates = [item for item in interrupted_list(job_key) if item.get("status") == "ready"]
+                    if candidates:
+                        candidate = candidates[-1]
+                        saved_answer = {
+                            "answer": str(candidate.get("answer") or "").strip(),
+                            "user_text": str(candidate.get("user_text") or ""),
+                            "history": candidate.get("history", [])[-4:],
+                        }
+            if not saved_answer or not str(saved_answer.get("answer") or "").strip():
+                logger.info("Repeat-answer requested but no completed answer is available")
+                return make_response(body, "Пока нет готового ответа, который можно повторить.")
+
+            replay_answer = str(saved_answer.get("answer") or "").strip()
+            replay_question = str(saved_answer.get("user_text") or "")
+            replay_history = saved_answer.get("history", [])[-4:]
+            search_jobs.pop(job_key, None)
+            interrupted_jobs.pop(job_key, None)
+            persist_job_maps()
+
+        # Остановка выполняется вне jobs_lock: она сериализуется с командами моста.
+        stop_tts_bridge_for_interruption()
+
+        replay_job = {
+            "job_id": uuid.uuid4().hex,
+            "kind": "replay",
+            "status": "ready",
+            "answer": replay_answer,
+            "parts": [],
+            "part_index": 0,
+            "current_part_index": 0,
+            "resume_part_index": 0,
+            "user_text": replay_question,
+            "history": replay_history,
+            "auto_reading": True,
+            "auto_reading_paused": False,
+            "auto_next_generation": 0,
+            "auto_next_thread_started": False,
+            "last_part_playing": False,
+        }
+        with jobs_lock:
+            prepare_job_parts(replay_job, replay_answer)
+            search_jobs[job_key] = replay_job
+            latest_answers[job_key] = {
+                "answer": replay_answer,
+                "user_text": replay_question,
+                "history": replay_history,
+                "updated_at": int(time.time()),
+            }
+            persist_job_maps()
+        logger.info("DIAG repeat-answer started from first fragment with fresh job_id=%s", replay_job["job_id"][:8])
+        return deliver_job_part(body, job_key, replay_job)
 
     # Автоматическая команда моста «Алиса, продолжи» приходит в тот же вебхук,
     # что и реплики пользователя. Её нельзя трактовать как новое прерывание:
@@ -4119,6 +4229,7 @@ async def main(body: dict):
             if current and (not job or current.get("job_id") == job.get("job_id")):
                 search_jobs.pop(job_key, None)
             interrupted_jobs.pop(job_key, None)
+            latest_answers.pop(job_key, None)
             persist_job_maps()
         return make_response(body, "Хорошо, больше не буду продолжать.")
 
