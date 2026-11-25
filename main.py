@@ -675,6 +675,83 @@ def normalize_command(text):
     return " ".join(text.split()).strip(" .,!?:;\"'«»")
 
 
+def has_alice_prefix(text):
+    """Обычный запрос принимается только при явном обращении к Алисе."""
+    command = normalize_command(text).replace(",", " ")
+    return bool(re.match(r"^алиса(?:\s+|$)", command))
+
+
+def strip_alice_prefix(text):
+    """Удаляет обращение к Алисе перед передачей обычного вопроса модели."""
+    return re.sub(r"^\s*алиса(?:\s*,)?\s*", "", str(text or ""), count=1, flags=re.IGNORECASE).strip()
+
+
+def is_save_answer_command(text):
+    command = " ".join(normalize_command(text).replace(",", " ").split())
+    return bool(re.fullmatch(r"(?:алиса\s+)?сохрани\s+ответ", command))
+
+
+def is_yes_confirmation_phrase(text):
+    command = " ".join(normalize_command(text).replace(",", " ").split())
+    command = re.sub(r"^алиса\s+", "", command).strip()
+    return command == "да"
+
+
+def is_yes_confirmation_context(job_key, history):
+    """Разрешает одиночное «Да» только в ответ на вопрос о продолжении."""
+    candidates = []
+    with jobs_lock:
+        active = search_jobs.get(job_key)
+        if active:
+            if active.get("status") == "ready":
+                candidates.append(str(active.get("answer") or ""))
+            elif active.get("parts"):
+                index = max(0, int(active.get("part_index", 0)) - 1)
+                parts = active.get("parts") or []
+                if index < len(parts):
+                    candidates.append(str(parts[index] or ""))
+    if isinstance(history, list):
+        for item in reversed(history):
+            if isinstance(item, dict) and item.get("role") == "assistant":
+                candidates.append(str(item.get("content") or ""))
+                break
+
+    continuation_markers = (
+        "продолжить", "продолжу", "продолжать", "дальше",
+        "следующую часть", "следующий фрагмент", "рассказать дальше",
+    )
+    for answer in candidates:
+        tail = answer.strip()[-350:]
+        if not tail or not tail.rstrip().endswith("?"):
+            continue
+        questions = re.findall(r"[^.!?]*\?", tail)
+        question = questions[-1].lower() if questions else ""
+        if any(marker in question for marker in continuation_markers):
+            return True
+    return False
+
+
+def is_allowed_unprefixed_utterance(text, job_key, history):
+    """Список команд, которым не требуется обращение «Алиса»."""
+    command = " ".join(normalize_command(text).replace(",", " ").split())
+    if not command:
+        return True
+    if (
+        is_exit_skill_command(text)
+        or is_pause_command(text)
+        or is_stop_command(text)
+        or is_continue_command(text)
+        or is_wait_command(text)
+        or is_save_answer_command(text)
+        or command == "алиса продолжи"
+        or command == "алиса"
+    ):
+        return True
+    if is_yes_confirmation_phrase(text) and is_yes_confirmation_context(job_key, history):
+        return True
+    return has_alice_prefix(text)
+
+
 def remove_source_links(text):
     """Убирает URL и явные предложения перейти к источникам из ответа."""
     text = str(text or "")
@@ -725,16 +802,18 @@ def pending_job_notice(job):
 
 
 def is_continue_command(text):
-    """Распознаёт короткое подтверждение продолжения текущей темы."""
+    """Распознаёт явные команды продолжения; одиночное «Да» проверяется отдельно по контексту."""
     command = " ".join(normalize_command(text).replace(",", " ").split())
-    if command in ("да", "продолжай", "продолжи", "продолжить"):
+    if command in ("продолжай", "продолжи", "продолжить"):
         return True
-    return bool(re.match(r"^(?:алиса\s+)?(?:продолжи|продолжай|продолжить)\b", command))
+    return bool(re.match(r"^(?:алиса\s+)?(?:да\s+)?(?:продолжи|продолжай|продолжить)\b", command))
 
 
 def is_topic_return_command(text):
-    """Распознаёт только пять согласованных форм возврата к прежней теме."""
+    """Возврат к прежней теме разрешён только с обращением «Алиса»."""
     command = " ".join(normalize_command(text).replace(",", " ").split())
+    if not re.match(r"^алиса\s+", command):
+        return False
     command = re.sub(r"^алиса\s+", "", command).strip()
     fixed_phrases = {
         "вернись к прежней теме",
@@ -3941,6 +4020,20 @@ async def main(body: dict):
                 history=[],
             )
 
+    state = body.get("state", {}).get("session", {})
+    history = [] if session_is_new else state.get("history", [])
+    yes_confirmation_command = (
+        is_yes_confirmation_phrase(user_text)
+        and is_yes_confirmation_context(job_key, history)
+    )
+
+    # Фоновая речь без обращения к Алисе не должна менять задачу или останавливать мост.
+    if not is_allowed_unprefixed_utterance(user_text, job_key, history):
+        logger.info("Ambient/unaddressed utterance ignored without interrupting active TTS: %r", user_text)
+        silent_response = make_response(body, "")
+        silent_response["response"]["tts"] = "sil <[100]>"
+        return silent_response
+
     # Выход обрабатываем раньше любых команд продолжения/поиска.
     if is_exit_skill_command(user_text):
         logger.info("DIAG handler=exit; response end_session=True")
@@ -3957,9 +4050,7 @@ async def main(body: dict):
         )
 
     # Явная команда сохранения не должна останавливать мост или менять очередь чтения.
-    normalized_save_command = " ".join(normalize_command(user_text).replace(",", " ").split())
-    save_command = re.fullmatch(r"(?:алиса\s+)?сохрани\s+ответ", normalized_save_command)
-    if save_command:
+    if is_save_answer_command(user_text):
         saved = save_latest_answer_to_archive()
         if saved is True:
             return make_response(body, "Ответ сохранён.")
@@ -3978,7 +4069,7 @@ async def main(body: dict):
     is_wait_command_utterance = is_wait_command(user_text)
     if is_bridge_auto_continue:
         logger.info("Bridge auto-continue recognized; skipping incoming-utterance interruption")
-    elif is_continue_command(user_text):
+    elif is_continue_command(user_text) or yes_confirmation_command:
         # Явное «Продолжи» — команда возобновления, а не новая реплика.
         # Не сохраняем здесь индекс текущего фрагмента как точку паузы:
         # обработчик ниже сам выберет следующий фрагмент, если чтение не было
@@ -3995,10 +4086,8 @@ async def main(body: dict):
         # останавливает мост и фиксирует начало текущего фрагмента.
         pause_active_job_for_incoming_utterance(job_key, user_text)
 
-    state = body.get("state", {}).get("session", {})
-    history = [] if session_is_new else state.get("history", [])
     wake_command = is_wake_command(user_text)
-    continue_command = is_continue_command(user_text)
+    continue_command = is_continue_command(user_text) or yes_confirmation_command
     repair_continue_command = is_continuation_repair_request(user_text)
     topic_return_command = is_topic_return_command(user_text)
     wait_command = is_wait_command(user_text)
@@ -4216,8 +4305,11 @@ async def main(body: dict):
     if social_reply:
         return make_response(body, social_reply)
 
+    # Передаём модели сам вопрос без активационного обращения «Алиса».
+    question_text = strip_alice_prefix(user_text)
+
     # Интернет-поиск выполняется в фоне. Результат забирается командой «Алиса, я жду» / «Я жду».
-    if needs_search(user_text):
+    if needs_search(question_text):
         job_id = uuid.uuid4().hex
         with jobs_lock:
             search_jobs[job_key] = {
@@ -4234,7 +4326,7 @@ async def main(body: dict):
                 "part_index": 0,
                 "current_part_index": 0,
                 "resume_part_index": 0,
-                "user_text": user_text,
+                "user_text": question_text,
                 "history": history[-4:],
             }
             trim_interrupted_for_active(job_key)
@@ -4244,7 +4336,7 @@ async def main(body: dict):
             search_and_answer,
             job_key,
             job_id,
-            user_text,
+            question_text,
             history[-4:],
         )
         monitor_delayed_job(job_key, job_id)
@@ -4253,7 +4345,7 @@ async def main(body: dict):
 
     # Обычный разговор: простые вопросы ждут до 3,35 секунды,
     # сложные быстро переходят в фоновую обработку.
-    complex_question = is_complex_question(user_text)
+    complex_question = is_complex_question(question_text)
     wait_timeout = 0.35 if complex_question else 3.35
     logger.info(
         "Chat question classified as %s; wait timeout %.2f seconds",
@@ -4272,7 +4364,7 @@ async def main(body: dict):
             "part_index": 0,
             "current_part_index": 0,
             "resume_part_index": 0,
-            "user_text": user_text,
+            "user_text": question_text,
             "history": history[-4:],
         }
         trim_interrupted_for_active(job_key)
@@ -4282,7 +4374,7 @@ async def main(body: dict):
         chat_in_background,
         job_key,
         job_id,
-        user_text,
+        question_text,
         history[-4:],
     )
 
@@ -4317,7 +4409,7 @@ async def main(body: dict):
                     search_jobs.pop(job_key, None)
                     persist_job_maps()
             new_history = history[-3:] + [
-                {"role": "user", "content": user_text[:400]},
+                {"role": "user", "content": question_text[:400]},
                 {"role": "assistant", "content": answer[:400]},
             ]
             return make_response(body, answer, new_history)
